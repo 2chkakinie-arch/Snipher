@@ -121,8 +121,11 @@ snipher/
 
 ## 6. デプロイ
 
-- **Vercel**: `vercel.json` により `snipher/api.py` を ASGI アプリとしてデプロイ
+- **Vercel**: `pyproject.toml` の `tool.vercel.entrypoint = "snipher.api:app"` により
+  `snipher/api.py` を ASGI アプリとしてデプロイする
   (ルートは Serverless Functions の Python ランタイムで動作)。
+  依存は `requirements.txt` だけでなく `[project.dependencies]` にも定義し、
+  Python ランタイムで確実に解決できるようにする。
 - **Render**: `render.yaml` により Web サービスとして
   `uvicorn snipher.api:app --host 0.0.0.0 --port $PORT` で起動。
 
