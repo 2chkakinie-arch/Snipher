@@ -88,6 +88,23 @@
   .chip.done { border-color: #bbf7d0; color: var(--ok); }
   .chip.done button { background: var(--ok); }
 
+  /* ---------- assist / model import ---------- */
+  .assist-note {
+    display: inline-flex; align-items: center; gap: 6px;
+    font-size: .72rem; color: var(--accent); background: var(--accent-soft);
+    border: 1px solid #dbeafe; border-radius: 999px; padding: 2px 10px; margin: 0 0 8px;
+  }
+  #dropZone {
+    border: 2px dashed var(--border-strong); border-radius: 12px; padding: 16px;
+    text-align: center; color: var(--muted); font-size: .8rem; background: #fff;
+    transition: border-color .15s, background .15s;
+  }
+  #dropZone.drag { border-color: var(--accent); background: var(--accent-soft); color: var(--accent); }
+  #dropProgress { height: 6px; background: var(--border); border-radius: 999px; overflow: hidden; margin-top: 8px; display: none; }
+  #dropProgress > div { height: 100%; background: var(--accent); width: 0; transition: width .2s; }
+  .filelist { font-size: .74rem; color: var(--muted); margin-top: 6px; white-space: pre-wrap; }
+  code.inline { background: #f3f4f6; border: 1px solid var(--border); border-radius: 6px; padding: 1px 6px; font-size: .72rem; }
+
   /* ---------- composer ---------- */
   footer { border-top: 1px solid var(--border); padding: 12px 20px 16px; background: var(--panel); }
   .composer { display: flex; gap: 10px; align-items: flex-end; }
@@ -175,6 +192,28 @@
       <div id="learnStatus">未実行</div>
     </div>
   </details>
+
+  <details class="learn">
+    <summary>モデル管理（オフライン環境への取り込み）</summary>
+    <div class="learn-body">
+      <div id="importStatus" style="color:var(--muted)">読込中…</div>
+      <div>このサンドボックスからは HuggingFace に接続できません。自分の PC で
+        <a href="https://huggingface.co/LiquidAI/LFM2.5-1.2B-JP-202606" target="_blank" rel="noopener">LiquidAI/LFM2.5-1.2B-JP-202606</a>
+        の <b>config.json / tokenizer.json / tokenizer_config.json / model.safetensors</b>（等）をダウンロードし、
+        下にドラッグ＆ドロップするとサーバー側でホットロードされます。</div>
+      <div id="dropZone">ここにモデルのファイルをドロップ または クリックして選択（複数可）</div>
+      <input type="file" id="fileInput" multiple style="display:none"
+             accept=".json,.safetensors,.jinja,.txt,.model,.bin">
+      <div id="dropProgress"><div></div></div>
+      <div class="filelist" id="fileList"></div>
+      <div class="learn-row">
+        <button class="mini" id="loadModelBtn">アップロード済みモデルをロード</button>
+        <button class="mini" id="refreshImportBtn">状態を更新</button>
+      </div>
+      <div class="filelist">自分のマシンで動かすときは <code class="inline">python tools/fetch_model.py --dest var/models/LFM2.5-1.2B-JP</code> が使えます
+       （HuggingFace → ミラーの順に自動試行・レジューム対応。詳細は README）。</div>
+    </div>
+  </details>
 </div>
 
 <script>
@@ -192,7 +231,7 @@ async function refreshStatus() {
     const b = $("engineBadge");
     const lfm = s.lfm || {};
     if (lfm.state === "ready") {
-      b.textContent = lfm.engine_label || "LFM2.5-1.2B-JP";
+      b.textContent = `⚡ ${lfm.engine_label || "LFM2.5-1.2B-JP"} · ハイブリッド`;
       b.className = "badge ok";
     } else if (lfm.state === "loading") {
       b.textContent = "モデル読込中…";
@@ -201,11 +240,11 @@ async function refreshStatus() {
       b.textContent = "学習中…";
       b.className = "badge warn";
     } else if (lfm.state === "failed") {
-      b.textContent = "Snipher-mini（LFM 利用不可）";
+      b.textContent = "Snipher-mini+（軽量モード）";
       b.className = "badge err";
       b.title = lfm.error || "";
     } else {
-      b.textContent = "Snipher-mini（軽量モード）";
+      b.textContent = "Snipher-mini+（軽量モード）";
       b.className = "badge";
     }
     const n = (lfm.learned_chars || []).length;
@@ -279,6 +318,17 @@ async function send() {
         const ev = JSON.parse(raw.slice(5).trim());
         if (ev.type === "meta" && ev.unknown_chars && ev.unknown_chars.length) {
           renderUnknown(ev.unknown_chars);
+        } else if (ev.type === "assist") {
+          // ハイブリッド補正の可視化
+          const an = document.createElement("div");
+          an.className = "assist-note";
+          if (ev.mode === "lfm") {
+            an.textContent = `✨ 下書きの確率が低かったため LFM2.5 が書き直しています（確度 ${((ev.confidence ?? 0) * 100).toFixed(0)}%）`;
+          } else {
+            an.textContent = `⚡ 高速経路：下書きの確度 ${((ev.confidence ?? 1) * 100).toFixed(0)}% — LFM 未使用で即答`;
+          }
+          bubble.parentNode.parentNode.insertBefore(an, bubble.parentNode);
+          if (ev.draft) bubble.dataset.draft = ev.draft;
         } else if (ev.type === "start" && ev.engine) {
           bubble.dataset.engine = ev.engine;
         } else if (ev.type === "delta") {
@@ -291,13 +341,20 @@ async function send() {
           const st = ev.stats || {};
           $("statsbar").textContent =
             `${st.engine || ""} · ${st.template_mode || "-"} テンプレート · ` +
-            `${st.new_tokens ?? "-"} tok · ` +
-            (st.tokens_per_second ? `${st.tokens_per_second} tok/s` : "-");
-          if (st.tokens_per_second) {
-            const meta = document.createElement("div"); meta.className = "meta";
-            meta.textContent = `${st.new_tokens ?? "?"} tokens · ${st.tokens_per_second} tok/s · ${st.template_mode}`;
-            bubble.appendChild(meta);
-          }
+            (st.tokens_per_second ? `${st.tokens_per_second} tok/s · ` : "") +
+            (st.draft_confidence != null ? `下書き確度 ${(st.draft_confidence * 100).toFixed(0)}% · ` : "") +
+            (st.draft_seconds != null ? `draft ${Math.max(1, Math.round(st.draft_seconds * 1000))}ms` :
+              `${st.new_tokens ?? "-"} tok`);
+          const meta = document.createElement("div"); meta.className = "meta";
+          const bits = [];
+          if (st.assist === "lfm") bits.push("✨ LFM 補正済み");
+          if (st.assist === "rule") bits.push("⚡ ルール応答（LFM 未使用）");
+          if (st.fixes && st.fixes.length) bits.push(`助動詞など補正 ${st.fixes.length}件`);
+          if (st.tokens_per_second) bits.push(`${st.new_tokens} tok · ${st.tokens_per_second} tok/s`);
+          if (st.intent) bits.push(`intent: ${st.intent}`);
+          meta.textContent = bits.join(" · ") || " ";
+          bubble.appendChild(meta);
+          if (st.fixes && st.fixes.length) meta.title = st.fixes.join("\n");
         } else if (ev.type === "error") {
           note(ev.message, true);
         }
@@ -387,6 +444,73 @@ $("resetLearnBtn").onclick = async () => {
   learnStatus(`リセット: ${d.removed ?? 0}文字削除`);
   refreshStatus();
 };
+
+/* ---------------- model import ---------------- */
+const fmtSize = (n) => n > 1e9 ? (n/1e9).toFixed(2)+" GB" : n > 1e6 ? (n/1e6).toFixed(1)+" MB" : Math.round(n/1024)+" KB";
+async function refreshImport() {
+  try {
+    const r = await fetch("/api/model/import");
+    const d = await r.json();
+    const st = d.upload || {};
+    const el = $("importStatus");
+    if (st.complete) {
+      el.innerHTML = `✅ アップロード済みモデルが揃っています（${st.files.length} ファイル / ` +
+        fmtSize(st.files.reduce((a, f) => a + f.size, 0)) + `）。現在のソース: <code class="inline">${(d.current_source||"-").replace(/</g,"&lt;")}</code>`;
+    } else {
+      el.innerHTML = `⏳ 未取り込み。不足: <b>${(st.missing||[]).join(", ")||"-"}</b>` +
+        (d.engine_error ? ` ・エンジン状態: ${d.engine_state} (${String(d.engine_error).slice(0,120)})` : "");
+    }
+    $("fileList").textContent = (st.files||[]).map(f => `${f.name} — ${fmtSize(f.size)}`).join("\n") || "（まだファイルがありません）";
+  } catch (e) { $("importStatus").textContent = "状態の取得に失敗: " + e.message; }
+}
+async function uploadFiles(fileObjs) {
+  if (!fileObjs || !fileObjs.length) return;
+  const fd = new FormData();
+  for (const f of fileObjs) fd.append("files", f, f.name);
+  fd.append("activate", "0");
+  const bar = $("dropProgress"); bar.style.display = "";
+  const inner = bar.firstElementChild; inner.style.width = "0";
+  try {
+    await new Promise((resolve, reject) => {
+      const xhr = new XMLHttpRequest();
+      xhr.open("POST", "/api/model/upload");
+      xhr.upload.onprogress = (e) => { if (e.lengthComputable) inner.style.width = Math.round(e.loaded/e.total*100) + "%"; };
+      xhr.onload = () => xhr.status < 300 ? resolve(xhr) : reject(new Error("HTTP " + xhr.status));
+      xhr.onerror = () => reject(new Error("通信エラー"));
+      xhr.send(fd);
+    });
+    inner.style.width = "100%";
+    await refreshImport();
+    note("モデルファイルをアップロードしました。「アップロード済みモデルをロード」で有効化します。");
+  } catch (e) {
+    note("アップロード失敗: " + e.message, true);
+  } finally {
+    setTimeout(() => bar.style.display = "none", 800);
+  }
+}
+$("dropZone").onclick = () => $("fileInput").click();
+$("fileInput").onchange = (e) => uploadFiles(e.target.files);
+$("dropZone").addEventListener("dragover", (e) => { e.preventDefault(); $("dropZone").classList.add("drag"); });
+$("dropZone").addEventListener("dragleave", () => $("dropZone").classList.remove("drag"));
+$("dropZone").addEventListener("drop", (e) => {
+  e.preventDefault(); $("dropZone").classList.remove("drag");
+  uploadFiles(e.dataTransfer.files);
+});
+$("loadModelBtn").onclick = async () => {
+  $("loadModelBtn").disabled = true;
+  try {
+    const r = await fetch("/api/model/load", {
+      method: "POST", headers: { "Content-Type": "application/json" }, body: "{}",
+    });
+    const d = await r.json();
+    if (d.ok) note("モデルのロードを開始しました。バッジが変わるまでお待ちください。");
+    else note(d.error || "ロードに失敗しました", true);
+    refreshStatus();
+  } catch (e) { note("通信エラー: " + e.message, true); }
+  $("loadModelBtn").disabled = false;
+};
+$("refreshImportBtn").onclick = refreshImport;
+refreshImport();
 
 /* ---------------- misc ---------------- */
 function autosize() {

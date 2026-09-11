@@ -61,6 +61,7 @@ class Generator:
         }
 
         pattern = self._pick_pattern(prompt)
+        self.ctx["decisions"] = []  # スロット決定の確率(ハイブリッド補正の判定に使う)
         self._select_predicate(pattern)
 
         for slot in pattern["structure"]:
@@ -76,7 +77,36 @@ class Generator:
             "register": register,
             "tense": tense,
             "tokens": list(self.ctx["tokens"]),
+            "confidence": self._confidence(),
+            "decisions": list(self.ctx.get("decisions", [])),
         }
+
+    # ================================================================== #
+    # 確率的な不確実さ(ハイブリッド補正の判定)
+    # ================================================================== #
+    def _confidence(self) -> float:
+        """生成に使った候補選択のソフトマックス確率の重み平均(0..1)。
+
+        述語(動詞/形容詞)は文の骨格を決めるため重みを大きくする。
+        """
+        decisions = self.ctx.get("decisions", [])
+        if not decisions:
+            return 1.0
+        num = 0.0
+        den = 0.0
+        for d in decisions:
+            w = 1.5 if d.get("kind") == "predicate" else 1.0
+            num += w * float(d.get("prob", 1.0))
+            den += w
+        return max(0.0, min(1.0, num / (den or 1.0)))
+
+    def _record(self, kind: str, surface: str | None, best: dict) -> None:
+        if best is None or surface is None:
+            return
+        if "prob" in best:
+            self.ctx.setdefault("decisions", []).append(
+                {"kind": kind, "surface": surface, "prob": round(float(best["prob"]), 4)}
+            )
 
     def generate_many(self, n: int = 5, **kwargs) -> list[dict]:
         """複数文を生成する(独立な文のリスト)。"""
@@ -166,6 +196,8 @@ class Generator:
                 s -= 1.2  # 「する/来る」のような汎用動詞を抑制
             cands.append({"entry": v, "score": s})
         best = self.model.sample(cands)
+        if best:
+            self._record("predicate", best["entry"]["s"], best)
         return best["entry"] if best else None
 
     def _pick_adjective(self, only_i: bool = False) -> dict | None:
@@ -181,6 +213,8 @@ class Generator:
             for a in pool
         ]
         best = self.model.sample(cands)
+        if best:
+            self._record("predicate", best["entry"]["s"], best)
         return best["entry"] if best else None
 
     def _pick_topic_noun(self) -> dict | None:
@@ -217,6 +251,13 @@ class Generator:
 
     # ---- 名詞 + 助詞 ---- #
     def _slot_topic(self) -> None:
+        # プロンプトから決めた話題を優先的に主題にする(会話の一貫性)
+        t = self.ctx.get("topic")
+        if t is not None and self.rng.random() < 0.85:
+            self._emit(t["s"], _POS["noun"], t.get("t", []))
+            self._emit("は", _POS["part"], [])
+            self._record("topic", t["s"], {"prob": 0.9})
+            return
         noun = self._pick_noun("は")
         if noun:
             self._emit(noun["s"], _POS["noun"], noun.get("t", []))
@@ -256,6 +297,7 @@ class Generator:
         pred = self.ctx.get("predicate")
         verb_trans = pred.get("tr") if pred and self.ctx.get("predicate_pos") == _POS["verb"] else None
         pred_tags = pred.get("t", []) if pred else []
+        topic_tags = self.ctx.get("topic_tags") or []
         cands = []
         for n in self.lex.nouns:
             s = self.model.score(
@@ -268,8 +310,13 @@ class Generator:
                 s += 1.2 if overlap else -1.0
             elif particle == "が" and pred_tags:
                 s += 0.5 if overlap else -0.2
+            # 話題と同じ意味クラスの名詞も優先する(旅行→駅/切符 など)
+            if topic_tags and set(n.get("t", [])) & set(topic_tags):
+                s += 0.9
             cands.append({"entry": n, "score": s})
         best = self.model.sample(cands)
+        if best:
+            self._record("noun", best["entry"]["s"], best)
         return best["entry"] if best else None
 
     # ---- 述語 ---- #

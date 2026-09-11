@@ -6,6 +6,12 @@ import os
 from dataclasses import dataclass, field
 from pathlib import Path
 
+# HuggingFace への接続が遮断されている環境(サンドボックス等)では
+# 自動ダウンロードが長時間固まるので、既定で短いタイムアウトを設定する。
+# 本物のネットワークが遅い環境では環境変数で上書きできる。
+os.environ.setdefault("HF_HUB_ETAG_TIMEOUT", "5")
+os.environ.setdefault("HF_HUB_DOWNLOAD_TIMEOUT", "15")
+
 # Liquid AI の日本語チャットモデル（LFM2 アーキテクチャ / 1.17B / 32K context）
 DEFAULT_MODEL_ID = "LiquidAI/LFM2.5-1.2B-JP-202606"
 
