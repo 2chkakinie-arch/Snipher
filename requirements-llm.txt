@@ -1,0 +1,8 @@
+# LFM2.5-1.2B-JP ニューラルチャットエンジン用の依存（オプション）。
+# インストールしなくても Snipher は超小型エンジンで動作します。
+#   pip install -r requirements.txt -r requirements-llm.txt
+torch>=2.3
+transformers>=4.57
+tokenizers>=0.20
+safetensors>=0.4
+accelerate>=0.30

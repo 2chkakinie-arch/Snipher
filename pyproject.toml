@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "snipher"
-version = "0.1.0"
-description = "超小型・確率的日本語AI — 構文解析と独自確率式による高速な日本語生成"
+version = "0.2.0"
+description = "超小型・確率的日本語AI + LFM2.5-1.2B-JP チャット（未知文字学習・テンプレートフォールバック付き）"
 readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "MIT" }
@@ -16,11 +16,22 @@ dependencies = [
   "pydantic>=2.0",
 ]
 
+[project.optional-dependencies]
+# ニューラルエンジン（LFM2.5-1.2B-JP）を使う場合
+llm = [
+  "torch>=2.3",
+  "transformers>=4.57",
+  "tokenizers>=0.20",
+  "safetensors>=0.4",
+  "accelerate>=0.30",
+]
+dev = ["pytest", "pytest-timeout", "httpx"]
+
 [tool.setuptools]
-packages = ["snipher"]
+packages = ["snipher", "snipher.lfm", "snipher.web"]
 
 [tool.setuptools.package-data]
-snipher = ["data/*.json"]
+snipher = ["data/*.json", "web/*.html"]
 
 # Vercel Python ランタイムのエントリポイント。
 # `snipher.api` モジュールとしてロードされるため、パッケージ内 import が正しく解決される。

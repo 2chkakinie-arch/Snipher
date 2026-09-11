@@ -1,0 +1,411 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Snipher Chat — LFM2.5-1.2B-JP</title>
+<style>
+  :root {
+    --bg: #ffffff; --panel: #ffffff; --border: #e5e7eb; --border-strong: #d1d5db;
+    --text: #111827; --muted: #6b7280; --accent: #2563eb; --accent-soft: #eff6ff;
+    --user-bubble: #f3f4f6; --ok: #16a34a; --warn: #d97706; --err: #dc2626;
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; }
+  body {
+    margin: 0; background: var(--bg); color: var(--text);
+    font-family: "Hiragino Kaku Gothic ProN", "Noto Sans JP", system-ui, sans-serif;
+    line-height: 1.7;
+  }
+  .app { display: flex; flex-direction: column; height: 100vh; max-width: 880px; margin: 0 auto; }
+
+  /* ---------- header ---------- */
+  header {
+    display: flex; align-items: center; gap: 12px;
+    padding: 14px 20px; border-bottom: 1px solid var(--border); background: var(--panel);
+  }
+  header h1 { font-size: 1.1rem; margin: 0; letter-spacing: .3px; font-weight: 700; }
+  header h1 span { color: var(--accent); }
+  .badge {
+    font-size: .72rem; padding: 2px 9px; border-radius: 999px;
+    border: 1px solid var(--border-strong); color: var(--muted); background: #fff;
+    white-space: nowrap;
+  }
+  .badge.ok { border-color: #bbf7d0; background: #f0fdf4; color: var(--ok); }
+  .badge.warn { border-color: #fde68a; background: #fffbeb; color: var(--warn); }
+  .badge.err { border-color: #fecaca; background: #fef2f2; color: var(--err); }
+  .spacer { flex: 1; }
+  header a { color: var(--muted); font-size: .78rem; text-decoration: none; }
+  header a:hover { color: var(--accent); }
+
+  /* ---------- settings ---------- */
+  details.settings { border-bottom: 1px solid var(--border); background: #fafafa; }
+  details.settings summary {
+    cursor: pointer; padding: 8px 20px; font-size: .8rem; color: var(--muted); user-select: none;
+  }
+  .settings-body { display: flex; flex-wrap: wrap; gap: 18px; padding: 4px 20px 14px; font-size: .82rem; }
+  .settings-body label { display: flex; align-items: center; gap: 8px; color: var(--text); }
+  .settings-body input[type=range] { width: 120px; accent-color: var(--accent); }
+  .settings-body input[type=number] { width: 70px; padding: 3px 6px; border: 1px solid var(--border-strong); border-radius: 6px; }
+  .settings-body select { padding: 3px 6px; border: 1px solid var(--border-strong); border-radius: 6px; background: #fff; }
+  .val { color: var(--muted); min-width: 32px; text-align: right; }
+
+  /* ---------- chat ---------- */
+  main { flex: 1; overflow-y: auto; padding: 22px 20px 10px; }
+  .msg { display: flex; margin: 0 0 16px; }
+  .msg.user { justify-content: flex-end; }
+  .bubble {
+    max-width: 78%; padding: 10px 14px; border-radius: 14px; white-space: pre-wrap; word-break: break-word;
+  }
+  .msg.user .bubble { background: var(--user-bubble); border-bottom-right-radius: 4px; }
+  .msg.assistant .bubble { background: #fff; border: 1px solid var(--border); border-bottom-left-radius: 4px; }
+  .msg.assistant .bubble.thinking { color: var(--muted); }
+  .meta { font-size: .7rem; color: var(--muted); margin-top: 6px; display: flex; gap: 10px; flex-wrap: wrap; }
+  .cursor { display: inline-block; width: 8px; height: 15px; background: var(--accent);
+            vertical-align: -2px; animation: blink 1s steps(2) infinite; border-radius: 2px; }
+  @keyframes blink { 50% { opacity: 0; } }
+
+  .sysnote { font-size: .75rem; color: var(--muted); text-align: center; margin: 0 0 14px; }
+  .sysnote.err { color: var(--err); }
+
+  /* ---------- unknown chars ---------- */
+  #unknownPanel { padding: 0 20px; }
+  .unknown-card {
+    border: 1px solid var(--border); border-radius: 12px; padding: 10px 14px; margin-bottom: 10px;
+    background: #fffbeb; font-size: .8rem;
+  }
+  .unknown-card b { font-size: .82rem; }
+  .chip {
+    display: inline-flex; align-items: center; gap: 6px; margin: 4px 6px 0 0;
+    border: 1px solid var(--border-strong); border-radius: 999px; padding: 2px 10px; background: #fff;
+  }
+  .chip .ch { font-weight: 700; font-size: .95rem; }
+  .chip .st { color: var(--muted); font-size: .7rem; }
+  .chip button {
+    border: none; background: var(--accent); color: #fff; border-radius: 999px;
+    font-size: .7rem; padding: 2px 9px; cursor: pointer;
+  }
+  .chip.done { border-color: #bbf7d0; color: var(--ok); }
+  .chip.done button { background: var(--ok); }
+
+  /* ---------- composer ---------- */
+  footer { border-top: 1px solid var(--border); padding: 12px 20px 16px; background: var(--panel); }
+  .composer { display: flex; gap: 10px; align-items: flex-end; }
+  textarea#input {
+    flex: 1; resize: none; border: 1px solid var(--border-strong); border-radius: 12px;
+    padding: 10px 12px; font: inherit; font-size: .92rem; max-height: 140px; background: #fff; color: var(--text);
+  }
+  textarea#input:focus { outline: 2px solid var(--accent-soft); border-color: var(--accent); }
+  button.primary {
+    background: var(--accent); border: none; color: #fff; font-weight: 700; font-size: .9rem;
+    padding: 10px 20px; border-radius: 12px; cursor: pointer;
+  }
+  button.primary:disabled { opacity: .45; cursor: default; }
+  button.stop { background: #fff; color: var(--err); border: 1px solid #fecaca; font-weight: 700;
+    padding: 10px 16px; border-radius: 12px; cursor: pointer; font-size: .9rem; }
+  .hint { font-size: .7rem; color: var(--muted); margin-top: 6px; }
+
+  /* ---------- learn drawer ---------- */
+  details.learn { border-top: 1px solid var(--border); background: #fafafa; }
+  details.learn summary { cursor: pointer; padding: 8px 20px; font-size: .8rem; color: var(--muted); }
+  .learn-body { padding: 4px 20px 14px; font-size: .82rem; display: flex; flex-direction: column; gap: 8px; }
+  .learn-body textarea {
+    width: 100%; border: 1px solid var(--border-strong); border-radius: 8px; padding: 8px;
+    font: inherit; font-size: .8rem; resize: vertical; background: #fff;
+  }
+  .learn-row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+  .learn-row input[type=number] { width: 60px; padding: 3px 6px; border: 1px solid var(--border-strong); border-radius: 6px; }
+  #learnStatus { color: var(--muted); font-size: .76rem; white-space: pre-wrap; }
+  .mini { background: #fff; border: 1px solid var(--border-strong); color: var(--text);
+          border-radius: 8px; padding: 5px 12px; cursor: pointer; font-size: .78rem; }
+  .mini:hover { border-color: var(--accent); color: var(--accent); }
+  .statsbar { font-size: .7rem; color: var(--muted); padding: 0 20px 4px; text-align: right; }
+</style>
+</head>
+<body>
+<div class="app">
+  <header>
+    <h1>Snipher<span>Chat</span></h1>
+    <span id="engineBadge" class="badge">起動中…</span>
+    <div class="spacer"></div>
+    <a href="/classic" title="旧 UI（超小型エンジンのデモ）">classic</a>
+    <a href="/docs" title="API ドキュメント">docs</a>
+  </header>
+
+  <details class="settings">
+    <summary>設定</summary>
+    <div class="settings-body">
+      <label>温度 <input id="temperature" type="range" min="0" max="1" step="0.05" value="0.3"><span class="val" id="temperatureVal">0.3</span></label>
+      <label>最大応答 <input id="maxNew" type="number" min="16" max="512" step="16" value="128"> トークン</label>
+      <label>テンプレート
+        <select id="templateSel">
+          <option value="auto">自動（内蔵フォールバック）</option>
+          <option value="none">なし（素の生成）</option>
+        </select>
+      </label>
+      <button class="mini" id="clearBtn">会話をリセット</button>
+    </div>
+  </details>
+
+  <main id="chat"></main>
+
+  <div id="unknownPanel"></div>
+  <div class="statsbar" id="statsbar"></div>
+
+  <footer>
+    <div class="composer">
+      <textarea id="input" rows="1" placeholder="日常会話をどうぞ（例: 今日はいい天気だね）"></textarea>
+      <button class="primary" id="sendBtn">送信</button>
+      <button class="stop" id="stopBtn" style="display:none">停止</button>
+    </div>
+    <div class="hint">Enter で送信 / Shift+Enter で改行</div>
+  </footer>
+
+  <details class="learn">
+    <summary>未知文字の学習（希少漢字・絵文字・新語）</summary>
+    <div class="learn-body">
+      <div>トークナイザが保持できない文字を、LFM2.5 の<b>学習済み埋め込みの合成</b>で会話に参加させます。</div>
+      <textarea id="learnText" rows="2" placeholder="学習したい文字や例文を入力（例: 𠮷 この漢字は『よし』と読みます）"></textarea>
+      <div class="learn-row">
+        <label>深学習ステップ <input id="learnSteps" type="number" min="2" max="64" value="12"></label>
+        <button class="mini" id="instantBtn">即時学習（埋め込み合成のみ）</button>
+        <button class="mini" id="deepBtn">深学習（勾配で数ステップ更新）</button>
+        <button class="mini" id="resetLearnBtn">学習リセット</button>
+      </div>
+      <div id="learnStatus">未実行</div>
+    </div>
+  </details>
+</div>
+
+<script>
+const $ = (id) => document.getElementById(id);
+const chatEl = $("chat");
+let messages = [];      // {role, content}
+let busy = false;
+let aborter = null;
+
+/* ---------------- status ---------------- */
+async function refreshStatus() {
+  try {
+    const r = await fetch("/api/status");
+    const s = await r.json();
+    const b = $("engineBadge");
+    const lfm = s.lfm || {};
+    if (lfm.state === "ready") {
+      b.textContent = lfm.engine_label || "LFM2.5-1.2B-JP";
+      b.className = "badge ok";
+    } else if (lfm.state === "loading") {
+      b.textContent = "モデル読込中…";
+      b.className = "badge warn";
+    } else if (lfm.state === "learning") {
+      b.textContent = "学習中…";
+      b.className = "badge warn";
+    } else if (lfm.state === "failed") {
+      b.textContent = "Snipher-mini（LFM 利用不可）";
+      b.className = "badge err";
+      b.title = lfm.error || "";
+    } else {
+      b.textContent = "Snipher-mini（軽量モード）";
+      b.className = "badge";
+    }
+    const n = (lfm.learned_chars || []).length;
+    if (n > 0) b.textContent += ` · 学習済み${n}文字`;
+  } catch (e) { /* ignore */ }
+}
+
+/* ---------------- chat rendering ---------------- */
+function addMessage(role, text, extraClass) {
+  const wrap = document.createElement("div");
+  wrap.className = "msg " + role;
+  const b = document.createElement("div");
+  b.className = "bubble" + (extraClass ? " " + extraClass : "");
+  b.textContent = text;
+  wrap.appendChild(b);
+  chatEl.appendChild(wrap);
+  chatEl.scrollTop = chatEl.scrollHeight;
+  return b;
+}
+function note(text, isErr) {
+  const p = document.createElement("p");
+  p.className = "sysnote" + (isErr ? " err" : "");
+  p.textContent = text;
+  chatEl.appendChild(p);
+  chatEl.scrollTop = chatEl.scrollHeight;
+  return p;
+}
+
+/* ---------------- send ---------------- */
+async function send() {
+  const input = $("input");
+  const text = input.value.trim();
+  if (!text || busy) return;
+  busy = true;
+  input.value = ""; autosize();
+  $("sendBtn").disabled = true;
+  $("stopBtn").style.display = "";
+
+  messages.push({ role: "user", content: text });
+  addMessage("user", text);
+  const bubble = addMessage("assistant", "…", "thinking");
+  const cursor = document.createElement("span"); cursor.className = "cursor";
+  bubble.textContent = ""; bubble.appendChild(cursor);
+
+  aborter = new AbortController();
+  let out = "";
+  const useTemplate = $("templateSel").value === "auto";
+  try {
+    const res = await fetch("/api/chat", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        messages,
+        temperature: Number($("temperature").value),
+        max_new_tokens: Number($("maxNew").value),
+        use_template: useTemplate,
+      }),
+      signal: aborter.signal,
+    });
+    const reader = res.body.getReader();
+    const dec = new TextDecoder();
+    let buf = "";
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buf += dec.decode(value, { stream: true });
+      let idx;
+      while ((idx = buf.indexOf("\n\n")) >= 0) {
+        const raw = buf.slice(0, idx).trim(); buf = buf.slice(idx + 2);
+        if (!raw.startsWith("data:")) continue;
+        const ev = JSON.parse(raw.slice(5).trim());
+        if (ev.type === "meta" && ev.unknown_chars && ev.unknown_chars.length) {
+          renderUnknown(ev.unknown_chars);
+        } else if (ev.type === "start" && ev.engine) {
+          bubble.dataset.engine = ev.engine;
+        } else if (ev.type === "delta") {
+          out += ev.text;
+          bubble.classList.remove("thinking");
+          bubble.textContent = out;
+          bubble.appendChild(cursor);
+          chatEl.scrollTop = chatEl.scrollHeight;
+        } else if (ev.type === "done") {
+          const st = ev.stats || {};
+          $("statsbar").textContent =
+            `${st.engine || ""} · ${st.template_mode || "-"} テンプレート · ` +
+            `${st.new_tokens ?? "-"} tok · ` +
+            (st.tokens_per_second ? `${st.tokens_per_second} tok/s` : "-");
+          if (st.tokens_per_second) {
+            const meta = document.createElement("div"); meta.className = "meta";
+            meta.textContent = `${st.new_tokens ?? "?"} tokens · ${st.tokens_per_second} tok/s · ${st.template_mode}`;
+            bubble.appendChild(meta);
+          }
+        } else if (ev.type === "error") {
+          note(ev.message, true);
+        }
+      }
+    }
+  } catch (e) {
+    if (e.name !== "AbortError") note("通信エラー: " + e.message, true);
+  }
+  if (!out) bubble.textContent = bubble.textContent.replace("…", "") || "（応答なし）";
+  const cursorEl = bubble.querySelector(".cursor"); if (cursorEl) cursorEl.remove();
+  messages.push({ role: "assistant", content: out });
+  busy = false; aborter = null;
+  $("sendBtn").disabled = false;
+  $("stopBtn").style.display = "none";
+  input.focus();
+  refreshStatus();
+}
+
+/* ---------------- unknown chars ---------------- */
+function renderUnknown(chars) {
+  const panel = $("unknownPanel");
+  panel.innerHTML = "";
+  const card = document.createElement("div");
+  card.className = "unknown-card";
+  card.innerHTML = "<b>未知文字を検出</b> — トークナイザが保持できないため学習すると会話で使えます";
+  for (const c of chars) {
+    const chip = document.createElement("span");
+    chip.className = "chip";
+    const learned = !!c.learned;
+    chip.innerHTML = `<span class="ch"></span><span class="st"></span>` +
+      (learned ? `` : `<button>学習</button>`);
+    chip.querySelector(".ch").textContent = c.char;
+    chip.querySelector(".st").textContent = `U+${c.codepoint.replace("U+","")} ${c.status}`;
+    if (!learned) {
+      chip.querySelector("button").onclick = async () => {
+        chip.querySelector("button").disabled = true;
+        const r = await fetch("/api/learn", {
+          method: "POST", headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ chars: [c.char], mode: "instant" }),
+        });
+        const d = await r.json();
+        if (d.ok) { chip.classList.add("done"); chip.querySelector("button").remove();
+          chip.querySelector(".st").textContent += " 学習済み"; refreshStatus(); }
+        else { chip.querySelector("button").disabled = false; alert(d.error || "学習に失敗しました"); }
+      };
+    } else {
+      chip.classList.add("done");
+    }
+    card.appendChild(chip);
+  }
+  panel.appendChild(card);
+}
+
+/* ---------------- learn drawer ---------------- */
+function learnStatus(s) { $("learnStatus").textContent = s; }
+async function doLearn(mode) {
+  const text = $("learnText").value.trim();
+  if (!text) { learnStatus("学習したい文字か例文を入力してください"); return; }
+  learnStatus(`${mode === "deep" ? "深学習" : "即時学習"}を実行中…`);
+  try {
+    const r = await fetch("/api/learn", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ text, mode, steps: Number($("learnSteps").value) }),
+    });
+    const d = await r.json();
+    if (d.mode === "deep") { pollLearn(); return; }
+    if (d.ok) learnStatus("即時学習完了:\n" + JSON.stringify(d.results, null, 1));
+    else learnStatus("エラー: " + (d.error || "?"));
+    refreshStatus();
+  } catch (e) { learnStatus("通信エラー: " + e.message); }
+}
+async function pollLearn() {
+  try {
+    const r = await fetch("/api/learn/status");
+    const s = await r.json();
+    learnStatus(`状態: ${s.phase} ${s.detail || ""}`);
+    if (s.phase === "running" || s.phase === "loading") setTimeout(pollLearn, 1500);
+    else refreshStatus();
+  } catch (e) { /* */ }
+}
+$("instantBtn").onclick = () => doLearn("instant");
+$("deepBtn").onclick = () => doLearn("deep");
+$("resetLearnBtn").onclick = async () => {
+  if (!confirm("学習済みの文字をすべて削除しますか？")) return;
+  const r = await fetch("/api/learn", { method: "DELETE" });
+  const d = await r.json();
+  learnStatus(`リセット: ${d.removed ?? 0}文字削除`);
+  refreshStatus();
+};
+
+/* ---------------- misc ---------------- */
+function autosize() {
+  const t = $("input");
+  t.style.height = "auto";
+  t.style.height = Math.min(t.scrollHeight, 140) + "px";
+}
+$("input").addEventListener("input", autosize);
+$("input").addEventListener("keydown", (e) => {
+  if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); send(); }
+});
+$("sendBtn").onclick = send;
+$("stopBtn").onclick = () => { if (aborter) aborter.abort(); };
+$("clearBtn").onclick = () => { messages = []; chatEl.innerHTML = ""; $("unknownPanel").innerHTML = ""; note("会話をリセットしました"); };
+$("temperature").addEventListener("input", (e) => $("temperatureVal").textContent = Number(e.target.value).toFixed(2));
+note("LFM2.5-1.2B-JP による日本語の日常会話。未知の文字は自動検出して学習できます。");
+refreshStatus();
+setInterval(refreshStatus, 4000);
+autosize();
+</script>
+</body>
+</html>
