@@ -113,6 +113,8 @@ curl -X POST http://localhost:8000/generate \
 3. `pyproject.toml` の `[tool.vercel] entrypoint = "snipher.api:app"` により、
    FastAPI アプリが Python ランタイムの Serverless Function として自動認識される
    (追加のルーティング設定は不要。全リクエストがアプリに転送される)
+4. 依存パッケージは `pyproject.toml` の `[project.dependencies]` にも定義してあるため、
+   Vercel の Python ランタイムが `fastapi` / `uvicorn` / `pydantic` を確実にインストールできる
 
 ### Render
 
