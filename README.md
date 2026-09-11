@@ -1,10 +1,12 @@
 # Snipher
 
-**超小型・確率的日本語AI（日本語のみ対応）**
+**超小型・確率的日本語AI（日本語のみ対応）+ LFM2.5-1.2B-JP チャット**
 
 動詞・助動詞・名詞・助詞・文構造を「あらかじめ決めておく」ことで、
 量子化された大規模言語モデル（例: 1.2B）よりも**圧倒的に少ないパラメータ**で、
 日本語の構文解析と高速な文章生成を実現する試みです。
+さらにオプションで Liquid AI の **LFM2.5-1.2B-JP** を載せ、
+未知文字の学習とテンプレートフォールバック付きの高速な日常会話ができます。
 
 - 全パラメータ数: **476**（テーブル 470 + 確率式の重み 6）
 - 依存: `fastapi` / `uvicorn` / `pydantic` のみ。GPU 不要、モデルファイル不要
@@ -32,7 +34,37 @@ P(w) = softmax( S(w) / temperature )
 
 ---
 
-## クイックスタート
+## 🚀 LFM2.5-1.2B-JP チャット（ニューラルエンジン）
+
+Liquid AI の **LFM2.5-1.2B-JP**（1.17B / 32K context）の学習済みパラメータを載せて、
+**CPU でも高速な日本語の日常会話**ができるホワイトテーマのチャット UI を追加。
+
+- **高速化**: 動的 INT8 量子化 + 短いコンテキスト + SSE ストリーミング。
+  応答速度（tok/s）は UI に実測値で表示
+- **未知文字の学習**: `𠮷` や `🚀` などトークナイザが保持できない文字を、
+  **事前学習済み断片埋め込みの合成**で即時に学習（さらに例文から
+  埋め込みのみの勾配更新で深学習も可能）。学習結果は永続化され、
+  モデルはその文字を 1 意味トークンとして読み・書きできる
+- **テンプレートがない時の生成**: ネイティブ chat template →
+  内蔵 ChatML テンプレート → テンプレートなし（素の生成）の
+  3 段フォールバックで常に応答可能
+- **フォールバック**: torch 未インストールやモデル未取得の環境では
+  従来の Snipher-mini（476 パラメータ）が自動で応答
+
+```bash
+# ニューラルエンジン込みで起動（初回に ~2.4GB を HuggingFace から取得）
+python3 -m venv .venv
+.venv/bin/pip install -r requirements.txt -r requirements-llm.txt
+.venv/bin/uvicorn snipher.api:app --host 0.0.0.0 --port 8000
+```
+
+`http://localhost:8000` でチャット UI が開く。オフライン環境では
+`SNIPHER_LFM_MODEL=/path/to/model` でローカルのモデルを指定できる。
+設計の詳細は [docs/lfm.md](docs/lfm.md) を参照。
+
+---
+
+## クイックスタート（超小型エンジンのみ）
 
 ```bash
 # 依存インストール
@@ -43,7 +75,8 @@ python3 -m venv .venv
 .venv/bin/uvicorn snipher.api:app --host 0.0.0.0 --port 8000
 ```
 
-ブラウザで `http://localhost:8000` を開くと UI、
+ブラウザで `http://localhost:8000` を開くとチャット UI、
+`http://localhost:8000/classic` に旧 UI、
 `http://localhost:8000/docs` で Swagger UI が使えます。
 
 ### CLI デモ

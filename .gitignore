@@ -18,7 +18,11 @@ env/
 .coverage
 htmlcov/
 
+# 実行時に生成されるもの（テスト用小型モデル・学習済み語彙）
+var/
+
 # エディタ/OS
 .vscode/
 .idea/
+.DS_Store/
 .DS_Store
