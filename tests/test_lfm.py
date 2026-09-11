@@ -219,7 +219,7 @@ def test_api_end_to_end(lfm_env, monkeypatch):
     scan = client.post("/api/vocab/check", json={"text": f"今日は{RARE}の日です"}).json()
     assert scan["ok"] and scan["counts"]["unknown"] >= 1
 
-    # チャット（SSE）
+    # チャット（SSE・LFM 直接応答: hybrid を無効化して LFM の素の経路を検証）
     with client.stream(
         "POST",
         "/api/chat",
@@ -227,6 +227,7 @@ def test_api_end_to_end(lfm_env, monkeypatch):
             "messages": [{"role": "user", "content": f"これは{RARE}の話です"}],
             "max_new_tokens": 8,
             "temperature": 0.5,
+            "hybrid": False,
         },
     ) as resp:
         assert resp.status_code == 200
@@ -238,6 +239,28 @@ def test_api_end_to_end(lfm_env, monkeypatch):
     assert kinds[0] in ("meta", "start")
     assert "start" in kinds and "delta" in kinds and "done" in kinds
     assert events[-1]["stats"]["engine"].startswith("LFM")
+
+    # チャット（SSE・ハイブリッド: 下書きの確度で LFM 補正 / 高速経路を選ぶ）
+    with client.stream(
+        "POST",
+        "/api/chat",
+        json={
+            "messages": [{"role": "user", "content": f"これは{RARE}の話です"}],
+            "max_new_tokens": 8,
+            "temperature": 0.5,
+        },
+    ) as resp:
+        assert resp.status_code == 200
+        hybrid_events = []
+        for line in resp.iter_lines():
+            if line.startswith("data:"):
+                hybrid_events.append(json.loads(line[5:].strip()))
+    hkinds = [e["type"] for e in hybrid_events]
+    assert "delta" in hkinds and hybrid_events[-1]["type"] == "done"
+    hstats = hybrid_events[-1]["stats"]
+    # どちらの経路でも正当なエンジン名と assist フラグが返る
+    assert hstats["engine"].startswith(("LFM", "Snipher-mini+"))
+    assert hstats.get("assist") in ("rule", "lfm")
 
     # 即時学習
     r = client.post("/api/learn", json={"chars": [RARE], "mode": "instant"}).json()

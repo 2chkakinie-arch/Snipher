@@ -24,6 +24,8 @@ from .morphology import Morphology  # noqa: E402
 from .parser import Parser  # noqa: E402
 from .probability import ProbabilityModel  # noqa: E402
 from .generator import Generator  # noqa: E402
+from .polisher import Polisher  # noqa: E402
+from .responder import Responder  # noqa: E402
 from .engine import SnipherEngine  # noqa: E402
 
 __all__ = [
@@ -32,6 +34,8 @@ __all__ = [
     "Parser",
     "ProbabilityModel",
     "Generator",
+    "Polisher",
+    "Responder",
     "SnipherEngine",
     "DEFAULT_WEIGHTS",
 ]

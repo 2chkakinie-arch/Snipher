@@ -4,9 +4,60 @@ Snipher に Liquid AI の **LFM2.5-1.2B-JP**（1.17B / LFM2 hybrid アーキテ�
 32K context）の学習済みパラメータを載せ、CPU でも高速な日本語の日常会話を
 実現するニューラルエンジンの設計メモ。
 
-従来の超小型エンジン（476 パラメータ・ルールベース）は、ニューラルエンジンが
-使えない環境（torch 未インストール / モデル未ダウンロード / オフライン）での
-フォールバックとしてそのまま残してある。
+従来の超小型エンジン（~500 パラメータ・ルールベース + 対話テーブル）は、
+ニューラルエンジンが使えない環境（torch 未インストール / モデル未ダウンロード /
+オフライン）でのフォールバックとしてそのまま残してある。
+
+---
+
+## 0. ハイブリッド補正（速度を維持したまま賢く）
+
+「LFM に全部を作らせる」のではなく、**Snipher-mini が常に下書きを作り、
+確率的に不安な部分だけ LFM が書き直す**二段構え:
+
+```
+ユーザー発話
+  │  <数ミリ秒>
+  ▼
+Snipher-mini 下書き
+  ├─ 意図判定     ... responses.json の対話テーブル(挨拶/感謝/質問…)
+  ├─ 確率的補完   ... generator が話題に合わせた1文を生成
+  │                  (各スロット決定の softmax 確率を記録)
+  └─ 助動詞の補い ... polisher が文末・助動詞・文体をルール修復
+  │
+  ▼
+confidence = スロット確率の重み平均(述語 1.5 / 名詞 1.0)
+  ├─ ≥ SNIPHER_ASSIST_THRESHOLD(既定 0.35)
+  │     → そのまま返答。LFM は 1 トークンも消費しない(最速経路)
+  └─ < 閾値
+        → LFM2.5 に書き直し依頼(既定 64 トークン上限)
+          「相手の発話 + 下書き → 自然な返答(1〜2文)」
+          出力が空でも下書きにフォールバックするので壊れない
+```
+
+ポイント:
+
+- 下書きは常に完成しているため、LFM が何らかの理由で失敗しても応答は出る
+- 補正対象が短いので、応答全体を LFM で作るより速い
+- LFM が無い環境では、不確実な生成文を安全な骨子(base_text)に退避させ、
+  テーブル由来の確実な文だけで返す(品質の下限を守る)
+- 助動詞の補いは LFM の有無にかかわらずルールで実行(マイクロ秒単位)
+
+## 1. オフライン環境でのモデル取り込み
+
+`huggingface.co` への外向き接続が遮断された環境（CI サンドボックス等）では
+自動ダウンロードが失敗する。`LfmEngine._probe_hf` が 5 秒の事前確認を行い、
+失敗なら軽量モードへ素早く落ちる（ハングしない）。モデルの入手手段は 2 つ:
+
+1. **ブラウザからのアップロード（UI 統合）**
+   - 「モデル管理」パネルにモデルファイルをドロップ → `POST /api/model/upload`
+   - `config.json` + トークナイザ + `*.safetensors` が揃うと complete 判定
+     （`GET /api/model/import` が不足ファイルを列挙）
+   - 「ロード」→ `POST /api/model/load` → `LfmEngine.reload()` がホットスワップ
+2. **`tools/fetch_model.py`（自分のマシンで実行）**
+   - HuggingFace → hf-mirror.com の順に自動試行、Range リクエストでレジューム対応
+   - 標準ライブラリのみで動作
+   - 取得後 `SNIPHER_LFM_MODEL=<dir>` で起動、または同じく UI からロード
 
 ---
 
@@ -14,14 +65,17 @@ Snipher に Liquid AI の **LFM2.5-1.2B-JP**（1.17B / LFM2 hybrid アーキテ�
 
 ```
 snipher/
+├── polisher.py       # 助動詞の補い・文体修復(ルールのみ・LFM 不要)
+├── responder.py      # 意図分類 + 対話テーブル応答(下書き生成)
 ├── lfm/
 │   ├── config.py     # 環境変数 SNIPHER_LFM_* の設定
-│   ├── engine.py     # ロード / INT8 量子化 / ストリーミング生成 / 学習ジョブ
+│   ├── engine.py     # ロード / INT8 量子化 / ストリーミング生成 / 学習ジョブ / ホットスワップ
+│   ├── assist.py     # ハイブリッド補正(下書き → 確度判定 → LFM 書き直し)
 │   ├── template.py   # チャットテンプレート管理（ネイティブ → 内蔵 → なし の3段）
 │   ├── vocab.py      # 未知文字の検出（UNK / バイト断片 / 分割）
 │   └── learner.py    # 未知文字の学習（即時合成 + 埋め込み勾配更新）と永続化
 ├── web/chat.html     # ホワイトテーマのチャット UI
-└── api.py            # /api/chat (SSE) /api/learn /api/status など
+└── api.py            # /api/chat (SSE) /api/model/* /api/learn /api/status など
 ```
 
 ## 1. 高速化のポイント
@@ -124,6 +178,11 @@ UI のバッジに現在のエンジンが表示される。`GET /api/status` �
 | `SNIPHER_LFM_LEARN_STEPS` | `12` | 深学習の既定ステップ数 |
 | `SNIPHER_LFM_LEARN_LR` | `3e-3` | 深学習の学習率 |
 | `SNIPHER_LFM_STORE_DIR` | `var/learned_vocab` | 学習済み語彙の保存先 |
+| `SNIPHER_LFM_UPLOAD_DIR` | `var/models/upload` | ブラウザからのモデル取り込み先 |
+| `SNIPHER_LFM_SKIP_NET_CHECK` | `0` | `1` で HuggingFace 事前接続確認をスキップ |
+| `SNIPHER_ASSIST_ENABLED` | `1` | ハイブリッド補正の有効化 |
+| `SNIPHER_ASSIST_THRESHOLD` | `0.35` | 下書き確度がこの値未満なら LFM 補正 |
+| `SNIPHER_ASSIST_MAX_NEW_TOKENS` | `64` | LFM 補正の出力トークン上限 |
 
 ## 7. API
 
@@ -131,8 +190,11 @@ UI のバッジに現在のエンジンが表示される。`GET /api/status` �
 | --- | --- | --- |
 | GET | `/` | ホワイトテーマのチャット UI |
 | GET | `/classic` | 旧 UI（超小型エンジンのデモ） |
-| GET | `/api/status` | エンジン状態・学習済み文字・テンプレート情報 |
-| POST | `/api/chat` | SSE ストリーミング応答（`use_template:false` でテンプレートなし生成） |
+| GET | `/api/status` | エンジン状態・学習済み文字・テンプレート情報・ハイブリッド設定 |
+| POST | `/api/chat` | SSE ストリーミング応答（`hybrid:false` で LFM 直接・`use_template:false` でテンプレートなし生成） |
+| GET | `/api/model/import` | ローカル取り込み状態(不足ファイルの列挙) |
+| POST | `/api/model/upload` | モデルファイルのアップロード(multipart、`activate=1` で即ロード) |
+| POST | `/api/model/load` | アップロード済み/指定ローカルモデルでホットリロード |
 | POST | `/api/vocab/check` | テキスト中の未知文字をスキャン |
 | POST | `/api/learn` | 未知文字を学習（`mode: instant` / `deep`） |
 | GET | `/api/learn/status` | 深学習ジョブの状態 |

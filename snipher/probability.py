@@ -221,17 +221,24 @@ class ProbabilityModel:
     # 候補選択(softmax サンプリング)
     # ------------------------------------------------------------------ #
     def sample(self, candidates: list[dict], temperature: float | None = None) -> dict:
-        """候補リストからスコアに基づき確率的に1つ選ぶ。"""
+        """候補リストからスコアに基づき確率的に1つ選ぶ。
+
+        選ばれた候補にはそのソフトマックス確率が ``prob`` として付く。
+        この値が低い(≈ どの候補も曖昧)ほど生成は「確率的に不安」で、
+        ハイブリッド補正(LFM による書き直し)の対象になる。
+        """
         if not candidates:
             raise ValueError("候補が空です")
         temp = self.temperature if temperature is None else temperature
         if len(candidates) == 1:
+            candidates[0]["prob"] = 1.0
             return candidates[0]
         scores = [c.get("score", -1e9) for c in candidates]
         # 数値安定化のため最大値を引く
         mx = max(scores)
         if temp <= 0:
             best = max(candidates, key=lambda c: c.get("score", -1e9))
+            best["prob"] = 1.0
             return best
         exps = [math.exp((sc - mx) / temp) for sc in scores]
         total = sum(exps) or 1.0
@@ -241,5 +248,8 @@ class ProbabilityModel:
         for cand, p in zip(candidates, probs):
             acc += p
             if r <= acc:
+                cand["prob"] = p
                 return cand
+        candidates[-1]["prob"] = probs[-1]
         return candidates[-1]
+

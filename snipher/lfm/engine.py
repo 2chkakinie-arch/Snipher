@@ -115,6 +115,28 @@ class LfmEngine:
             self.state = STATE_FAILED
             self.error = f"{exc}"
 
+    @staticmethod
+    def _probe_hf(source: str) -> None:
+        """リモートモデルIDのときだけ、短いタイムアウトで接続を事前確認する。
+
+        huggingface_hub 自体は数回のリトライ・バックオフを持つため、
+        オフライン環境ではここで素早く明確なエラーにする(既定 5 秒)。
+        """
+        if os.environ.get("SNIPHER_LFM_SKIP_NET_CHECK", "0").strip() in ("1", "true", "yes"):
+            return
+        import urllib.request
+
+        url = f"https://huggingface.co/{source}/resolve/main/config.json"
+        try:
+            req = urllib.request.Request(url, method="HEAD")
+            urllib.request.urlopen(req, timeout=5)  # noqa: S310
+        except Exception as exc:  # noqa: BLE001
+            raise RuntimeError(
+                f"HuggingFace に接続できません(オフライン?): {exc}. "
+                "UI の『モデル管理』からローカルのモデルを取り込むか、"
+                "SNIPHER_LFM_MODEL=ローカルディレクトリ を指定してください。"
+            ) from exc
+
     def load(self, quantize: bool | None = None) -> None:
         """モデルをロードし（必要なら）INT8 量子化する。"""
         import torch
@@ -127,6 +149,8 @@ class LfmEngine:
             t0 = time.time()
             src = self.cfg.model_source
             log.info("LFM モデルをロード中: %s (quantize=%s)", src, quantize)
+            if not self.cfg.is_local:
+                self._probe_hf(src)
             self.tokenizer = AutoTokenizer.from_pretrained(src)
             model = AutoModelForCausalLM.from_pretrained(src, dtype=torch.bfloat16)
             model.eval()
@@ -451,4 +475,19 @@ class LfmEngine:
         prompt, mode = self.tmpl.apply(msgs, use_template=use_template)
         return prompt, mode, msgs
 
-        return prompt, mode, msgs
+    # ------------------------------------------------------------------ #
+    # モデルのホットスワップ(オフライン取り込み用)
+    # ------------------------------------------------------------------ #
+    def reload(self, source: str | None = None) -> None:
+        """モデルソースを変更し、バックグラウンドで再ロードする。
+
+        HuggingFace に接続できない環境では、ブラウザからアップロードした
+        ローカルのモデルディレクトリをここで差し替える。
+        """
+        with self.lifecycle_lock:
+            if source:
+                self.cfg.model_source = source
+            self._started = False
+            self.state = STATE_IDLE
+            self.error = None
+        self.ensure_started()

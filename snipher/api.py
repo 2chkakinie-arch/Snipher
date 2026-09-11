@@ -6,7 +6,7 @@ Vercel では WSGI/ASGI として、Render では `uvicorn snipher.api:app` で�
 from __future__ import annotations
 
 import contextlib
-import random
+import os
 import threading
 
 from fastapi import FastAPI
@@ -58,7 +58,7 @@ app = FastAPI(
         "超小型・確率的日本語AI + LFM2.5-1.2B-JP チャット。"
         "未知文字の学習とテンプレートフォールバック付きの高速な日常会話。"
     ),
-    version="0.2.0",
+    version="0.3.0",
     lifespan=_lifespan,
 )
 
@@ -72,36 +72,60 @@ app.add_middleware(
 
 
 # ----------------------------------------------------------------------
-# Snipher-mini フォールバック（ニューラルエンジンが使えないときの応答）
+# ハイブリッド補正: Snipher-mini の下書き → 不安な部分だけ LFM2.5 が書き直し
 # ----------------------------------------------------------------------
-_MINI_LEADS = ["なるほど。", "うんうん。", "そうなんですね。", "へえ、面白いですね。", ""]
+from snipher.lfm.assist import AssistConfig, HybridAssist
+
+_assist = HybridAssist()
+_ASSIST_CFG = _assist.cfg
 
 
-def _mini_reply(messages: list[dict]) -> tuple[str, dict]:
-    """超小型エンジン(476パラメータ)で会話っぽい一文を作る。"""
+def _chunk_for_stream(text: str, pieces: int = 3) -> list[str]:
+    """軽量経路のテキストを擬似ストリーミング用に文単位で分割する。"""
+    import re as _re
+
+    parts = [p for p in _re.split(r"(?<=。)|(?<=？)|(?<=！)", text) if p]
+    if len(parts) <= pieces:
+        return parts or [text]
+    merged: list[str] = []
+    per = max(1, -(-len(parts) // pieces))
+    for i in range(0, len(parts), per):
+        merged.append("".join(parts[i : i + per]))
+    return merged
+
+
+def _mini_reply(messages: list[dict], safe_only: bool | None = None) -> tuple[str, dict]:
+    """超小型エンジンで会話応答を作る(対話テーブル + 助動詞の補い)。
+
+    ニューラルエンジンが使えない環境でも、意図に沿った日本語の返答を
+    数ミリ秒で組み立てる。confidence が閾値未満の確率的生成文は、
+    LFM が無い限り安全な骨子(base_text)に退避させて出力する。
+    LFM が使えるときは HybridAssist がこの下書きを LFM に書き直させる。
+    """
     last_user = next(
         (m.get("content", "") for m in reversed(messages) if m.get("role") == "user"), ""
     )
-    topic = None
-    try:
-        if last_user:
-            topic = engine.analyze(last_user).get("topic")
-    except Exception:
-        topic = None
-    try:
-        gen = engine.generate(prompt=topic if topic else None, n=1)
-        body = gen["text"]
-    except Exception:
-        body = "今日もいい一日になりますように。"
-    lead = random.choice(_MINI_LEADS)
-    text = f"{lead}{body}" if lead else body
-    note = "（モデル未ロードのため Snipher-mini で応答中）"
-    return f"{text}{note}", {
-        "engine": "Snipher-mini",
+    draft = _assist.draft(last_user)
+    uncertain = _assist.needs_lfm(draft)
+    if uncertain and (safe_only or safe_only is None):
+        text = draft.get("base_text") or draft["text"]
+    else:
+        text = draft["text"]
+    stats = {
+        "engine": "Snipher-mini+",
         "template_mode": "rule-based",
         "new_tokens": None,
         "tokens_per_second": None,
+        "assist": "rule",
+        "draft": draft["text"],
+        "draft_confidence": draft.get("confidence"),
+        "intent": draft.get("intent"),
+        "fixes": draft.get("fixes", []),
+        "draft_seconds": draft.get("draft_seconds"),
     }
+    if uncertain:
+        stats["degraded_to_base"] = text != draft["text"]
+    return text, stats
 
 
 class AnalyzeRequest(BaseModel):
@@ -287,6 +311,10 @@ class ChatRequest(BaseModel):
     repetition_penalty: float | None = Field(None, ge=1.0, le=2.0)
     use_template: bool = Field(True, description="False でテンプレートなし生成")
     system_prompt: str | None = Field(None, max_length=2000)
+    hybrid: bool | None = Field(
+        None,
+        description="True/False でハイブリッド補正を強制。未指定時は LFM が使えるなら有効",
+    )
 
 
 def _sse(obj: dict) -> str:
@@ -300,23 +328,45 @@ def api_status():
     """ニューラルエンジンと学習済み語彙の状態。"""
     eng = lfm_engine()
     if eng is None:
-        return {"deps": False, "lfm": None, "fallback": "Snipher-mini"}
+        return {
+            "deps": False,
+            "lfm": None,
+            "fallback": "Snipher-mini+",
+            "hybrid": {"available": False, "assist": "rule", "reason": "torch/transformers 未インストール"},
+        }
     if eng.cfg.autostart:
         eng.ensure_started()
     st = eng.status()
     st["engine_label"] = eng.engine_name() if eng.is_ready else None
-    return {"deps": True, "lfm": st}
+    return {
+        "deps": True,
+        "lfm": st,
+        "fallback": "Snipher-mini+",
+        "hybrid": {
+            "available": eng.is_ready,
+            "assist": "lfm" if eng.is_ready else "rule",
+            "threshold": _ASSIST_CFG.threshold,
+            "enabled": _ASSIST_CFG.enabled,
+        },
+    }
 
 
 @app.post("/api/chat")
 def api_chat(req: ChatRequest):
-    """SSE ストリーミングで応答するチャット。"""
+    """SSE ストリーミングで応答するチャット。
+
+    ハイブリッド経路（既定）:
+        Snipher-mini が一瞬で下書きを作り、確率的に不安な返答
+        （confidence が閾値未満）のときだけ LFM2.5 が書き直す。
+        助動詞・文体の欠落は常にルールで補う（polisher）。
+    """
     eng = lfm_engine()
     if eng is not None and eng.cfg.autostart:
         eng.ensure_started()
 
     msgs = [m.model_dump() for m in req.messages]
     last_user = next((m["content"] for m in reversed(msgs) if m["role"] == "user"), "")
+    use_hybrid = req.hybrid if req.hybrid is not None else True
 
     def gen():
         ready = eng is not None and eng.is_ready
@@ -343,13 +393,84 @@ def api_chat(req: ChatRequest):
                 reason = "学習処理中"
             else:
                 reason = eng.error or "モデル未ロード"
+                if "huggingface" in (reason or "").lower() or "ConnectionError" in (reason or ""):
+                    reason = "HuggingFace に未接続（モデルをローカルから取り込んでください）"
+
+            # ---- 軽量経路: 対話テーブル + 助動詞の補い（数ミリ秒） ----
             text, stats = _mini_reply(msgs)
             stats["fallback_reason"] = reason
-            yield _sse({"type": "start", "engine": "Snipher-mini", "template_mode": "rule-based"})
-            yield _sse({"type": "delta", "text": text})
+            yield _sse({"type": "start", "engine": "Snipher-mini+", "template_mode": "rule-based"})
+            for piece in _chunk_for_stream(text):
+                yield _sse({"type": "delta", "text": piece})
             yield _sse({"type": "done", "text": text, "stats": stats})
             return
 
+        # ---- LFM 利用可能 ----
+        if use_hybrid:
+            try:
+                draft = _assist.draft(last_user)
+                if _assist.needs_lfm(draft):
+                    # 確率的に不安な下書き → LFM2.5 が書き直す（賢い経路）
+                    yield _sse({
+                        "type": "assist",
+                        "mode": "lfm",
+                        "draft": draft["text"],
+                        "confidence": draft.get("confidence"),
+                        "reason": "low_confidence",
+                    })
+                    holder: dict = {}
+
+                    def _polish():
+                        text, stats = yield from _assist.polish_with_lfm(
+                            eng, draft, last_user,
+                            temperature=req.temperature if req.temperature is not None else 0.3,
+                            max_new_tokens=max(
+                                24, min(req.max_new_tokens or 64, _ASSIST_CFG.max_new_tokens)
+                            ),
+                        )
+                        holder["text"] = text
+                        holder["stats"] = stats
+
+                    try:
+                        for ev in _polish():
+                            yield _sse(ev)
+                    except Exception as exc:  # noqa: BLE001 — LFM 補正が失敗しても下書きで応答
+                        holder["error"] = str(exc)
+
+                    text = holder.get("text") or draft["text"]
+                    stats = holder.get("stats") or {
+                        "engine": "Snipher-mini+", "assist": "rule",
+                        "template_mode": "rule-based",
+                    }
+                    if holder.get("error"):
+                        stats["assist_fallback"] = holder["error"]
+                    yield _sse({"type": "done", "text": text, "stats": stats})
+                    return
+                # 確信を持てる下書き → そのまま高速返答（LFM は未使用・速度維持）
+                stats = {
+                    "engine": "Snipher-mini+ (LFM 未使用)",
+                    "template_mode": "rule-based",
+                    "new_tokens": None,
+                    "tokens_per_second": None,
+                    "assist": "rule",
+                    "draft": draft["text"],
+                    "draft_confidence": draft.get("confidence"),
+                    "draft_seconds": draft.get("draft_seconds"),
+                    "intent": draft.get("intent"),
+                    "fixes": draft.get("fixes", []),
+                }
+                yield _sse({
+                    "type": "assist", "mode": "rule", "confidence": draft.get("confidence"),
+                })
+                yield _sse({"type": "start", "engine": stats["engine"], "template_mode": "rule-based"})
+                for piece in _chunk_for_stream(draft["text"]):
+                    yield _sse({"type": "delta", "text": piece})
+                yield _sse({"type": "done", "text": draft["text"], "stats": stats})
+                return
+            except Exception:  # noqa: BLE001 — 補正経路が壊れても LFM 直接応答へ
+                pass
+
+        # ---- LFM 直接応答（hybrid=False または補正経路の失敗時） ----
         try:
             for ev in eng.stream_chat(
                 msgs,
@@ -454,3 +575,111 @@ def api_learn_reset():
         return {"ok": True, **eng.reset_learned()}
     except Exception as exc:  # noqa: BLE001
         return {"ok": False, "error": str(exc)}
+
+
+# ====================================================================== #
+# モデル取り込み（HuggingFace に接続できない環境向け）
+# ====================================================================== #
+# このサンドボックスのように huggingface.co への外向き接続が遮断されている
+# 環境では、ユーザーの PC でモデルをダウンロードし、ブラウザからこの UI 経由で
+# アップロードする（または tools/fetch_model.py のミラー機能を使う）。
+from pathlib import Path  # noqa: E402
+
+from fastapi import File, Form, UploadFile  # noqa: E402
+
+from snipher.lfm.config import REPO_ROOT  # noqa: E402
+
+UPLOAD_DIR = Path(os.environ.get("SNIPHER_LFM_UPLOAD_DIR", str(REPO_ROOT / "var" / "models" / "upload")))
+_ALLOWED_EXTS = {".json", ".safetensors", ".jinja", ".txt", ".model", ".bin"}
+_REQUIRED = ["config.json", "*token*", "*.safetensors"]
+
+
+def _model_dir_status(d: Path) -> dict:
+    files = []
+    if d.exists():
+        for p in sorted(d.iterdir()):
+            if p.is_file():
+                files.append({"name": p.name, "size": p.stat().st_size})
+    has_config = any(f["name"] == "config.json" for f in files)
+    has_tokenizer = any(("token" in f["name"].lower()) for f in files)
+    has_weights = any(f["name"].endswith(".safetensors") for f in files)
+    complete = has_config and has_tokenizer and has_weights
+    missing = [r for r, ok in (
+        ("config.json", has_config),
+        ("tokenizer (tokenizer.json / tokenizer_config.json)", has_tokenizer),
+        ("*.safetensors", has_weights),
+    ) if not ok]
+    return {"dir": str(d), "files": files, "complete": complete, "missing": missing}
+
+
+@app.get("/api/model/import")
+def api_model_import():
+    """ローカル取り込みディレクトリの状態(不足ファイルの判定つき)。"""
+    eng = lfm_engine()
+    return {
+        "upload": _model_dir_status(UPLOAD_DIR),
+        "current_source": eng.cfg.model_source if eng else None,
+        "engine_state": eng.state if eng else None,
+        "engine_error": eng.error if eng else None,
+        "hint": (
+            "HuggingFace に直接接続できない環境では、ローカル PC で "
+            "LiquidAI/LFM2.5-1.2B-JP-202606 をダウンロードし、"
+            "config.json / tokenizer.json / tokenizer_config.json / model.safetensors "
+            "をここにアップロードしてください。"
+        ),
+    }
+
+
+@app.post("/api/model/upload")
+async def api_model_upload(files: list[UploadFile] = File(...), activate: str = Form("0")):
+    """モデルファイルをブラウザからアップロードする（複数可・一覧は GET /api/model/import）。
+
+    完了後 activate=1 でエンジンをホットリロードする。
+    """
+    UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+    saved = []
+    skipped = []
+    for f in files:
+        name = Path(f.filename or "").name  # パス区切りを除去
+        ext = Path(name).suffix.lower()
+        if not name or ext not in _ALLOWED_EXTS:
+            skipped.append(name or "(unnamed)")
+            continue
+        dest = UPLOAD_DIR / name
+        size = 0
+        with open(dest, "wb") as out:  # 100MB 単位でディスクへ書き流す
+            while chunk := await f.read(100 * 1024 * 1024):
+                out.write(chunk)
+                size += len(chunk)
+        saved.append({"name": name, "size": size})
+    status = _model_dir_status(UPLOAD_DIR)
+    result: dict = {"ok": True, "saved": saved, "skipped": skipped, "status": status}
+    if activate == "1" and status["complete"]:
+        eng = lfm_engine()
+        if eng is not None:
+            eng.reload(str(UPLOAD_DIR))
+            result["activated"] = True
+    return result
+
+
+class ModelLoadRequest(BaseModel):
+    source: str | None = Field(None, max_length=1000, description="ローカルのモデルディレクトリ(既定: アップロード済みディレクトリ)")
+
+
+@app.post("/api/model/load")
+def api_model_load(req: ModelLoadRequest):
+    """アップロード済み（または指定のローカル）モデルでエンジンを再ロードする。"""
+    eng = lfm_engine()
+    if eng is None:
+        return {"ok": False, "error": "torch/transformers 未インストール"}
+    source = req.source
+    if not source:
+        st = _model_dir_status(UPLOAD_DIR)
+        if not st["complete"]:
+            return {"ok": False, "error": f"アップロードが不完全です。不足: {', '.join(st['missing'])}"}
+        source = str(UPLOAD_DIR)
+    p = Path(source)
+    if not p.is_dir():
+        return {"ok": False, "error": f"ローカルディレクトリが見つかりません: {source}"}
+    eng.reload(str(p))
+    return {"ok": True, "source": str(p), "state": "loading"}
