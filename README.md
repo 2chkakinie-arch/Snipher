@@ -110,7 +110,9 @@ curl -X POST http://localhost:8000/generate \
 
 1. リポジトリを GitHub に push
 2. Vercel でこのリポジトリをインポート
-3. `vercel.json` が `snipher/api.py` を Python ランタイムの Serverless Function として認識
+3. `pyproject.toml` の `[tool.vercel] entrypoint = "snipher.api:app"` により、
+   FastAPI アプリが Python ランタイムの Serverless Function として自動認識される
+   (追加のルーティング設定は不要。全リクエストがアプリに転送される)
 
 ### Render
 

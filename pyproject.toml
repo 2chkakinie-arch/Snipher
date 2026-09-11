@@ -7,7 +7,7 @@ name = "snipher"
 version = "0.1.0"
 description = "超小型・確率的日本語AI — 構文解析と独自確率式による高速な日本語生成"
 readme = "README.md"
-requires-python = ">=3.9"
+requires-python = ">=3.10"
 license = { text = "MIT" }
 authors = [{ name = "Snipher" }]
 
@@ -19,3 +19,8 @@ packages = ["snipher"]
 
 [tool.setuptools.package-data]
 snipher = ["data/*.json"]
+
+# Vercel Python ランタイムのエントリポイント。
+# `snipher.api` モジュールとしてロードされるため、パッケージ内 import が正しく解決される。
+[tool.vercel]
+entrypoint = "snipher.api:app"

@@ -5,14 +5,12 @@ Vercel では WSGI/ASGI として、Render では `uvicorn snipher.api:app` で�
 
 from __future__ import annotations
 
-import os
-
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, ConfigDict, Field
 
-from .engine import SnipherEngine
+from snipher.engine import SnipherEngine
 
 engine = SnipherEngine()
 
