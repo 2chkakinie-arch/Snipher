@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "snipher"
+version = "0.1.0"
+description = "超小型・確率的日本語AI — 構文解析と独自確率式による高速な日本語生成"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+authors = [{ name = "Snipher" }]
+
+[project.optional-dependencies]
+server = ["fastapi>=0.100", "uvicorn>=0.23", "pydantic>=2.0"]
+
+[tool.setuptools]
+packages = ["snipher"]
+
+[tool.setuptools.package-data]
+snipher = ["data/*.json"]

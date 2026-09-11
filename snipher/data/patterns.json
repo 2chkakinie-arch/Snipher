@@ -1,0 +1,14 @@
+[
+  {"id":"plain", "name":"平叙文(他動詞構文)", "structure":["topic","object","verb"], "weight":1.0},
+  {"id":"state", "name":"状態文(〜は〜です)", "structure":["topic","adjective","auxiliary","sentence_end"], "weight":0.9},
+  {"id":"nominal", "name":"名詞述語文(〜は〜です)", "structure":["topic","noun_predicate"], "weight":0.8},
+  {"id":"topic_subject", "name":"自動詞文(〜は〜ます)", "structure":["topic","verb"], "weight":1.1},
+  {"id":"reason", "name":"理由文(〜ので)", "structure":["topic","adjective","reason_conj","verb"], "weight":0.7},
+  {"id":"contrast", "name":"逆接文(〜が)", "structure":["topic","adjective","contrast_conj","verb"], "weight":0.6},
+  {"id":"temporal", "name":"時点文(朝/夜 に)", "structure":["time","object","verb"], "weight":0.8},
+  {"id":"place", "name":"場所文(〜で)", "structure":["topic","place","verb"], "weight":0.7},
+  {"id":"compound", "name":"複文(そして/だから)", "structure":["clause1","conjunction","clause2"], "weight":0.5},
+  {"id":"question", "name":"疑問文(〜か)", "structure":["topic","object","verb","question_mark"], "weight":0.4},
+  {"id":"exclamation", "name":"感嘆文(〜ね)", "structure":["topic","adjective","auxiliary","exclamation_end"], "weight":0.3},
+  {"id":"conjecture", "name":"推量文(〜でしょう)", "structure":["topic","object","verb","conjecture_aux"], "weight":0.5}
+]
