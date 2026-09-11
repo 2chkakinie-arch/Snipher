@@ -1,15 +1,3 @@
 {
-  "$schema": "https://openapi.vercel.sh/vercel.json",
-  "builds": [
-    {
-      "src": "snipher/api.py",
-      "use": "@vercel/python"
-    }
-  ],
-  "routes": [
-    {
-      "src": "/(.*)",
-      "dest": "snipher/api.py"
-    }
-  ]
+  "$schema": "https://openapi.vercel.sh/vercel.json"
 }
