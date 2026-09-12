@@ -49,6 +49,42 @@ class SnipherEngine:
     # ------------------------------------------------------------------ #
     # モデル情報
     # ------------------------------------------------------------------ #
+    def knowledge(self) -> dict | None:
+        """知識ベース（BM25 検索）の統計。使えない環境では None。"""
+        try:
+            from .knowledge import KnowledgeBase
+
+            kb = KnowledgeBase.shared()
+            return kb.stats() if kb is not None else None
+        except Exception:  # noqa: BLE001
+            return None
+
+    def neural(self) -> dict:
+        """内蔵ニューラルコア（LFM2.5 蒸留スナップショット）の情報。"""
+        out = {"available": False, "params": 0, "vocab": 0, "weights_bytes": 0, "engine": None}
+        try:
+            from .neural import numpy_available
+
+            if not numpy_available():
+                out["reason"] = "numpy が未インストールです"
+                return out
+            from .neural.cache import get_core
+
+            core = get_core()
+            if core is None:
+                from .neural.core import DEFAULT_PATH
+
+                out["reason"] = f"重みが未ビルドです（python tools/distill_neural.py）: {DEFAULT_PATH}"
+                return out
+            out.update({"available": True, "params": core.net.n_params(),
+                        "vocab": core.tok.size(), "engine": core.engine_name(),
+                        "weights_bytes": core.path.stat().st_size if core.path.exists() else 0,
+                        "trained_at": core.meta.get("trained_at"),
+                        "metrics": core.meta.get("metrics")})
+        except Exception as exc:  # noqa: BLE001
+            out["reason"] = str(exc)
+        return out
+
     def info(self) -> dict:
         """モデルのパラメータ数と設計情報を返す。"""
         cfg = self.lexicon.config
@@ -60,14 +96,29 @@ class SnipherEngine:
                       "patterns", "corpus")
         )
         weight_params = len(cfg.get("weights", {}))
+        kb_stats = self.knowledge() or {}
+        kb_params = int(sum(kb_stats.get(k, 0) for k in ("topics", "facts", "questions", "answers")))
+        net = self.neural()
+        net_params = int(net.get("params") or 0)
         return {
             "name": "Snipher",
-            "version": "0.1.0",
-            "architecture": "ルールベース構文解析 + 確率的テーブル生成(if構文ベース)",
+            "version": "0.4.0",
+            "architecture": (
+                "ルールベース構文解析 + 確率的テーブル生成(if構文ベース) "
+                "+ LFM2.5 アーキテクチャの蒸留ニューラルコア + BM25 知識ベース"
+            ),
             "language": "日本語のみ",
-            "total_parameters": table_params + weight_params,
+            "total_parameters": table_params + weight_params + kb_params + net_params,
+            "parameter_breakdown": {
+                "lexicon_table_entries": table_params,
+                "probability_weights": weight_params,
+                "knowledge_base_entries": kb_params,
+                "neural_core_weights": net_params,
+            },
             "table_entries": table_params,
             "probability_weights": weight_params,
+            "knowledge_base": kb_stats or None,
+            "neural_core": {k: v for k, v in net.items() if k != "metrics"},
             "weights": cfg.get("weights", {}),
             "temperature": cfg.get("temperature"),
             "lexicon_stats": stats,

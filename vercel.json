@@ -1,3 +1,10 @@
 {
-  "$schema": "https://openapi.vercel.sh/vercel.json"
+  "$schema": "https://openapi.vercel.sh/vercel.json",
+  "functions": {
+    "snipher/api.py": {
+      "maxDuration": 60,
+      "memory": 1024,
+      "excludeFiles": "{tests,docs,var,node_modules,.venv,.git,tools/demo,.pytest_cache}/**"
+    }
+  }
 }

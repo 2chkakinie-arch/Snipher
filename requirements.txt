@@ -1,4 +1,9 @@
+# Snipher 本体（高速コア + 内蔵ニューラルコア）に必要な依存だけ。
+# LFM2.5-1.2B-JP のフルウェイトを使う場合のみ requirements-llm.txt を追加で入れる。
 fastapi>=0.100
 uvicorn>=0.23
 pydantic>=2.0
 python-multipart>=0.0.9
+# 内蔵ニューラルコア（LFM2.5 アーキテクチャの蒸留スナップショット）の推論に必要。
+# 無い場合でも Snipher はルール/確率テーブル経路で動作を続ける（graceful degradation）。
+numpy>=1.24

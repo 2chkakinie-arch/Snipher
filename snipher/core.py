@@ -16,6 +16,14 @@
     │    │                               未知文字を 1 トークン化(torch バックエンド)│
     │    └─ テンプレートフォールバック  … native → 内蔵 ChatML → 素の生成         │
     │                                                                          │
+    │  ニューラルコアは環境に応じて 3 段構えで自動選択（ユーザー設定ゼロ）:        │
+    │    T1  ローカル フルウェイト … llama.cpp(GGUF ~731MB) / torch(INT8) を自動取得│
+    │    T2  リモート委譲          … SNIPHER_LFM_REMOTE_URL の常駐ホストに生成を依頼│
+    │    T3  内蔵蒸留コア          … LFM2.5 と同じアーキテクチャを蒸留した           │
+    │                                NumPy スナップショット（同梱・ミリ秒ロード）     │
+    │  T3 は重み同梱なので Vercel 等のサーバーレスでもダウンロード不要で動く。        │
+    │  知識は `snipher/knowledge.py`（BM25 検索）で補い、どんな話題でも事実を引ける。 │
+    │                                                                          │
     │  モデルは起動時に全自動取得(レジューム対応・マルチソース)。                  │
     │  バックエンドは llama.cpp(GGUF・最速) / torch(INT8) を自動選択。            │
     └──────────────────────────────────────────────────────────────────────────┘
@@ -31,8 +39,9 @@ import threading
 import time
 from pathlib import Path
 
+from .knowledge import KnowledgeBase
 from .lfm.assist import AssistConfig, HybridAssist
-from .lfm.config import DEFAULT_GGUF_QUANT, LfmConfig
+from .lfm.config import DEFAULT_GGUF_QUANT, LfmConfig, is_serverless
 from .polisher import Polisher
 
 log = logging.getLogger(__name__)
@@ -43,9 +52,11 @@ CANNED_INTENTS = {
     "farewell", "agreement", "disagreement", "praise",
 }
 
-ROUTE_INSTANT = "instant"   # ⚡ 高速コアが即答
-ROUTE_NEURAL = "neural"     # ✨ LFM2.5 が生成（内部構造）
-ROUTE_FALLBACK = "fallback" # 高速コアのみ（ニューラル未就绪）
+ROUTE_INSTANT = "instant"     # ⚡ 高速コアが即答（数ミリ秒）
+ROUTE_KNOWLEDGE = "knowledge"  # 📚 知識ベース検索＋補足生成
+ROUTE_LIGHT = "light"          # ✨ 内蔵ニューラルコア（LFM2.5 蒸留）が生成
+ROUTE_NEURAL = "neural"        # ✨ LFM2.5 が生成（フルウェイト / リモート）
+ROUTE_FALLBACK = "fallback"    # 高速コアのみ（ニューラル未就绪）
 
 
 class SnipherCore:
@@ -70,6 +81,11 @@ class SnipherCore:
         self._cancel = threading.Event()
         self._learn_threads: set[threading.Thread] = set()
         self._env_sig = self._env_signature()
+        # ---- 軽量ニューラルコア（LFM2.5 の蒸留スナップショット）/ 知識ベース ---- #
+        self._light = None
+        self._light_state = "unchecked"        # unchecked|ready|absent|off|error
+        self._remote = None
+        self.kb = KnowledgeBase.shared()
 
     @staticmethod
     def _env_signature() -> tuple:
@@ -123,7 +139,11 @@ class SnipherCore:
         return self._gguf
 
     def active_backend(self):
-        """現在アクティブ（ready）なニューラルバックエンドを返す。"""
+        """現在アクティブ（ready）な「重い」ニューラルバックエンドを返す。
+
+        優先順位: ローカル llama.cpp(GGUF) → ローカル torch → リモート委譲。
+        どれも無ければ None（→ 内蔵蒸留コア／ルール経路が担う）。
+        """
         if self.backend_kind == "gguf" and self._gguf is not None and self._gguf.is_ready:
             return self._gguf
         eng = self.torch_engine()
@@ -134,10 +154,103 @@ class SnipherCore:
             return self._gguf
         if eng is not None and eng.is_ready:
             return eng
+        # T2: リモートのフルウェイト（設定済みで疎通できる場合のみ）
+        remote = self.remote_backend()
+        if remote is not None and remote.is_ready:
+            return remote
         return None
 
     def neural_available(self) -> bool:
+        """LFM2.5 フルウェイト（ローカル or リモート）が使えるか。
+
+        内蔵蒸留コア（T3）は含めない — 高速経路の判定は「重い生成を挟むか否か」で
+        決まるため、既存の経路契約（instant / neural / fallback）を崩さない。
+        """
         return self.active_backend() is not None
+
+    # ------------------------------------------------------------------ #
+    # T2: リモート委譲 / T3: 内蔵蒸留コア
+    # ------------------------------------------------------------------ #
+    def remote_backend(self):
+        """常駐ホストの LFM2.5 に生成を委譲するバックエンド（未設定なら None）。"""
+        if not self.cfg.remote_url:
+            return None
+        if self._remote is None:
+            from .lfm.remote_backend import RemoteLfmBackend
+
+            self._remote = RemoteLfmBackend(self.cfg.remote_url, token=self.cfg.remote_token)
+        return self._remote
+
+    def light_core(self):
+        """内蔵ニューラルコア（LFM2.5 を蒸留した NumPy スナップショット）。
+
+        重みはパッケージ同梱なのでダウンロード不要・初回のみ数十ミリ秒でロードし、
+        以降はメモリ上の行列をそのまま使う（サーバーレスでも即動）。
+        """
+        want = (self.cfg.light_core or "auto").lower()
+        if want == "off":
+            self._light_state = "off"
+            return None
+        if self._light_state == "ready":
+            return self._light
+        if self._light_state in ("absent", "error") and want != "on":
+            return None
+        if self._light is not None and self._light_state == "unchecked":
+            return self._light
+        from .neural.cache import get_core
+
+        core = get_core()
+        if core is None:
+            self._light_state = "absent" if want != "on" else "error"
+            self._light = None
+            return None
+        self._light = core
+        self._light_state = "ready"
+        log.info("内蔵ニューラルコアを有効化: %s", core.engine_name())
+        return core
+
+    def light_ready(self) -> bool:
+        return self.light_core() is not None
+
+    def disable_light(self) -> None:
+        """テスト/低速環境用に内蔵ニューラルコアを無効化する。"""
+        self._light = None
+        self._light_state = "off"
+        self.cfg.light_core = "off"
+
+    def any_neural(self) -> bool:
+        return self.active_backend() is not None or self.light_ready()
+
+    def tiers(self) -> dict:
+        """どの知能階層が生きているか（/api/status・/info 用）。"""
+        heavy = None
+        if self._gguf is not None and self._gguf.is_ready:
+            heavy = "gguf"
+        elif self.torch_engine() is not None and getattr(self.torch_engine(), "is_ready", False):
+            heavy = "torch"
+        remote = self.remote_backend()
+        return {
+            "local_full": heavy,
+            "remote": {"configured": bool(self.cfg.remote_url),
+                       "alive": bool(remote and remote.is_ready)} if remote or self.cfg.remote_url else None,
+            "distilled": self._light_state if self._light_state != "unchecked" else (
+                "ready" if self.light_ready() else self._light_state),
+            "knowledge_base": self.kb.stats() if self.kb is not None else None,
+            "serverless": is_serverless(),
+        }
+
+    # ------------------------------------------------------------------ #
+    # 知識ベース（BM25）
+    # ------------------------------------------------------------------ #
+    def kb_answer(self, text: str) -> dict | None:
+        """発話に合う事実があれば返す（検索は 0.1 ミリ秒オーダー・常時使用可）。"""
+        if self.kb is None:
+            return None
+        try:
+            return self.kb.answer(text)
+        except Exception:  # noqa: BLE001
+            log.debug("知識ベース検索に失敗", exc_info=True)
+            return None
 
     # ------------------------------------------------------------------ #
     # 自動取得
@@ -246,6 +359,13 @@ class SnipherCore:
 
     def _boot_loop(self, gen: int) -> None:
         pending = getattr(self, "_pending_backend", None)
+        if is_serverless() and not self.cfg.auto_fetch and pending is None:
+            # Vercel 等: 731MB の取得は無意味。内蔵蒸留コア／リモート委譲が知能を担う。
+            self.boot_state = "skipped_serverless"
+            self.boot_error = None
+            log.info("サーバーレス環境のためフルウェイトの自動取得をスキップします"
+                     "（内蔵蒸留コア + 知識ベースで応答）")
+            return
         while not self._cancel.is_set() and gen == self._boot_gen:
             self.boot_error = None
             backend = pending or self._choose_backend()
@@ -375,6 +495,14 @@ class SnipherCore:
         st["neural_ready"] = backend is not None
         st["acquire"] = self.acquire_status()
         st["engine_label"] = backend.engine_name() if backend is not None else None
+        st["tiers"] = self.tiers()
+        light = self.light_core()
+        st["light"] = light.status() if light is not None else {
+            "state": self._light_state, "kind": "distilled", "params": 0}
+        st["light_backend"] = st["light"].get("engine")
+        st["light_ready"] = light is not None
+        st["knowledge"] = self.kb.stats() if self.kb is not None else None
+        st["neural_ready_any"] = self.any_neural()
         return st
 
     # ------------------------------------------------------------------ #
@@ -421,18 +549,37 @@ class SnipherCore:
     # 会話（内部パイプライン）
     # ------------------------------------------------------------------ #
     def route_of(self, draft: dict, mode: str) -> str:
-        """auto モードの経路判定: 確実な定形 → instant / それ以外 → neural。"""
+        """auto モードの経路判定。
+
+            確実な定形               → instant（数ミリ秒・ニューラル不使用）
+            曖昧/自由応答 + 重いコア → neural（LFM2.5 フルウェイト or リモート）
+            曖昧/自由応答 + 蒸留コア → light / knowledge（内蔵ニューラルコア）
+            ニューラル一切なし        → fallback（高速コアのみ）
+        """
         if mode == "fast":
             return ROUTE_INSTANT
-        if not self.neural_available():
-            return ROUTE_FALLBACK
+        if mode == "light":
+            return self._light_route(draft, force=True)
         if mode in ("lfm", "neural"):
-            return ROUTE_NEURAL
+            # 強制指定でも、重いコアが無ければ内蔵蒸留コアが同じ顔をして応答する
+            return ROUTE_NEURAL if self.neural_available() else self._light_route(draft, force=True)
+        if not self.neural_available():
+            return self._light_route(draft, force=False)
         intent = str(draft.get("intent") or "")
         conf = float(draft.get("confidence", 1.0))
         if intent not in CANNED_INTENTS or conf < self.assist.cfg.threshold:
             return ROUTE_NEURAL
         return ROUTE_INSTANT
+
+    def _light_route(self, draft: dict, *, force: bool) -> str:
+        """重いコアが居ないときの代替経路（内蔵蒸留コア + 知識ベース）。"""
+        if not self.light_ready():
+            return ROUTE_FALLBACK      # 重みが無い環境は従来のルール契約を維持
+        intent = str(draft.get("intent") or "")
+        conf = float(draft.get("confidence", 1.0))
+        if intent in CANNED_INTENTS and conf >= self.assist.cfg.threshold and not force:
+            return ROUTE_INSTANT          # 定形応答はニューラルを使わず即答（速度維持）
+        return ROUTE_LIGHT
 
     def stream_reply(self, messages: list[dict], *, mode: str = "auto",
                      max_new_tokens: int | None = None, temperature: float | None = None,
@@ -463,6 +610,10 @@ class SnipherCore:
                                           repetition_penalty=repetition_penalty,
                                           use_template=use_template,
                                           system_prompt=system_prompt)
+            return
+
+        if route in (ROUTE_LIGHT, ROUTE_KNOWLEDGE):
+            yield from self._light_reply(messages, draft, route, mode=mode)
             return
 
         # 3) instant / fallback: 高速コアの応答をそのまま返す（速度維持）
@@ -497,6 +648,149 @@ class SnipherCore:
             yield {"type": "delta", "text": piece}
         yield {"type": "done", "text": text, "stats": stats}
 
+    def _light_reply(self, messages: list[dict], draft: dict, route: str, *, mode: str = "auto"):
+        """✨ 内蔵ニューラルコア（LFM2.5 の蒸留スナップショット）＋知識ベース経路。
+
+        フルウェイトをロードできない環境（Vercel 等）でも「どんな会話」に使えるよう、
+
+            知識ベース検索（事実） → 内蔵コアが文章化・会話を続ける
+            確信的な部分（ルール下書き）はそのまま使い、不安な部分だけを生成する
+
+        という分担をする。生成は 1 文字あたり 2〜3ms（NumPy）で、高速経路は通らない。
+        """
+        core = self.light_core()
+        last_user = next((m.get("content", "") for m in reversed(messages)
+                         if m.get("role") == "user"), "")
+        t0 = time.time()
+        kb = self.kb_answer(last_user)
+        info = {"route": route, "knowledge": None, "engine": "Snipher-mini+"}
+        if kb:
+            info["knowledge"] = {"topic": kb.get("topic"), "score": kb.get("score"),
+                                 "coverage": kb.get("coverage"), "usage": kb.get("usage")}
+
+        yield {"type": "assist", "mode": "light", "route": route,
+               "confidence": draft.get("confidence"),
+               "reason": "knowledge_hit" if kb else "uncertain_slot",
+               "knowledge": info["knowledge"]}
+        rule_text = draft.get("text") or ""
+        base_text = draft.get("base_text") or rule_text
+        conf = float(draft.get("confidence", 1.0))
+        text = ""
+        gen_text = ""
+        light_conf: float | None = None        # 候補を採点したときだけ値が入る
+        ppl: float | None = None
+        used_core = False
+        if kb is not None:
+            text = str(kb.get("text") or "").strip()
+            if core is not None and conf < self.assist.cfg.threshold:
+                # 事実を伝えたあと、会話を続ける一文だけを内蔵コアに作らせる
+                gen_text = core.reply(last_user, context=messages, max_chars=40,
+                                      temperature=0.55, top_k=24) or ""
+        elif core is not None:
+            gen_text = core.reply(last_user, context=messages,
+                                  max_chars=self.cfg.light_max_chars,
+                                  temperature=0.85, top_k=40) or ""
+            used_core = bool(gen_text)
+        # 確率的に不安なときだけ、下書き候補をもう数案ふやして内蔵コアに選ばせる
+        extra_cands: list[str] = []
+        if core is not None and kb is None and conf < self.assist.cfg.threshold:
+            try:
+                gen = self.assist.responder.gen
+                for _ in range(3):
+                    d = gen.generate(prompt=draft.get("topic"), register="polite", tense="nonpast")
+                    t = _clean_sentence(str(d.get("text") or ""))
+                    if t:
+                        extra_cands.append(t)
+            except Exception:  # noqa: BLE001 - 候補水増しは無くても困らない
+                extra_cands = []
+        chosen_from_model = False
+        if core is not None and not text:
+            used_core = True
+            scored = []
+            for cand in filter(None, {rule_text, base_text, gen_text, *extra_cands}):
+                sc = core.score(cand)
+                prefer = 0.06 if cand == rule_text else 0.0     # 迷ったらルールを尊重
+                scored.append((sc["confidence"] + prefer, cand, sc))
+            scored.sort(key=lambda t: -t[0])
+            _, text, sc = scored[0]
+            light_conf = sc["confidence"]
+            ppl = sc["perplexity"]
+            chosen_from_model = text == gen_text or text in extra_cands
+        if not text:
+            text = rule_text if conf >= self.assist.cfg.threshold else base_text
+        # 根拠（知識ベース）が無く、内蔵コアの確信度も低いなら — 事実を主張せず
+        # 話題を受け取る安全応答に切り替える（それっぽい誤情報より正直で有益）。
+        # モデルが書いた文にはルールより厳しいバー（+0.11）を適用する。
+        bar = self.cfg.light_gate + (0.11 if chosen_from_model else 0.0)
+        if (core is not None and kb is None and light_conf is not None
+                and light_conf < bar):
+            topic = str(draft.get("topic") or "").strip()
+            text = (f"{topic}のことですね。" if topic else "なるほど、そういうことですね。") \
+                + "もう少し詳しく聞かせてください。"
+            used_core = False
+            stats_note = "low_confidence_ack"
+        else:
+            stats_note = None
+        # 助動詞の補い（内蔵コアの神経系）
+        added = ""
+        if core is not None and _looks_incomplete(text):
+            used_core = True
+            comp = core.complete(text)
+            if comp.get("changed") and comp.get("confidence", 0) >= 0.25:
+                added = comp.get("added") or ""
+                text = comp.get("text") or text
+        # 会話継続の一文（知識ベースヒット時だけ後ろに足す）
+        extra = ""
+        if gen_text and kb is not None and core is not None:
+            sc = core.score(gen_text)
+            used_core = True
+            if sc["confidence"] >= 0.55 and gen_text not in text:
+                extra = gen_text
+        polished = self.polisher.polish(f"{text}{extra}", register="polite")
+        fixes = list(polished["fixes"])
+        if added:
+            fixes.append("neural_completion")
+        final = polished["text"] or text
+        engine = (core.engine_name() if used_core
+                  else "Snipher 知識ベース" if kb is not None else "Snipher-mini+")
+        yield {"type": "start", "engine": engine,
+               "template_mode": "distilled-numpy" if used_core else "knowledge+rule"}
+        for piece in _chunk_for_stream(final, pieces=2):
+            yield {"type": "delta", "text": piece}
+        stats = {
+            "engine": engine,
+            "template_mode": "distilled-numpy" if used_core else ("knowledge-bm25" if kb else "rule-based"),
+            "neural_used": used_core,
+            "assist": "light",
+            "route": route,
+            "draft": rule_text,
+            "draft_confidence": conf,
+            "intent": draft.get("intent"),
+            "fixes": fixes,
+            "generated": bool(gen_text and (gen_text in final or gen_text == final)),
+            "candidates": 3 + len(extra_cands),
+            "knowledge": info["knowledge"],
+            "neural_confidence": round(light_conf, 4) if light_conf is not None else None,
+            "perplexity": ppl,
+            "seconds": round(time.time() - t0, 4),
+            "new_tokens": None,
+            "tokens_per_second": None,
+        }
+        if stats_note:
+            stats["note"] = stats_note
+            stats["fallback_reason"] = "手元に確かな材料が無かったので、話題を受け取る応答にしました"
+        if core is None:
+            stats["fallback_reason"] = "内蔵ニューラルコアの重みが未ビルドです"
+        gate_val = light_conf if light_conf is not None else conf
+        if gate_val < self.cfg.light_gate and not self.neural_available():
+            # 確信度が低い → フルウェイトが使える環境なら裏で起動準備（応答は止めない）
+            self.ensure_started()
+            stats["escalation"] = "queued_full_weights"
+            stats["escalation_gate"] = self.cfg.light_gate
+        elif not used_core and kb is None:
+            stats["fallback_reason"] = "確信度が足りるので生成は見送りました"
+        yield {"type": "done", "text": final, "stats": stats}
+
     def _fallback_reason(self) -> str:
         if self.boot_state == "fetching":
             acq = self.acquire_status()
@@ -514,7 +808,11 @@ class SnipherCore:
     def _neural_reply(self, messages: list[dict], draft: dict, mode: str, **opts):
         """✨ LFM2.5-1.2B-JP が内部構造として本文を生成する経路。"""
         backend = self.active_backend()
-        if backend is None:  # 判定直後に落ちた場合の安全網
+        if backend is None:  # 判定直後に落ちた場合の安全網（→ 内蔵蒸留コア）
+            if self.light_ready() or self.kb is not None:
+                yield from self._light_reply(messages, draft, ROUTE_LIGHT, mode=mode)
+                return
+        if backend is None:  # ニューラル整体が使えない場合の最終安全網
             text = draft.get("base_text") or draft["text"]
             yield {"type": "start", "engine": "Snipher-mini+", "template_mode": "rule-based"}
             for piece in _chunk_for_stream(text):
@@ -541,6 +839,10 @@ class SnipherCore:
             hint = (draft.get("text") or "").strip()
             if hint and draft.get("intent") in ("question", "fallback"):
                 sp += f"\n（内部ヒント: 高速コアの下書き「{hint[:120]}」を参考にしつつ、自然な返答を作ってください）"
+            kb = self.kb_answer(last_user_of(messages))
+            if kb:
+                sp += (f"\n（Snipher 知識ベースが引けた事実: {str(kb.get('text'))[:520]}）"
+                       "この事実を踏まえて、短く自然に答えてください。")
 
         collected: list[str] = []
         stats: dict = {}
@@ -611,6 +913,16 @@ class SnipherCore:
         fixed = self.polisher.polish(text, register=register)
         result = {"text": fixed["text"], "fixes": fixed["fixes"], "engine": "rule"}
         backend = self.active_backend() if use_neural else None
+        # 重いコアが無ければ内蔵蒸留コア（LFM2.5 と同じ役割）で補う
+        light = None if backend is not None or not use_neural else self.light_core()
+        if light is not None and _looks_incomplete(fixed["text"]):
+            comp = light.complete(fixed["text"])
+            if comp.get("changed") and float(comp.get("confidence", 0)) >= 0.25:
+                return {"text": comp["text"],
+                        "fixes": fixed["fixes"] + ["neural_completion"],
+                        "engine": light.engine_name(),
+                        "added": comp.get("added", ""),
+                        "confidence": comp.get("confidence")}
         if backend is not None and _looks_incomplete(fixed["text"]):
             msgs = [
                 {"role": "user",
@@ -672,6 +984,17 @@ class SnipherCore:
         self._cancel.set()
         if self._gguf is not None:
             self._gguf.unload()
+
+
+def _clean_sentence(text: str) -> str:
+    """生成候補を軽く整形（長すぎ・空・記号だけの候補を落とす）。"""
+    t = str(text or "").strip().replace("\n", "")
+    return t if 6 <= len(t) <= 60 else ""
+
+
+def last_user_of(messages: list[dict]) -> str:
+    """直近のユーザー発話を取り出す（コア内部の共通処理）。"""
+    return next((m.get("content", "") for m in reversed(messages) if m.get("role") == "user"), "")
 
 
 # ---------------------------------------------------------------------- #

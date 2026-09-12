@@ -73,6 +73,14 @@ def _env_float(name: str, default: float) -> float:
         return default
 
 
+def is_serverless() -> bool:
+    """サーバーレス（Vercel 等）環境では 731MB の自動取得を行わない。"""
+    for k in ("VERCEL", "AWS_LAMBDA_FUNCTION_NAME", "NETLIFY", "LAMBDA_TASK_ROOT"):
+        if os.environ.get(k):
+            return True
+    return False
+
+
 @dataclass
 class LfmConfig:
     """環境変数 SNIPHER_LFM_* で上書きできる設定。"""
@@ -95,8 +103,21 @@ class LfmConfig:
     )
     # 初回起動時に自動ロード（+ 必要なら自動ダウンロード）するか
     autostart: bool = field(default_factory=lambda: _env_bool("SNIPHER_LFM_AUTOSTART", True))
-    # 自動取得を有効にするか（off ならローカル/環境変数のモデルだけを使う）
-    auto_fetch: bool = field(default_factory=lambda: _env_bool("SNIPHER_LFM_AUTO_FETCH", True))
+    # 自動取得を有効にするか（off ならローカル/環境変数のモデルだけを使う）。
+    # サーバーレス環境では既定 off: 関数サイズ/時間制限に対して 731MB は大きすぎるため、
+    # 内蔵ニューラルコア（蒸留スナップショット）とリモート委譲で知能を確保する。
+    auto_fetch: bool = field(default_factory=lambda: _env_bool("SNIPHER_LFM_AUTO_FETCH",
+                                                               not is_serverless()))
+    # 内蔵ニューラルコア（LFM2.5 を蒸留した NumPy スナップショット）: auto|on|off
+    light_core: str = field(default_factory=lambda: (
+        os.environ.get("SNIPHER_LIGHT_CORE", "auto").strip().lower() or "auto"))
+    # 軽量ニューラルコアの生成上限（文字数）
+    light_max_chars: int = field(default_factory=lambda: _env_int("SNIPHER_LIGHT_MAX_CHARS", 64))
+    # 蒸留コアの確信度がこの値を切ったら、重い LFM2.5 の起動を裏で進める（段階昇格）
+    light_gate: float = field(default_factory=lambda: _env_float("SNIPHER_LIGHT_GATE", 0.34))
+    # LFM2.5-1.2B-JP のフルウェイトを常駐させたホストへの委譲（任意・ゼロ設定）
+    remote_url: str = field(default_factory=lambda: os.environ.get("SNIPHER_LFM_REMOTE_URL", "").strip())
+    remote_token: str = field(default_factory=lambda: os.environ.get("SNIPHER_LFM_REMOTE_TOKEN", "").strip())
     # 推論時の動的 INT8 量子化（torch バックエンドの CPU 高速化）
     quantize_int8: bool = field(default_factory=lambda: _env_bool("SNIPHER_LFM_QUANTIZE", True))
     # 未知文字学習用の予約トークン枠

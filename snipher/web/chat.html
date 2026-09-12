@@ -181,6 +181,7 @@
         <select id="modeSel">
           <option value="auto" selected>自動（確実な定形は即答 / 不安な応答は LFM2.5 が生成）</option>
           <option value="lfm">常に LFM2.5 が生成</option>
+          <option value="light">内蔵蒸留コア固定（軽量・常時利用可）</option>
           <option value="fast">高速コアのみ（LFM2.5 不使用）</option>
         </select>
       </label>
@@ -274,6 +275,8 @@ async function refreshStatus() {
   const acq = s.acquire || lfm.acquire || {};
   const boot = lfm.boot_state || "";
   const bar = $("fetchbar");
+  const light = s.light || {};
+  const kb = s.knowledge || {};
 
   let badge = "", cls = "badge";
   if (lfm.state === "ready" || lfm.neural_ready) {
@@ -302,6 +305,13 @@ async function refreshStatus() {
   } else if (lfm.state === "learning") {
     badge = "学習中…"; cls += " warn";
     bar.classList.remove("show");
+  } else if (light.state === "ready") {
+    // フルウェイトは無いが、内蔵蒸留コア＋知識ベースで会話できる（＝通常動作）
+    const mb = light.weights_bytes ? " · " + fmtSize(light.weights_bytes) : "";
+    const pm = light.params ? " · " + (light.params / 1e6).toFixed(2) + "M" : "";
+    badge = `✨ 内蔵ニューラルコア${pm}${mb}` + (kb.facts ? ` + 📚 知識 ${kb.facts}件` : "");
+    cls += " ok";
+    bar.classList.remove("show");
   } else {
     badge = "Snipher-mini+（軽量モード）";
     if (boot === "failed" || lfm.state === "failed") {
@@ -315,6 +325,8 @@ async function refreshStatus() {
         (lfm.boot_error || lfm.error || acq.error || "取得できませんでした") +
         " — ネットワーク回復後に自動再試行します（または「再試行」）。この環境では HuggingFace / 共有ミラーへの接続が遮断されている可能性があります。";
       $("fetchRetryBtn").style.display = "";
+    } else if (boot === "skipped_serverless") {
+      bar.classList.remove("show");
     } else if (boot === "deps_missing") {
       bar.classList.add("show");
       $("fetchTitle").textContent = "⚠ ニューラルランタイム未インストール";
@@ -329,6 +341,10 @@ async function refreshStatus() {
   }
   const n = (lfm.learned_chars || []).length;
   if (n > 0) badge += ` · 学習済${n}字`;
+  if (s.note && light.state === "ready" && !lfm.neural_ready && !window._lightNote) {
+    window._lightNote = true;
+    note(s.note);
+  }
   if (lfm.engine_label && !lfm.engine_label.includes("JP") && !window._demoNote) {
     window._demoNote = true;
     note("現在ロードされているのは検証用モデル（" + lfm.engine_label + "）です。通常の環境では起動時に LFM2.5-1.2B-JP が全自動で取得・ロードされます。");
@@ -345,7 +361,11 @@ async function refreshStatus() {
     `量子化: ${lfm.quantized ? (lfm.quant || "int8") : "-"} / テンプレート: ${lfm.template ? lfm.template.default_mode : "-"}\n` +
     (lfm.error ? `エラー: ${String(lfm.error).slice(0, 200)}\n` : "") +
     (lfm.boot_error ? `boot: ${String(lfm.boot_error).slice(0, 200)}\n` : "") +
-    `ランタイム: ${lfm.versions ? JSON.stringify(lfm.versions) : "-"}`;
+    `ランタイム: ${lfm.versions ? JSON.stringify(lfm.versions) : "-"}\n` +
+    `内蔵蒸留コア: ${light.state || "-"}${light.params ? " / " + light.params.toLocaleString() + " params" : ""}` +
+    `${light.vocab ? " / 語彙 " + light.vocab : ""}${light.load_seconds != null ? " / load " + light.load_seconds + "s" : ""}\n` +
+    `知識ベース: ${kb.topics || 0} トピック / ${kb.facts || 0} 事実 / ${kb.terms || 0} 語\n` +
+    `階層: ${s.tiers ? ["local=" + (s.tiers.local_full || "-"), "remote=" + (s.tiers.remote && s.tiers.remote.alive ? "live" : "-"), "distilled=" + (s.tiers.distilled || "-")].join(" ") : "-"}`;
   return s;
 }
 
@@ -429,6 +449,9 @@ async function send() {
           an.className = "assist-note" + (ev.mode === "rule" ? " fast" : "");
           if (ev.mode === "lfm") {
             an.textContent = `✨ 確率的に不安な応答（確度 ${((ev.confidence ?? 0) * 100).toFixed(0)}%）→ 内部の LFM2.5-1.2B-JP が生成します`;
+          } else if (ev.mode === "light") {
+            const kn = ev.knowledge && ev.knowledge.topic ? ` · 知識ベース: ${ev.knowledge.topic}` : "";
+            an.textContent = `✨ 確率的に不安な応答（確度 ${((ev.confidence ?? 0) * 100).toFixed(0)}%）→ 内蔵ニューラルコア（LFM2.5 蒸留）が生成します${kn}`;
           } else {
             an.textContent = `⚡ 確実な定形応答（確度 ${((ev.confidence ?? 1) * 100).toFixed(0)}%）→ 高速コアが即答`;
           }
@@ -450,8 +473,12 @@ async function send() {
           const meta = document.createElement("div"); meta.className = "meta";
           const bits = [];
           if (st.route === "neural" || st.assist === "lfm") bits.push("✨ LFM2.5 生成");
+          if (st.route === "light") bits.push(st.neural_used ? "✨ 内蔵ニューラルコア生成" : "📚 知識ベース＋高速コア");
+          if (st.knowledge && st.knowledge.topic) bits.push(`📚 ${st.knowledge.topic}`);
+          if (st.neural_confidence != null) bits.push(`内部確度 ${(st.neural_confidence * 100).toFixed(0)}%`);
           if (st.route === "instant") bits.push("⚡ 高速コア即答");
           if (st.route === "fallback") bits.push("⚡ 高速コア（ニューラル準備中）");
+          if (st.escalation) bits.push("⇧ フルウェイト起動を準備中");
           if (st.fixes && st.fixes.length) bits.push(`助動詞補正 ${st.fixes.length}件`);
           if (st.tokens_per_second) bits.push(`${st.tokens_per_second} tok/s`);
           if (st.intent) bits.push(`intent: ${st.intent}`);

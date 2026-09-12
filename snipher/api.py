@@ -23,6 +23,7 @@ engine = SnipherEngine()
 # （モデルは起動時に全自動取得・バックエンド自動選択・アップロード不要）
 # ----------------------------------------------------------------------
 from snipher.lfm import LLM_DEPS_AVAILABLE
+from snipher.lfm.config import is_serverless
 
 _lfm_engine = None
 _lfm_lock = threading.Lock()
@@ -284,10 +285,10 @@ class ChatRequest(BaseModel):
     system_prompt: str | None = Field(None, max_length=2000)
     mode: str = Field(
         "auto",
-        pattern="^(auto|fast|lfm|neural)$",
+        pattern="^(auto|fast|lfm|neural|light)$",
         description=(
             "auto=内部パイプライン(確実な定形は即答/確率的に不安な応答は LFM2.5 が生成), "
-            "fast=高速コアのみ, lfm=常に LFM2.5 が生成"
+            "fast=高速コアのみ, lfm=常に LFM2.5 が生成, light=内蔵蒸留コア＋知識ベース固定"
         ),
     )
     hybrid: bool | None = Field(
@@ -316,34 +317,183 @@ def _neural_deps() -> bool:
 
 @app.get("/api/status")
 def api_status():
-    """Snipher Core の状態（ニューラルコア・自動取得の進捗・学習済み語彙）。"""
+    """Snipher Core の状態（知能階層・自動取得の進捗・学習済み語彙・知識ベース）。
+
+    依存ランタイムが無い環境（Vercel 等）でも 200 で、内蔵蒸留コアと
+    知識ベースの有無を必ず返す（＝「何も無し」に見えないようにする）。
+    """
     c = core()
-    if not _neural_deps():
-        return {
-            "deps": False,
-            "backend": None,
-            "lfm": {"state": "unavailable", "error": "torch/transformers または llama-cpp-python 未インストール"},
-            "acquire": {"phase": "idle"},
-            "fallback": "Snipher-mini+",
-            "hybrid": {"available": False, "assist": "rule", "reason": "ニューラルランタイム未インストール"},
-        }
-    if c.cfg.autostart:
+    deps = _neural_deps()
+    if deps and c.cfg.autostart:
         c.ensure_started()
     st = c.status()
     ready = bool(st.get("neural_ready"))
+    light = st.get("light") or {"state": c._light_state}
     return {
-        "deps": True,
+        "deps": deps,
         "backend": st.get("backend_kind"),
         "lfm": st,
         "acquire": st.get("acquire"),
         "fallback": "Snipher-mini+",
         "hybrid": {
             "available": ready,
-            "assist": "lfm" if ready else "rule",
+            "assist": "lfm" if ready else ("light" if light.get("state") == "ready" else "rule"),
             "threshold": c.assist.cfg.threshold,
             "enabled": c.assist.cfg.enabled,
+            "light_available": light.get("state") == "ready",
         },
+        "light": light,
+        "knowledge": st.get("knowledge"),
+        "tiers": st.get("tiers"),
+        "serverless": is_serverless(),
+        "note": (None if ready else
+                 ("LFM2.5-1.2B-JP のフルウェイトは読み込みません。内蔵ニューラルコア"
+                  "（LFM2.5 を蒸留した同梱スナップショット）と知識ベースで応答します。")),
     }
+
+
+@app.get("/api/neural")
+def api_neural():
+    """内蔵ニューラルコア（LFM2.5 蒸留スナップショット）の詳細と生成テスト。"""
+    from .neural.cache import get_core
+
+    c = get_core()
+    if c is None:
+        return {"available": False, "reason": "重みが未ビルドです（tools/distill_neural.py）"}
+    return {"available": True, **c.status()}
+
+
+class NeuralProbeRequest(BaseModel):
+    text: str = Field(..., max_length=500)
+    max_chars: int = Field(48, ge=4, le=200)
+    temperature: float = Field(0.7, ge=0.0, le=2.0)
+
+
+@app.post("/api/neural/probe")
+def api_neural_probe(req: NeuralProbeRequest):
+    """内蔵コアに生成・補完・採点させてみる（デバッグ/紹介用）。"""
+    from .neural.cache import get_core
+
+    c = get_core()
+    if c is None:
+        return {"ok": False, "reason": "内蔵ニューラルコアが未ビルドです"}
+    import time
+
+    t0 = time.time()
+    gen = c.generate(req.text, max_chars=req.max_chars, temperature=req.temperature)
+    comp = c.complete(req.text)
+    sc = c.score(req.text)
+    return {"ok": True, "generate": gen, "complete": comp, "score": sc,
+            "seconds": round(time.time() - t0, 3)}
+
+
+# ---------------- 内蔵ニューラルコアの再蒸留（全自動・任意実行） ------------- #
+_REBUILD: dict = {"running": False, "started_at": None, "finished_at": None,
+                  "log": [], "returncode": None, "profile": None}
+_REBUILD_LOCK = threading.Lock()
+
+
+def _rebuild_worker(profile: str) -> None:
+    import subprocess
+    import sys
+    import time
+
+    cmd = [sys.executable, str(REPO_ROOT / "tools" / "distill_neural.py"), "--profile", profile,
+           "--out", str(REPO_ROOT / "snipher" / "data" / "neural" / "core.npz"),
+           "--report", str(REPO_ROOT / "snipher" / "data" / "neural" / "report.json")]
+    _REBUILD["log"] = ["$ " + " ".join(cmd)]
+    try:
+        proc = subprocess.Popen(cmd, cwd=str(REPO_ROOT), stdout=subprocess.PIPE,
+                                stderr=subprocess.STDOUT, text=True, bufsize=1)
+        assert proc.stdout is not None
+        for line in proc.stdout:
+            log_buf = _REBUILD["log"]
+            log_buf.append(line.rstrip())
+            if len(log_buf) > 400:
+                del log_buf[:100]
+        proc.wait()
+        _REBUILD["returncode"] = proc.returncode
+        if proc.returncode == 0:
+            from .neural.cache import reset as _reset_cache
+
+            _reset_cache()      # 新しい重みを即座に差し替え
+            log_buf = _REBUILD["log"]
+            log_buf.append("内蔵ニューラルコアを再ビルドしました（自動で差し替え済み）")
+            if len(log_buf) > 400:
+                del log_buf[:100]
+    except Exception as exc:  # noqa: BLE001
+        _REBUILD["returncode"] = -1
+        _REBUILD["log"].append(f"エラー: {exc}")
+    finally:
+        import time as _t
+
+        _REBUILD["finished_at"] = _t.time()
+        _REBUILD["running"] = False
+
+
+class RebuildRequest(BaseModel):
+    profile: str = Field("base", pattern="^(tiny|base|big)$",
+                         description="tiny=数秒（検証用） / base=既定 / big=高品質（遅い）")
+
+
+@app.post("/api/neural/rebuild")
+def api_neural_rebuild(req: RebuildRequest):
+    """語彙テーブルや知識ベースを増やしたら、内蔵ニューラルコアを再蒸留できる。
+
+    サーバーが自前のデータから自分で作り直すので、ユーザーがファイルを
+    用意したりアップロードしたりする必要は無い（実行はバックグラウンド）。
+    """
+    import time
+
+    with _REBUILD_LOCK:
+        if _REBUILD["running"]:
+            return {"ok": False, "reason": "すでに再ビルドが実行中です", **_rebuild_state()}
+        if is_serverless():
+            return {"ok": False,
+                    "reason": "サーバーレス環境では再ビルド（CPU 学習）は行えません。"
+                              "同梱済みのスナップショットが使われます。",
+                            **_rebuild_state()}
+        _REBUILD.update({"running": True, "started_at": time.time(), "finished_at": None,
+                         "returncode": None, "profile": req.profile})
+        threading.Thread(target=_rebuild_worker, args=(req.profile,),
+                         name="snipher-rebuild", daemon=True).start()
+    return {"ok": True, "started": True, "profile": req.profile, **_rebuild_state()}
+
+
+def _rebuild_state() -> dict:
+    return {"rebuild": {k: v for k, v in _REBUILD.items() if k != "log"} |
+            {"log_tail": _REBUILD["log"][-12:]}}
+
+
+@app.get("/api/neural/rebuild")
+def api_neural_rebuild_status():
+    return {"ok": True, **_rebuild_state()}
+
+
+@app.get("/api/kb")
+def api_kb(q: str = "", k: int = 3):
+    """知識ベース（BM25）を検索する。"""
+    kb = core().kb
+    if kb is None:
+        return {"ok": False, "reason": "知識ベースが使えません"}
+    if not q.strip():
+        return {"ok": True, "stats": kb.stats(), "results": []}
+    k = max(1, min(10, int(k)))
+    return {"ok": True, "stats": kb.stats(), "query": q,
+            "answer": kb.answer(q), "results": kb.search(q, k)}
+
+
+@app.get("/api/model/remote")
+def api_remote_status():
+    """LFM2.5 フルウェイトのリモート委譲（任意設定）の疎通確認。"""
+    c = core()
+    b = c.remote_backend()
+    if b is None:
+        return {"configured": False,
+                "hint": "SNIPHER_LFM_REMOTE_URL に LFM2.5 を常駐させた Snipher の URL を設定すると、"
+                        "サーバーレスでもフルウェイトの生成を委譲できます。"}
+    ok = b.probe()
+    return {"configured": True, "alive": ok, **b.status()}
 
 
 @app.get("/api/model/acquire")
@@ -389,7 +539,8 @@ def api_chat(req: ChatRequest):
     - 確実な定形応答(挨拶・感謝など)  → 高速コアが数ミリ秒で即答（速度維持）
     - 確率的に不安な応答(質問・雑談)  → LFM2.5-1.2B-JP が内部で本文を生成し、
       助動詞の補い(polisher)を通して返す
-    - ニューラルコア準備中/未取得     → 高速コアが安全な応答を返し、
+    - フルウェイトが無い環境         → 内蔵ニューラルコア（LFM2.5 蒸留）+知識ベースで生成
+    - ニューラルコアが一切使えない    → 高速コアが安全な応答を返し、
       自動取得の進捗をイベントに載せる
     """
     c = core()
