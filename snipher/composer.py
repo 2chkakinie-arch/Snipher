@@ -34,7 +34,9 @@ _NEG_MARKS = ("つらい", "辛い", "疲れた", "疲れ", "悲しい", "かな
               # 過去形・語幹（つらかっ / 悲しかっ / だるい …）も拾う
               "つらかっ", "辛かっ", "悲しかっ", "痛かっ", "苦しかっ", "怖かっ", "こわかっ",
               "だるい", "しんど", "まずい", "不味", "最悪", "嫌だ", "いやだ", "眠れなかっ",
-              "寂しかっ", "さみしかっ", "怒っ", "腹が立つ", "疲れる", "壊れ", "失敗し")
+              "寂しかっ", "さみしかっ", "怒っ", "腹が立つ", "疲れる", "壊れ", "失敗し",
+              # 「どうしよう」は願望（〜よう）ではなく困りごとの声
+              "どうしよう", "どうしよ", "困った", "どうしたらいい")
 _POS_MARKS = ("嬉しい", "うれしい", "楽しい", "たのしい", "良かった", "よかった", "好き",
               "ありがとう", "幸せ", "しあわせ", "上手", "すごい", "やった", "成功", "楽しみ",
               # 語幹（楽し / 嬉し / おいし …）で過去形・連用形も拾う
@@ -72,6 +74,8 @@ _SELF_WORDS = {"あなた", "snipher", "スニファー", "きみ", "君", "お�
 import re as _re_mod
 
 _VERBISH = _re_mod.compile(r"[るいうくぐすつぬぶむえけせてねべめれ]")
+# 名詞らしい語尾（漢字・カタカナで終わる）。「聞いて」「知らん」は名詞にならない
+_NOUN_END = _re_mod.compile(r"[\u4e00-\u9fff\u30a1-\u30f6ー]$")
 _KANA_CHARS = _re_mod.compile(r"[ぁ-ん]")
 # 述語（動詞・形容詞・助動詞）で終わる日本語
 _PRED_END = _re_mod.compile(
@@ -106,6 +110,8 @@ _ECHO_SKIP = frozenset({
     "なに", "何", "誰", "いつ", "どう", "なぜ", "話", "話し", "話して", "教えて",
     "いう", "言う", "思う", "思うけど", "すごい", "いい", "良い", "だめ", "ダメ",
     "って何", "とは", "って", "のが", "のは", "って何？", "についてのこと",
+    "ちょっ", "ちょっと", "少し", "少しだけ", "なんか", "なにか", "何か", "いろいろ",
+    "やっぱり", "もちろん", "たぶん", "もしかして", "たとえば", "例えば",
 })
 
 # 分かち書きの断片に助詞がくっ付いてしまうことがある（「が好き」「って何」）
@@ -144,13 +150,18 @@ class Utterance:
     length: int = 0
 
     def subject(self) -> str:
+        """主語にできる語（名詞らしい語）を 1 つ返す。無ければ ""。
+
+        「聞いて」「知らん」のような活用形を主語にすると
+        「聞いてについて、もう少し教えてください。」になってしまうので返さない。
+        """
         if self.echo:
             return self.echo
-        for w in self.words:
-            if w not in _ECHO_SKIP and len(w) >= 2:
-                return w
-        for w in self.words:
-            if w not in _ECHO_SKIP:
+        ok = [w for w in self.words
+              if w not in _ECHO_SKIP and w not in _PARTICLE_PHRASES
+              and not w.endswith(("て", "た", "ん", "ない", "です", "ます"))]
+        for w in ok:
+            if _NOUN_END.search(w) or w in self.kb_words:
                 return w
         return ""
 
@@ -215,6 +226,11 @@ UNKNOWN_FRAMES = (
     "{w}について、根拠のあることが一つも言えません。{ask}",
     "「{w}」は聞いたことがありますが、確かだと断言できる材料がありません。{ask}",
 )
+UNKNOWN_GENERIC_FRAMES = (
+    "その話について、確かだと言える材料が手元にありません。{ask}",
+    "手元に確かな材料が無いので、断定は避けます。{ask}",
+    "今の言葉だけでは、確かなことを言えません。{ask}",
+)
 UNKNOWN_ASKS = (
     "それが何なのか、一言で教えてもらえますか。",
     "どの部分を知りたいのか教えてください。",
@@ -267,8 +283,8 @@ STATEMENT_FRAMES = (
 )
 STATEMENT_GENERIC_FRAMES = (
     "その話、もう少し聞かせてください。{ask}",
-    "なるほど。{ask}",
     "その話、興味があります。{ask}",
+    "もう少しだけ言葉を足してもらえますか。{ask}",
 )
 STATEMENT_ASKS = (
     "どんなところが印象に残りましたか。",
@@ -328,10 +344,15 @@ FOLLOW_CONNECTORS = ("", "", "ちなみに、", "そういえば、", "ひとつ
 # 検証
 # ---------------------------------------------------------------------- #
 _BAD_PATTERNS = (
-    "ですです", "ますます", "ましたました", "ませんません", "はは", "がが", "をを",
-    "。。", "、、", "？？", "！！", "いますです", "ますです", "ですます", "たです",
+    "ですです", "ましたました", "ませんません", "はは", "がが", "をを",
+    "。。", "、、", "？？", "！！", "いますです", "ますです", "ですます",
     "「」", "{}", "{w}", "{ask}", "{raw}", "{open}", "None", "nan",
 )
+# 「良かったです」は正しい日本語。「食べたです」は間違い。
+# 「ますます（益々）」も正しい副詞なので、重複は 2-gram のループ検査に任せる。
+_BAD_TADESU = "たです"
+# 英数字だけの 2-gram（コマンド名や略語の繰り返しは正常）
+_ASCII_GRAM = re.compile(r"^[\x20-\x7e]{2}$")
 # 「脂ののった」「風の音」のように、の + のX が正当な場合
 _NO_NO_OK = re.compile(r"のの[っりらろれいうえおん]")
 
@@ -356,6 +377,8 @@ def validate(text: str, *, max_len: int = 170, min_len: int = 6) -> tuple[bool, 
         return False, "no_terminal"
     if "のの" in t and not _NO_NO_OK.search(t):
         return False, "bad_pattern:のの"
+    if _BAD_TADESU in t.replace("かったです", ""):
+        return False, "bad_pattern:たです"
     for bad in _BAD_PATTERNS:
         if bad in t:
             return False, f"bad_pattern:{bad}"
@@ -366,10 +389,14 @@ def validate(text: str, *, max_len: int = 170, min_len: int = 6) -> tuple[bool, 
             continue
         if part.endswith(_DANGLING_ENDS) and part not in _DANGLING_OK:
             return False, f"dangling:{part[-4:]}"
-    # 3 回以上繰り返す 2-gram はループの兆候
+    # 3 回以上繰り返す 2-gram はループの兆候。
+    # ただし英数字の並び（git init / git add / git commit の "it" など）は
+    # 技術系の文で普通に繰り返されるので数えない。
     grams = [t[i:i + 2] for i in range(len(t) - 1)]
     seen: dict[str, int] = {}
     for g in grams:
+        if _ASCII_GRAM.match(g):
+            continue
         seen[g] = seen.get(g, 0) + 1
         if seen[g] >= 4:
             return False, f"loop:{g}"
@@ -477,17 +504,29 @@ class Composer:
             """
             score = 0
             if w in kb_words:
-                score += 4
+                score += 4          # 知識ベースが知っている語がいちばん話題らしい
             if len(w) >= 2:
                 score += 1
-            if not _VERBISH.match(w[-1]) and not w.endswith(("て", "た", "です", "ます")):
-                score += 2
+            if _NOUN_END.search(w):
+                score += 2          # 漢字/カタカナ終わり = 名詞らしい
+            if w.endswith(("て", "た", "です", "ます", "ん", "ない")):
+                score -= 2          # 動詞・形容詞の活用形は主語にできない
             return (score, -cands.index(w))
 
+        # 英字は分かち書きで小文字になるので、元の表記（Docker / Wi-Fi）に戻す
+        if cands and u.ascii_words:
+            upper = {w.lower(): w for w in u.ascii_words}
+            cands = [upper.get(w.lower(), w) if w.isascii() else w for w in cands]
         if cands:
-            ordered = sorted(cands, key=_rank, reverse=True)
-            u.echo = ordered[0]
-            u.echo2 = next((w for w in ordered[1:] if w != u.echo), "")
+            scored = sorted(((_rank(w), w) for w in cands), key=lambda x: x[0], reverse=True)
+            # 名詞らしくない語（「聞いて」「どうし」「らいい」のような活用の断片）は
+            # 主語にしない。主語にできる語が無ければ空のまま → 汎用の受け方に落ちる。
+            usable = [(w, sc[0]) for sc, w in scored if sc[0] >= 2]
+            if usable:
+                u.echo = usable[0][0]
+                u.echo2 = next((w for w, _s in usable[1:] if w != u.echo), "")
+            else:
+                u.echo = u.echo2 = ""
         else:
             u.echo = u.echo2 = ""
         if u.pred and u.echo and (u.echo == u.pred or u.echo in u.pred):
@@ -585,8 +624,29 @@ class Composer:
                      notes={"ack": bool(ack), "followup": bool(follow), "why": why})
 
     def _plan_unknown(self, u: Utterance, prev: list[str]) -> Reply | None:
-        w = u.echo or u.subject() or "そのこと"
         asks = UNKNOWN_ASKS_NEG if u.mood == "negative" else UNKNOWN_ASKS
+        w = u.echo or u.subject()
+        if not w:
+            # 主語にできる語が無い（「どうしたらいい」等）→ 語を埋め込まずに正直に言う
+            for i in range(len(UNKNOWN_GENERIC_FRAMES)):
+                frame = _rotate(UNKNOWN_GENERIC_FRAMES, self.turn + i)
+                text = self._polish(frame.format(ask=_rotate(asks, self.turn + i)))
+                ok, _why = validate(text)
+                if ok and text not in prev:
+                    return Reply(text=text, plan="unknown_topic", confidence=0.28,
+                                 sentences=_split(text), frame=frame, notes={})
+            w = "そのこと"
+        # 知識ベースに「近い話題」があれば、無いと言うだけでなく名指しで提案する
+        sug = self._suggest_topic(u.text, w)
+        if sug:
+            ask = _rotate(asks, self.turn)
+            text = self._polish(f"「{w}」の確かな材料は手元にありませんが、"
+                                f"{sug}については話せます。{ask}")
+            ok, _why = validate(text, max_len=200)
+            if ok and text not in prev:
+                return Reply(text=text, plan="unknown_topic", confidence=0.36,
+                             sentences=_split(text),
+                             notes={"echo": w, "suggest": sug})
         for i in range(len(UNKNOWN_FRAMES)):
             frame = _rotate(UNKNOWN_FRAMES, self.turn + i)
             ask = _rotate(asks, self.turn + i * 2)
@@ -600,6 +660,23 @@ class Composer:
         return Reply(text=f"「{w}」について、私には確かな情報がありません。"
                           "何を知りたいのか教えてください。",
                      plan="unknown_topic", confidence=0.25, notes={"echo": w})
+
+    def _suggest_topic(self, text: str, word: str) -> str:
+        """発話に近い知識ベースの話題名（無ければ ""）。字の重なりが 2 文字以上あるものだけ。"""
+        if not word:
+            return ""
+        try:
+            for t in self.kb.suggest(text, top_k=3):
+                t = str(t or "")
+                if not t:
+                    continue
+                if word in t or t in word:
+                    return t
+                if len(set(word) & set(t)) >= 2:
+                    return t
+        except Exception:  # noqa: BLE001
+            return ""
+        return ""
 
     def _plan_opaque(self, u: Utterance, prev: list[str]) -> Reply | None:
         raw = u.text.strip()[:24] or "その入力"
@@ -628,8 +705,13 @@ class Composer:
                 return self._plan_opaque(u, prev)
             w = "その話"
         frames = STATEMENT_GENERIC_FRAMES if generic else STATEMENT_FRAMES
-        ack = _pick(ACK_NEG, self.turn, prev) if u.mood == "negative" else \
-            (_pick(ACK_POS, self.turn, prev) if u.mood == "positive" else _pick(ACK_NEUTRAL, self.turn, prev))
+        if u.mood == "negative":
+            ack = _pick(ACK_NEG, self.turn, prev)
+        elif u.mood == "positive":
+            ack = _pick(ACK_POS, self.turn, prev)
+        else:
+            # 主語が無い応答（「その話、…」）に相槌を足すと二重になるので抑える
+            ack = "" if generic else _pick(ACK_NEUTRAL, self.turn, prev)
         for i in range(len(frames)):
             frame = _rotate(frames, self.turn + i)
             ask = _rotate(STATEMENT_ASKS, self.turn + i * 3)

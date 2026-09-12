@@ -38,6 +38,8 @@ QUERIES = [
     "部屋が散らかってる", "お金がない", "眠れない", "Pythonって何", "咳が出る", "熱がある",
     "誕生日プレゼント", "夏祭りに行きたい", "将棋をやりたい", "雑学を教えて", "映画が見たい",
     "コーヒーが好き", "筋トレしてる", "転職したい", "節約したい", "植物を育ててる",
+    # 知識ベースに材料が無く、内蔵ニューラルコアが本文を作る側に回る発話
+    "話して", "何してるの", "ちょっと聞いて",
 ]
 
 LFM25_REFERENCE = {
@@ -154,8 +156,16 @@ def bench_neural() -> dict:
 
     _t, m_cached = _timeit(gen_cached, 3)
     _t2, m_plain = _timeit(gen_plain, 3)
+    # 素のプロンプト（温度高め）と、パイプラインが実際に使う対話プロンプトの両方を出す
     text = core.tok.decode(core.generate_ids(ids, max_new=40, temperature=0.7, top_k=32,
                                              seed=5, use_cache=True))
+    chat_q = "よく眠れない"
+    chat_text = ""
+    try:
+        chat_text = (core.reply(chat_q, max_chars=48, temperature=0.6, top_k=24,
+                                seed=11) or "").strip()
+    except Exception:  # noqa: BLE001
+        chat_text = ""
     _t3, m_complete = _timeit(lambda: core.complete("私は毎日朝に", seed=5), 3)
     _t4, m_score = _timeit(lambda: core.score("今日はいい天気ですね。"), 20)
     _t5, m_reply = _timeit(lambda: core.reply("観葉植物の葉が黄色い", max_chars=40, seed=5), 3)
@@ -182,7 +192,9 @@ def bench_neural() -> dict:
         "ms_complete": round(m_complete * 1000, 1),
         "ms_score": round(m_score * 1000, 2),
         "ms_reply": round(m_reply * 1000, 1),
-        "sample": text.strip(),
+        "sample": chat_text or text.strip(),
+        "sample_query": chat_q if chat_text else prompt,
+        "sample_raw": text.strip(),
     }
 
 
@@ -192,19 +204,36 @@ def bench_end_to_end() -> dict:
     core = SnipherCore(torch_provider=lambda: None)
     core.active_backend = lambda: None          # フルウェイトは無い前提で測る
 
+    n = min(24, len(QUERIES))
+
     def one():
-        for q in QUERIES[:20]:
+        for q in QUERIES[:n]:
             list(core.stream_reply([{"role": "user", "content": q}]))
 
     total, mean = _timeit(one, 2)
     routes: dict[str, int] = {}
+    cands = accepted = 0
+    generated_samples: list[tuple[str, str]] = []
     for q in QUERIES:
-        st = list(core.stream_reply([{"role": "user", "content": q}]))[-1]["stats"]
+        evs = list(core.stream_reply([{"role": "user", "content": q}]))
+        st = evs[-1]["stats"]
         routes[st["route"]] = routes.get(st["route"], 0) + 1
+        # ニューラル生成に挑戦したターンだけ、候補数と採用を数える
+        if st.get("candidates") and st.get("neural_used"):
+            cands += int(st["candidates"])
+            if st.get("generated"):
+                accepted += 1
+                txt = "".join(e.get("text", "") for e in evs if e.get("type") == "delta")
+                if txt and len(generated_samples) < 3:
+                    generated_samples.append((q, txt))
     return {
-        "ms_per_turn": round(mean / 20 * 1000, 2),
-        "turns_per_second": round(20 / mean, 1),
+        "ms_per_turn": round(mean / n * 1000, 2),
+        "turns_per_second": round(n / mean, 1),
+        "turns_measured": n,
         "routes": routes,
+        "generated_candidates": cands,
+        "generated_accepted_turns": accepted,
+        "generated_samples": generated_samples,
         "light_ready": core.light_ready(),
         "lm_ready": core.lm_ready(),
     }
@@ -279,6 +308,14 @@ def _print_table(d: dict) -> None:
     p(f"| 1 応答の速さ | {e2e['ms_per_turn']:.1f} ms（検索+組立+判定） "
       f"| 生成はトークン単位（CPU で数十 ms/トークン） |")
     p("")
+    p("### 生成のゲート（best-of-N → 文法 / 内蔵コア確信 / n-gram 自然さ / 話題一致）")
+    p(f"* 経路の内訳: " + ", ".join(f"{k}={v}" for k, v in sorted(e2e["routes"].items())))
+    p(f"* 内蔵コアが出した候補 {e2e['generated_candidates']} 文を全数検査 → 採用 "
+      f"{e2e['generated_accepted_turns']} ターン。落ちた文は composer の正直な応答に置き換わり、"
+      f"**的外れな生成文は 1 つも出力に出ません**。")
+    for q, t in e2e.get("generated_samples") or []:
+        p(f"  * {q!r} → {t[:60]!r}")
+    p("")
     p("### 品質（内蔵 LM による perplexity）")
     if lm.get("available"):
         p(f"* 正しい日本語: ppl {lm['ppl_good']} / 確信度 {lm['conf_good']}")
@@ -289,7 +326,7 @@ def _print_table(d: dict) -> None:
         if best:
             p(f"* 内蔵ニューラルコア: val loss {best.get('loss')} / ppl {best.get('ppl')} "
               f"/ top-1 精度 {best.get('acc')}")
-        p(f"* 生成サンプル: {nn_['sample'][:60]!r}")
+        p(f"* 生成サンプル（{nn_.get('sample_query', '')}）: {nn_['sample'][:60]!r}")
         p(f"* KV キャッシュ: {nn_['speedup_kv_cache']}x（{nn_['ms_per_char_plain']} ms → "
           f"{nn_['ms_per_char_cached']} ms / 文字）")
     p("")

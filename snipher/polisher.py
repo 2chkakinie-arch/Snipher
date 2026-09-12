@@ -66,7 +66,28 @@ class Polisher:
         # 1/6. 文末の句点補完
         text = self._fix_terminal_punct(text, fixes)
 
+        # 7. 日本語と英数字のあいだの空白（技術系の文の読みやすさ）
+        text = self._fix_ascii_spacing(text, fixes)
+
         return {"text": text, "fixes": fixes, "changed": text != original}
+
+    # ------------------------------------------------------------------ #
+    # 日本語と英数字の境界に半角空白を 1 つ入れる
+    #   「最後にgit push で共有する」→「最後に git push で共有する」
+    #   句読点・括弧・既存の空白はそのまま（二重には入れない）
+    # ------------------------------------------------------------------ #
+    _JP = r"\u3041-\u309f\u30a1-\u30f6\u30fc\u4e00-\u9fff"
+    _ASCII_WORD = r"[A-Za-z0-9]"
+
+    def _fix_ascii_spacing(self, text: str, fixes: list[str]) -> str:
+        if not text:
+            return text
+        before = text
+        text = re.sub(f"([{self._JP}])({self._ASCII_WORD})", r"\1 \2", text)
+        text = re.sub(f"({self._ASCII_WORD})([{self._JP}])", r"\1 \2", text)
+        if text != before:
+            fixes.append("ascii_spacing")
+        return text
 
     # ------------------------------------------------------------------ #
     def _fix_verb_masu(self, text: str, fixes: list[str]) -> str:

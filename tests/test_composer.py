@@ -353,8 +353,11 @@ class TestMaterialBranchGating:
         from snipher.core import SnipherCore
 
         src = inspect.getsource(SnipherCore._light_reply)
-        assert 'sc["confidence"] >= bar' in src
-        assert '(sc["lm"] or 0.0) >= bar' in src
+        # 内蔵コアの自信と n-gram LM の自然さ、両方の閾値が見られていること
+        assert 'sc["confidence"] < bar' in src
+        assert 'float(sc["lm"] or 0.0) < bar' in src
+        # 話題の一致（relevant）も見られていること
+        assert "self.relevant(one, last_user, topic=topic)" in src
 
 
 class TestMoodAndValidation:
@@ -391,3 +394,122 @@ class TestMoodAndValidation:
         assert r.knowledge["topic"] == "投資"
         ok, why = validate(r.text, max_len=240)
         assert ok, why
+
+
+class TestHonestUnknownAndValidator:
+    """知らないことを「知らない」と言い、近い話題を提案できるか。"""
+
+    def test_yoshikatta_is_valid_japanese(self):
+        """「良かったです」を bad_pattern で落とさない（肯定的な相槌が全滅していた）。"""
+        ok, why = validate("それは良かったです。歴史について、もう少し教えてください。")
+        assert ok, why
+        bad, why2 = validate("私はそれを食べたです。")
+        assert not bad and "たです" in why2
+
+    def test_masumasu_is_a_real_word(self):
+        ok, why = validate("冬はますます寒くなります。体調に気をつけてください。")
+        assert ok, why
+
+    def test_unknown_topic_suggests_a_nearby_topic(self):
+        c = _composer()
+        r = c.compose("量子饅頭の作り方")
+        assert r.plan == "unknown_topic"
+        assert "量子コンピュータ" in r.text, r.text
+        assert "話せます" in r.text
+
+    def test_verb_te_form_is_not_used_as_subject(self):
+        u = _composer().analyze("ちょっと聞いて")
+        assert u.echo == "", u.echo
+
+    def test_katakana_noun_beats_verb_fragment(self):
+        u = _composer().analyze("知らん言葉ポメラ")
+        assert u.echo in ("言葉", "ポメラ"), u.echo
+
+
+class TestGenerationGates:
+    """内蔵ニューラルコアの生成文を通す/落とす門（幻覚対策）。"""
+
+    def _core(self):
+        from snipher.core import SnipherCore
+
+        core = SnipherCore(torch_provider=lambda: None)
+        core.active_backend = lambda: None
+        return core
+
+    def test_recited_kb_sentence_is_detected(self):
+        core = self._core()
+        if core.kb is None:
+            pytest.skip("kb なし")
+        fact = ""
+        for it in core.kb.items:
+            if it.get("topic") == "花火" and it.get("facts"):
+                fact = str(it["facts"][0])
+                break
+        assert fact
+        assert core.recited_topic(fact) == "花火"
+        assert core.recited_topic("あなたの言葉を受けて、返事を組み立てているところです。") == ""
+
+    def test_meaningless_generation_is_not_conversational(self):
+        core = self._core()
+        for junk, q in (("例外のとき量があることが多いです。", "ぬるぬる猿について語って"),
+                        ("態料を入れるだけで、深呼吸は情報を削除します。", "量子饅頭の作り方"),
+                        ("はい、買い物は明るいですよ。", "ちょっと聞いて"),
+                        ("温かいものを一口飲んで、少しだけ休みましょう。", "67")):
+            assert not core.conversational(junk, q), junk
+
+    def test_real_conversational_reply_passes(self):
+        core = self._core()
+        assert core.conversational("では、今日あったことを一つだけ話してもらえますか。", "話して")
+        assert core.conversational("あなたの言葉を受けて、返事を組み立てているところです。", "何してるの")
+
+    def test_recited_kb_fact_is_not_relevant_to_other_topic(self):
+        core = self._core()
+        # 花火の知識（話題名を含む文）
+        fact = "花火は、火薬の燃焼と爆発で光と音を出し、夜空に模様を描く娯楽です。"
+        # 花火の話題なら通す
+        assert core.relevant(fact, "花火大会はいつ", topic="花火")
+        # 別の話題（ぬるぬる猿）の返事としては通さない = 記憶の丸書きの幻覚を止める
+        assert not core.relevant(fact, "ぬるぬる猿について語って")
+
+    def test_redundant_followup_is_detected(self):
+        core = self._core()
+        assert core.redundant("あなたの言葉を受けて、返事を組み立てているところです。",
+                              "あなたの言葉を解析して、返事を組み立てています。")
+        assert not core.redundant("今日の出来事を一つ教えてください。",
+                                  "雑談は、関係を保つために交わす会話です。")
+
+    def test_relevant_fails_closed(self):
+        """判定に必要な知識ベースが無いときは、生成文を採用しない側に倒す。"""
+        from snipher.core import SnipherCore
+
+        core = SnipherCore(torch_provider=lambda: None)
+        core.active_backend = lambda: None
+        core.kb = None                     # 判定材料が無い状況を作る
+        assert core.relevant("何らかの生成文です。", "ぬるぬる猿について語って") is False
+
+
+class TestAsciiSpacing:
+    """日本語と英数字のあいだに空白が入ること（技術系の文の読みやすさ）。"""
+
+    def test_polisher_inserts_space_between_jp_and_ascii(self):
+        from snipher.polisher import Polisher
+
+        p = Polisher()
+        assert p.polish("最後にgit push で共有する。")["text"] == "最後に git push で共有する。"
+        assert p.polish("401と403の違いは何ですか。")["text"] == "401 と 403 の違いは何ですか。"
+        assert p.polish("catはかわいいです。")["text"] == "cat はかわいいです。"
+
+    def test_polisher_does_not_double_space(self):
+        from snipher.polisher import Polisher
+
+        p = Polisher()
+        for t in ("git init で場所を作る。", "Docker は、コンテナの道具です。",
+                  "Wi-Fi で困っていますか。", "100m を走りました。"):
+            assert p.polish(t)["text"] == t, t
+
+    def test_git_how_answer_is_spaced(self):
+        c = _composer()
+        r = c.compose("gitの使い方")
+        assert r.plan.startswith("knowledge"), r.plan
+        assert "最後に git" in r.text or "git push" in r.text, r.text
+        assert "にgit" not in r.text, r.text

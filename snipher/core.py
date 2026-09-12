@@ -37,6 +37,7 @@ from __future__ import annotations
 import logging
 import math
 import os
+import re
 import threading
 import time
 from pathlib import Path
@@ -316,22 +317,164 @@ class SnipherCore:
         return {"confidence": round(conf, 4), "perplexity": ppl, "neural": neural_conf,
                 "lm": lm_conf, "lm_bad_ratio": bad}
 
-    def relevant(self, text: str, user_text: str, *, topic: str = "") -> bool:
-        """生成文が発話と話題を共有しているか（それっぽいだけの雑談を弾く）。"""
+    # ---- 知識ベースの文の 4-gram 転置索引（幻覚の検出に使う・1 回だけ作る） ---- #
+    _kb_grams: tuple[dict, list] | None = None
+
+    def _kb_gram_index(self) -> tuple[dict, list] | None:
+        if self._kb_grams is not None:
+            return self._kb_grams
+        if self.kb is None:
+            return None
+        try:
+            index: dict[str, list[int]] = {}
+            topics: list[str] = []
+            for item in self.kb.items:
+                tp = str(item.get("topic") or "")
+                sents: list[str] = []
+                for key in ("def", "opinion"):
+                    v = item.get(key)
+                    if isinstance(v, str) and v.strip():
+                        sents.append(v.strip())
+                for key in ("facts", "why", "how", "tips", "answers", "followups"):
+                    for v in item.get(key) or []:
+                        if isinstance(v, str) and v.strip():
+                            sents.append(v.strip())
+                for sent in sents:
+                    sid = len(topics)
+                    topics.append(tp)
+                    for i in range(len(sent) - 3):
+                        index.setdefault(sent[i:i + 4], []).append(sid)
+            self._kb_grams = (index, topics)
+        except Exception:  # noqa: BLE001
+            log.debug("知識ベースの 4-gram 索引を作れません", exc_info=True)
+            self._kb_grams = None
+        return self._kb_grams
+
+    def recited_topic(self, text: str, *, ratio: float = 0.6) -> str:
+        """生成文が知識ベースの文の丸書きなら、その話題名を返す（""= 丸書きではない）。
+
+        小さなニューラルコアは、知らない話題を聞かれると **覚えている別の知識** を
+        語り出すことがあります。それを「それっぽい返事」として出してしまわないための検査です。
+        """
+        idx = self._kb_gram_index()
+        t = str(text or "").strip()
+        if idx is None or len(t) < 8:
+            return ""
+        grams = {t[i:i + 4] for i in range(len(t) - 3)}
+        if not grams:
+            return ""
+        gram_index, topics = idx
+        counts: dict[int, int] = {}
+        for g in grams:
+            for sid in gram_index.get(g, ()):
+                counts[sid] = counts.get(sid, 0) + 1
+        best_sid, best = -1, 0.0
+        for sid, n in counts.items():
+            r = n / len(grams)
+            if r > best:
+                best, best_sid = r, sid
+        return topics[best_sid] if best >= ratio and best_sid >= 0 else ""
+
+    # 会話の受け答えに必ず現れる語（一人称・二人称・依頼）。
+    # これが無い生成文は「知識の断片」であって、返事ではありません。
+    _DIALOGUE_MARKERS = ("私", "あなた", "返事", "言葉", "話", "続き", "教えて",
+                         "聞かせて", "どうぞ", "ください", "ましょう", "一緒に")
+    _QUESTION_END = re.compile(
+        r"(ますか|ですか|ましょうか|でしょうか|ませんか|たいですか|くれますか|"
+        r"か。|か？|か！|？|\?)\s*$")
+    # 話題として数えない語（形式名詞・一般的な動詞）
+    _NOT_TOPIC_WORDS = ("こと", "もの", "とき", "ある", "いる", "する", "なる", "いう")
+
+    def conversational(self, text: str, user_text: str) -> bool:
+        """生成文が「会話の受け答え」になっているか。
+
+        話題の語が無い発話（「何してるの」「話して」）への返事は、語の重なりだけでは
+        判定できません。次のいずれかを満たすものだけを通します:
+
+        A. 相手の内容語を一つでも返している（こと・もの等の形式名詞は数えない）
+        B. 問いかけで終わっていて、かつ会話の語（話・ください・ましょう…）を含む
+        C. 会話の語を 2 つ以上含む（私・あなた・返事・言葉 …）
+
+        「例外のとき量があることが多いです。」のような、文法的でも中身の無い文は
+        A/B/C のどれも満たさないので落ちます。
+        """
+        t = str(text or "").strip()
+        u = str(user_text or "").strip()
+        if not t:
+            return False
+        try:
+            from .composer import _ECHO_SKIP
+            from .knowledge import GENERIC_ALIASES, content_words
+
+            index = self.kb.index if self.kb is not None else None
+            skip = set(_ECHO_SKIP) | set(GENERIC_ALIASES) | set(self._NOT_TOPIC_WORDS)
+            a = {w for w in content_words(t, index) if w not in skip and len(w) >= 2}
+            b = {w for w in content_words(u, index) if w not in skip and len(w) >= 2}
+            if a & b:                                     # A
+                return True
+        except Exception:  # noqa: BLE001
+            log.debug("conversational の語比較に失敗", exc_info=True)
+        marks = sum(1 for m in self._DIALOGUE_MARKERS if m in t)
+        if marks >= 2:                                    # C
+            return True
+        return bool(self._QUESTION_END.search(t)) and marks >= 1   # B
+
+    def redundant(self, extra: str, text: str) -> bool:
+        """付け足す一文が、すでに出した文と同じことを言っていないか。"""
+        e, t = str(extra or "").strip(), str(text or "").strip()
+        if not e or e in t:
+            return True
+        for i in range(max(0, len(e) - 7)):       # 8 文字以上の共通部分列
+            if e[i:i + 8] and e[i:i + 8] in t:
+                return True
         try:
             from .knowledge import content_words
 
-            a = set(content_words(str(text or ""), self.kb.index))
-            b = set(content_words(str(user_text or ""), self.kb.index))
+            index = self.kb.index if self.kb is not None else None
+            a = set(content_words(e, index))
+            b = set(content_words(t, index))
+            if a and len(a & b) / len(a) >= 0.5:
+                return True
+        except Exception:  # noqa: BLE001
+            pass
+        return False
+
+    def relevant(self, text: str, user_text: str, *, topic: str = "") -> bool:
+        """生成文が発話と話題を共有しているか（それっぽいだけの雑談を弾く）。
+
+        判定は 3 段:
+
+        1. 発話の話題語（知識ベースが知っている語）と生成文が語を共有 → 関連あり
+        2. 探している話題名が生成文に出ている → 関連あり
+        3. 発話に話題語が無い（「何してるの」のような世間話）→ 語の重なりでは
+           判定できないので、**別の話題の知識の丸書きでなければ** 通す
+        """
+        try:
+            from .composer import _ECHO_SKIP
+            from .knowledge import content_words
+
+            index = self.kb.index if self.kb is not None else None
+            a = set(content_words(str(text or ""), index))
+            b = {w for w in content_words(str(user_text or ""), index)
+                 if w not in _ECHO_SKIP and (index is None or index.topics_of(w))}
             if a & b:
                 return True
             if topic:
-                tw = set(content_words(str(topic), self.kb.index)) | {str(topic)}
+                tw = set(content_words(str(topic), index)) | {str(topic)}
                 if tw & a or str(topic) in str(text or ""):
                     return True
+            if not b:
+                # 発話に話題の語が無い（世間話）→ 別の話題の知識の丸書きではなく、
+                # かつ「会話の受け答え」の形をしているものだけ通す
+                recited = self.recited_topic(text)
+                if recited and recited != str(topic or ""):
+                    return False
+                return self.conversational(text, user_text)
             return False
         except Exception:  # noqa: BLE001
-            return True
+            # 判定できないなら採用しない（幻覚の門は「閉じる側」に倒す）
+            log.debug("relevant の判定に失敗", exc_info=True)
+            return False
 
     def tiers(self) -> dict:
         """どの知能階層が生きているか（/api/status・/info 用）。"""
@@ -900,6 +1043,7 @@ class SnipherCore:
         note: str | None = None
         chosen_from_model = False
         extra = ""
+        stats_extra: dict = {}
 
         needs_follow = not bool(_re.search(r"(か|かな|でしょう)[。！？!?]", text))
         if core is not None:
@@ -918,28 +1062,56 @@ class SnipherCore:
                         lm_conf = sc["lm"]
                         on_topic = self.relevant(gen_text, last_user, topic=topic)
                         if (sc["confidence"] >= 0.75 and (sc["lm"] or 0.0) >= 0.7 and on_topic
-                                and gen_text not in text and len(text) + len(gen_text) < 190):
+                                and not self.redundant(gen_text, text)
+                                and len(text) + len(gen_text) < 190):
                             extra = gen_text
             else:
-                # 材料が無い → 本文の生成に挑戦させる
-                gen_text = core.reply(last_user, context=messages,
-                                      max_chars=self.cfg.light_max_chars,
-                                      temperature=0.85, top_k=40) or ""
-                used_core = bool(gen_text)
-                bar = self.cfg.light_gate
-                if gen_text:
-                    from .composer import validate as _validate
+                # 材料が無い → 本文の生成に挑戦させる。
+                # 小さなモデルは 1 発だと外すので、温度を変えて複数候補を作り、
+                # 「文法チェック → 内蔵コアの自信 → n-gram LM の自然さ → 話題の一致」を
+                # 全部通した中から最も良い 1 文だけを採用する（best-of-N）。
+                from .composer import validate as _validate
 
+                bar = self.cfg.light_gate
+                cands: list[str] = []
+                for temp, topk, sd in ((0.60, 24, 11), (0.85, 40, 23), (0.45, 12, 37)):
+                    try:
+                        one = (core.reply(last_user, context=messages,
+                                          max_chars=self.cfg.light_max_chars,
+                                          temperature=temp, top_k=topk, seed=sd) or "").strip()
+                    except Exception:  # noqa: BLE001
+                        one = ""
+                    if one and one not in cands:
+                        cands.append(one)
+                used_core = bool(cands)
+                best: tuple[float, str, dict] | None = None
+                for one in cands:
+                    ok, _why = _validate(one, max_len=200)
+                    if not ok:
+                        continue
+                    sc = self.judge(one, core=core, lm=lm)
+                    if sc["confidence"] < bar or float(sc["lm"] or 0.0) < bar:
+                        continue
+                    if not self.relevant(one, last_user, topic=topic):
+                        continue
+                    rank = float(sc["confidence"]) * float(sc["lm"] or 0.0)
+                    if best is None or rank > best[0]:
+                        best = (rank, one, sc)
+                if best is not None:
+                    gen_text = best[1]
+                    sc = best[2]
+                    text = gen_text
+                    chosen_from_model = True
+                    stats_extra["candidates"] = len(cands)
+                elif cands:
+                    gen_text = cands[0]
                     sc = self.judge(gen_text, core=core, lm=lm)
-                    ok, _why = _validate(gen_text, max_len=200)
-                    on_topic = self.relevant(gen_text, last_user, topic=topic)
-                    # 内蔵コアの自信と n-gram LM の自然さ、両方が閾値を越えた文だけ採用する
-                    if ok and sc["confidence"] >= bar and (sc["lm"] or 0.0) >= bar \
-                            and on_topic:
-                        text = gen_text
-                        chosen_from_model = True
-                    else:
-                        note = "low_confidence_ack"
+                    note = "low_confidence_ack"
+                    stats_extra["candidates"] = len(cands)
+                    stats_extra["rejected"] = "gate"
+                else:
+                    sc = None
+                if sc is not None:
                     neural_conf = sc["confidence"]
                     report_conf = sc["confidence"]
                     ppl = sc["perplexity"]
@@ -1006,6 +1178,8 @@ class SnipherCore:
             "new_tokens": None,
             "tokens_per_second": None,
         }
+        if stats_extra:
+            stats.update(stats_extra)
         if note:
             stats["note"] = note
             stats["fallback_reason"] = "手元に確かな材料が無かったので、話題を受け取る応答にしました"

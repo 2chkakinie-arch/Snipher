@@ -429,6 +429,24 @@ def _grams(chars: list[str]) -> list[str]:
     return [chars[i] + chars[i + 1] for i in range(len(chars) - 1)]
 
 
+# 被覆率を数えるとき、同じ語の表記ゆれ（Wi-Fi / wifi）や
+# 助詞がくっ付いた断片（が遅 / のに）を 1 つにまとめる。
+_PARTICLE_FRAG = re.compile(r"^(が|は|を|に|で|と|も|へ|の|や|から|まで|より|だ|た|で)")
+
+
+def _content_set(words) -> set[str]:
+    out: set[str] = set()
+    for w in words or []:
+        w = str(w)
+        if w in _FUNC_WORDS:
+            continue
+        w = _PARTICLE_FRAG.sub("", w, count=1)
+        key = w.lower().replace("-", "").replace(".", "").replace("_", "").replace(" ", "")
+        if key:
+            out.add(key)
+    return out
+
+
 class KnowledgeBase:
     """kb.json を引く検索エンジン（v2: 内容語 + 問答の一致 + 問いの型）。"""
 
@@ -624,12 +642,13 @@ class KnowledgeBase:
             return []
         mx = max(total.values()) or 1.0
         # 被覆率の分母 = 発話の内容語（辞書の語 + 未知語の断片）。機能語は数えない。
-        content = {w for w in words if w not in _FUNC_WORDS and len(w) >= 1}
+        # 表記ゆれ（Wi-Fi / wifi）と助詞の断片（が遅）は 1 つにまとめる。
+        content = _content_set(words)
         ranked = sorted(total.items(), key=lambda kv: -kv[1])[: max(top_k, 1) * 3]
         out: list[dict] = []
         for i, sc in ranked:
             hit_words = set(word_hits.get(i, []))
-            covered = len(content & hit_words) if content else 0
+            covered = len(content & _content_set(hit_words)) if content else 0
             cov = covered / len(content) if content else 0.0
             kinds = {self.index.kind_of(w, i) for w in hit_words}
             out.append({
@@ -762,8 +781,13 @@ class KnowledgeBase:
         strong_hit = None
         for h in hits:
             if h.get("topic_hit") and (float(h["score"]) >= min_score):
-                if int(h.get("covered_n", 0)) >= 1 and (
-                        float(h.get("coverage", 0.0)) >= min_cov or len(content) <= 3):
+                cov = float(h.get("coverage", 0.0))
+                covered_n = int(h.get("covered_n", 0))
+                # 話題名が実際に発話に出ていて、かつ発話の内容語の多くがその話題のもの
+                # であること。未知語（ゾルタクス等）が混ざる発話を別話題の定義で
+                # 答えてしまわないよう、内容語が多いときは被覆率を必ず見ます。
+                short = len(content) <= 2 and covered_n >= 1 and float(h["score"]) >= 0.6
+                if covered_n >= 1 and (cov >= min_cov or short):
                     strong_hit = h
                     break
         if strong_hit is None:
