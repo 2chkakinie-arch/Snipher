@@ -8,7 +8,7 @@ import に失敗せず、Snipher 従来の超小型エンジンへフォール�
 
 from __future__ import annotations
 
-__all__ = ["LLM_DEPS_AVAILABLE", "LfmEngine", "get_engine"]
+__all__ = ["LLM_DEPS_AVAILABLE", "LfmEngine", "get_engine", "GgufBackend"]
 
 
 def _check_deps() -> bool:
@@ -30,3 +30,9 @@ def get_engine():
     from .engine import get_engine as _get
 
     return _get()
+
+
+def GgufBackend(*args, **kwargs):  # noqa: N802 — 遅延 import のファサード
+    from .gguf_backend import GgufBackend as _B
+
+    return _B(*args, **kwargs)

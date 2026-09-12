@@ -1,202 +1,132 @@
-# LFM2.5-1.2B-JP ニューラルチャット設計
+# Snipher Core 設計 — LFM2.5-1.2B-JP を内部構造として動かす
 
-Snipher に Liquid AI の **LFM2.5-1.2B-JP**（1.17B / LFM2 hybrid アーキテクチャ /
-32K context）の学習済みパラメータを載せ、CPU でも高速な日本語の日常会話を
-実現するニューラルエンジンの設計メモ。
+Liquid AI の **LFM2.5-1.2B-JP-202606**（1.17B / LFM2.5 ハイブリッドアーキテクチャ /
+16 層 = 10 conv + 6 GQA / 32K context / 語彙 65,536）を、Snipher という
+1 つのエンジンの**ニューラルコア**として内蔵する設計メモ。
 
-従来の超小型エンジン（~500 パラメータ・ルールベース + 対話テーブル）は、
-ニューラルエンジンが使えない環境（torch 未インストール / モデル未ダウンロード /
-オフライン）でのフォールバックとしてそのまま残してある。
+「別製品のハイブリッド」ではなく、Snipher の内部パイプラインの一段として
+LFM2.5 が組み込まれている。高速コア（従来の ~500 パラメータのテーブル +
+確率式 + polisher）は、意図判定・確信度の算出・助動詞のルール補正・
+フォールバック応答という**内部の役割**を担い続ける。
 
 ---
 
-## 0. ハイブリッド補正（速度を維持したまま賢く）
-
-「LFM に全部を作らせる」のではなく、**Snipher-mini が常に下書きを作り、
-確率的に不安な部分だけ LFM が書き直す**二段構え:
+## 1. 内部パイプライン（snipher/core.py）
 
 ```
 ユーザー発話
   │  <数ミリ秒>
   ▼
-Snipher-mini 下書き
-  ├─ 意図判定     ... responses.json の対話テーブル(挨拶/感謝/質問…)
-  ├─ 確率的補完   ... generator が話題に合わせた1文を生成
-  │                  (各スロット決定の softmax 確率を記録)
-  └─ 助動詞の補い ... polisher が文末・助動詞・文体をルール修復
+高速コア（常に動作）
+  ├─ 未知文字の自動検出      … 入力に 𠮷/絵文字 → 自動学習をバックグラウンド起動
+  ├─ 意図判定               … responses.json の対話テーブル
+  ├─ 確率的な下書き + 確信度 … generator の softmax 確度 → confidence
+  └─ 助動詞の補い(ルール)    … polisher（文末・助動詞・文体の修復）
   │
-  ▼
-confidence = スロット確率の重み平均(述語 1.5 / 名詞 1.0)
-  ├─ ≥ SNIPHER_ASSIST_THRESHOLD(既定 0.35)
-  │     → そのまま返答。LFM は 1 トークンも消費しない(最速経路)
-  └─ < 閾値
-        → LFM2.5 に書き直し依頼(既定 64 トークン上限)
-          「相手の発話 + 下書き → 自然な返答(1〜2文)」
-          出力が空でも下書きにフォールバックするので壊れない
+  ▼ 経路判定（route_of）
+  ├─ intent ∈ 定形(挨拶/感謝/…) かつ confidence ≥ 閾値
+  │     → ⚡ instant: そのまま即答。ニューラルコアは 1 トークンも消費しない
+  ├─ それ以外（質問・雑談・低確信度）
+  │     → ✨ neural: LFM2.5-1.2B-JP が会話履歴ごと本文をストリーム生成。
+  │        下書きは「内部ヒント」として system プロンプトに同梱し、
+  │        出力は polisher（助動詞の補い）を通して返す
+  └─ ニューラルコア未準備/失敗
+        → fallback: 下書き（低確信度なら安全な骨子 base_text）で必ず応答。
+          自動取得の進捗を stats に載せる
 ```
 
 ポイント:
 
-- 下書きは常に完成しているため、LFM が何らかの理由で失敗しても応答は出る
-- 補正対象が短いので、応答全体を LFM で作るより速い
-- LFM が無い環境では、不確実な生成文を安全な骨子(base_text)に退避させ、
-  テーブル由来の確実な文だけで返す(品質の下限を守る)
-- 助動詞の補いは LFM の有無にかかわらずルールで実行(マイクロ秒単位)
+- **速度維持**: 確実な定形応答はミリ秒のまま。LFM が動いても SSE ストリーミング
+  なので体感遅延は小さい
+- **壊れない**: ニューラル出力が空/例外でも下書きにフォールバック
+- **助動詞の補い**は二重: 下書き段階（ルール）と LFM 出力の後処理（ルール）。
+  さらに `POST /api/complete` では断片文を LFM に補完させる（神経系の補い）
 
-## 1. オフライン環境でのモデル取り込み
+## 2. バックエンド（自動選択）
 
-`huggingface.co` への外向き接続が遮断された環境（CI サンドボックス等）では
-自動ダウンロードが失敗する。`LfmEngine._probe_hf` が 5 秒の事前確認を行い、
-失敗なら軽量モードへ素早く落ちる（ハングしない）。モデルの入手手段は 2 つ:
+| | gguf（既定・最速） | torch |
+|---|---|---|
+| ランタイム | llama-cpp-python（無ければ llama-server バイナリを PATH / var/bin / SNIPHER_LLAMA_SERVER から自動探索しサブプロセス起動） | transformers + 動的 INT8 量子化 |
+| モデル | 公式 GGUF（Q4_K_M 731MB 既定。Q4_0/Q5_K_M/Q6_K/Q8_0/F16 を選択可） | model.safetensors 2.2GB + config/tokenizer 一式 |
+| RAM 目安 | ~1.5GB | ~4GB（量子化時ピーク） |
+| 未知文字学習 | 不要（byte-fallback で未知文字が発生しない） | 予約トークン + 埋め込み合成（即時）/ 勾配更新（深学習） |
+| テンプレート | GGUF メタデータの chat template → 内蔵 ChatML → raw | tokenizer の native → 内蔵 ChatML → raw |
 
-1. **ブラウザからのアップロード（UI 統合）**
-   - 「モデル管理」パネルにモデルファイルをドロップ → `POST /api/model/upload`
-   - `config.json` + トークナイザ + `*.safetensors` が揃うと complete 判定
-     （`GET /api/model/import` が不足ファイルを列挙）
-   - 「ロード」→ `POST /api/model/load` → `LfmEngine.reload()` がホットスワップ
-2. **`tools/fetch_model.py`（自分のマシンで実行）**
-   - HuggingFace → hf-mirror.com の順に自動試行、Range リクエストでレジューム対応
-   - 標準ライブラリのみで動作
-   - 取得後 `SNIPHER_LFM_MODEL=<dir>` で起動、または同じく UI からロード
+LFM2.5 は llama.cpp の `lfm2` アーキテクチャで動く（conv + GQA のハイブリッド）。
+実測: 2 コア CPU で LFM2.5-2.6B Q4_0 が ~8-10 tok/s（ロード 1.5 秒）だったため、
+1.2B-JP Q4_K_M なら一般的な PC で 20-40 tok/s 程度が見込める。
 
----
+## 3. モデルの全自動取得（snipher/lfm/acquire.py）
 
-## 全体構成
+ユーザーにアップロードや手動ダウンロードをさせない。起動時に:
 
-```
-snipher/
-├── polisher.py       # 助動詞の補い・文体修復(ルールのみ・LFM 不要)
-├── responder.py      # 意図分類 + 対話テーブル応答(下書き生成)
-├── lfm/
-│   ├── config.py     # 環境変数 SNIPHER_LFM_* の設定
-│   ├── engine.py     # ロード / INT8 量子化 / ストリーミング生成 / 学習ジョブ / ホットスワップ
-│   ├── assist.py     # ハイブリッド補正(下書き → 確度判定 → LFM 書き直し)
-│   ├── template.py   # チャットテンプレート管理（ネイティブ → 内蔵 → なし の3段）
-│   ├── vocab.py      # 未知文字の検出（UNK / バイト断片 / 分割）
-│   └── learner.py    # 未知文字の学習（即時合成 + 埋め込み勾配更新）と永続化
-├── web/chat.html     # ホワイトテーマのチャット UI
-└── api.py            # /api/chat (SSE) /api/model/* /api/learn /api/status など
-```
+1. ローカル（キャッシュ `var/models/` / `SNIPHER_LFM_MODEL` / `SNIPHER_LFM_GGUF` /
+   手動取り込みディレクトリ）を確認
+2. 無ければバックエンドに応じたプランでダウンロード:
+   - `SNIPHER_LFM_URLS` の直接 URL
+   - 共有ミラー（ギガワタスの共有ページ → HTML から直リンクを自動解決 →
+     HEAD で検証してから使用。期限切れは自動スキップ）
+   - HuggingFace 公式 → hf-mirror.com
+3. Range リクエストでレジューム、`.part` → アトミック rename、最小サイズ検証
+4. 接続レベルで失敗したホストは死亡扱いにして以降のファイルを高速スキップ
+5. 失敗時は `SNIPHER_LFM_FETCH_RETRY`（既定 300 秒）ごとに自動再試行。
+   UI の「再試行」/ `POST /api/model/fetch` からもトリガー可能
+6. gguf の取得が失敗しても torch（逆も）に自動で切り替えて再試行する
 
-## 1. 高速化のポイント
+進捗（ファイル・%・速度・ETA・ソース・ログ）は `GET /api/status` の
+`acquire` と `GET /api/model/acquire` で公開し、UI のプログレスバーが描画する。
+取得中も高速コアが応答を続ける。
 
-| 工夫 | 効果 |
-| --- | --- |
-| 動的 INT8 量子化（`torch.ao.quantization.quantize_dynamic`、Linear のみ） | 重み ~2.4GB → ~1.2GB。CPU の int8 GEMM（oneDNN/FBGEMM）で高速化 |
-| 量子化しないモジュール（Embedding / norm / conv）だけ fp32 に寄せる | 動的量子化 Linear は fp32 入力を要求するための整合 |
-| `TextIteratorStreamer` によるトークン単位の SSE ストリーミング | 初トークンまでの体感遅延を削減 |
-| プロンプト予算（既定 1024 トークン）+ 古い履歴から削るローリング窓 | prefill コストを一定に保つ |
-| 応答長の既定 128 トークン / temperature 0.3 / top_k 50 / repetition_penalty 1.05 | 日常会話に適した短い返答と安定性 |
-| 予約トークン（既定 256 個）のうち未割当の id を logits で `-inf` に抑制 | 語彙拡張の副作用（空きスロットからの無意味なトークン排出）を防止 |
+## 4. 未知文字の学習（torch バックエンド・LFM2.5 のパラメータを適用）
 
-速度の目安: 2 vCPU・メモリ 4GB クラスで数十トークン/秒の応答が目標。
-実測値は UI の各応答に `tokens_per_second` として表示される。
+- **自動**: チャット入力をスキャンし、未知文字を**応答をブロックせずに**
+  バックグラウンドで即時学習する（learn_instant: トークナイザが文字を分解した
+  既知断片の事前学習済み埋め込みの平均で予約トークン行を初期化）
+- **深学習（任意）**: 例文から埋め込み行のみを少数ステップ勾配更新
+  （本体の重みは凍結）。`var/learned_vocab/` に永続化され、再起動後も有効。
+  学習済み文字はプロンプト内で 1 意味トークンに写像され、
+  未割当の予約トークンは生成時にロジット抑制される
+- **GGUF バックエンド**: byte-fallback BPE のため未知文字は原理的に発生しない
+  （`/api/vocab/check` は unknown 0 + 説明文を返す）
 
-## 2. テンプレートがない時の生成（3 段フォールバック）
+## 5. テンプレートの 3 段フォールバック（snipher/lfm/template.py）
 
-LFM2.5-1.2B-JP-202606 は `chat_template.jinja` を同梱するが、
-tokenizer によってはテンプレートを持たない（または壊れている）ことがある。
+1. ネイティブ（tokenizer.chat_template / GGUF メタデータ）
+2. 内蔵 ChatML（LFM2 系の <|im_start|>/<|im_end|> 形式を jinja 無しで描画）
+3. テンプレートなし（raw: 役割ラベルも制御トークンも付けず素で続唱）
 
-1. **native**: `tokenizer.apply_chat_template()` が使えるならそのまま使う
-2. **builtin**: 内蔵の ChatML テンプレート（`<|startoftext|>` + `<|im_start|>role\n...<|im_end|>`。
-   LiquidAI 純正の jinja と同じワイヤ形式を素の Python で再現、jinja 依存なし）
-3. **raw**: テンプレートなし生成。制御トークンを一切付けずテキストを素で続唱
-   （UI の「テンプレート: なし」で強制できる。BOS のみ付与）
-
-どの段で失敗しても次の段に落ちるため、**常に何らかの生成が可能**。
-
-## 3. 未知文字の学習
-
-トークナイザ（語彙 65,536）でも保持できない文字（希少漢字 `𠮷`、絵文字 `🚀`、
-新語など）を、**事前学習済みパラメータを再利用して**会話に参加させる。
-
-### 検出（vocab.py）
-1 文字ずつ単独トークナイズし、次を「未知」と判定する:
-- UNK トークンに落ちる
-- バイトフォールバック断片（`<0xNN>` 等）に分解される
-- 2 個以上のサブワードに分割される（fragmented）
-
-### レベル 1: 即時学習（数百ミリ秒・再起動不要）
-- 語彙末尾に用意した**予約スロット**（65536 番以降）に新トークンを割り当てる
-- その埋め込み行を、**トークナイザがその文字を分解した既知断片の
-  学習済み埋め込みの平均**で初期化する（=`compose_row`）
-  - 例: `𠮷` → 4 バイト断片の埋め込みの平均 → 「吉の異体字」っぽい方向ベクトル
-- untied の場合は出力側 lm_head 行にも書き込む。tied では入力側のみ
-  （量子化済み lm_head は再ロード時に反映）
-- `var/learned_vocab/` に JSON（文字 → id）+ safetensors（行ベクトル）として永続化
-
-### レベル 2: 深学習（例文から勾配で数ステップ・CPU でも数十秒）
-- エンコード時に**断片列 → 予約トークン**へ写像（`map_ids`）し、
-  モデルが学習文字を 1 意味トークンとして読めるようにする
-- チャット用の量子化モデルを一度解放し、bf16 マスターをロード
-- **新トークンの行だけ**を `nn.Parameter` として切り出し、例文
-  （未指定なら自動テンプレート「私は{x}が好きです。」等）で
-  causal LM の損失を数ステップ（既定 12 step / AdamW / lr 3e-3）最小化
-  - 損失は学習文字の近傍 3 トークン以内の位置に限定し、汎用挙動を壊さない
-  - 本体の重みは完全凍結（破壊的ファインチューニングではない）
-- 学習後、行を永続化して量子化モデルを再構築（tied lm_head にも学習結果が反映され、
-  モデルがその文字を**出力**できるようになる）
-
-### 永続化とライフサイクル
-- `var/learned_vocab/learned_vocab.json` + `learned_rows.safetensors`
-- 起動時: resize → ゼロ初期化 → 保存済み行を復元 → 量子化
-- 深学習は非同期ジョブ（`POST /api/learn {"mode":"deep"}` → `GET /api/learn/status`）
-- `DELETE /api/learn` で全消去
-
-## 4. フォールバック階層（ニューラルエンジンが無い環境）
+LFM2.5 公式のワイヤ形式:
 
 ```
-torch/transformers あり + モデルあり → LFM2.5-1.2B-JP（INT8）
-torch なし / モデル未取得 / 読込中 / 学習中 → Snipher-mini（476 パラメータ）
+<|startoftext|><|im_start|>system
+…<|im_end|>
+<|im_start|>user
+日本の首都は？<|im_end|>
+<|im_start|>assistant
 ```
 
-UI のバッジに現在のエンジンが表示される。`GET /api/status` で機械可読な状態を取得。
+## 6. 状態機械（boot）
 
-## 5. モデルの入手について
+```
+idle → booting → fetching → loading → ready
+                 │           │
+                 └── failed ─┴→ (クールダウン) → 自動再試行 / deps_missing
+```
 
-- 既定では `LiquidAI/LFM2.5-1.2B-JP-202606` を初回起動時に HuggingFace から
-  自動ダウンロードする（~2.4GB / LFM Open License v1.0）
-- オフライン環境では `SNIPHER_LFM_MODEL` にローカルのモデルディレクトリを指定
-- 開発/CI 用に、同アーキテクチャの小型モデル（~0.4M パラメータ）を
-  `python tools/make_test_model.py --out var/tiny-lfm2` で生成でき、
-  テンプレート/学習/ストリーミングの全コードパスを検証できる
-  （テスト `tests/test_lfm.py` はこの小型モデルで動く）
+- fetching/loading 中も `/api/chat` は高速コアで応答し続ける
+- `POST /api/model/fetch`（UI の再試行）と `/api/model/load`（手動取り込み後の
+  ホットスワップ）で状態をリセットして再 boot できる
+- テスト/ホット再設定のため、環境変数（SNIPHER_LFM_MODEL 等）の変化を
+  検出して自動的に設定を作り直す
 
-## 6. 環境変数一覧
+## 7. UI（snipher/web/chat.html・ホワイトテーマ）
 
-| 変数 | 既定 | 説明 |
-| --- | --- | --- |
-| `SNIPHER_LFM_MODEL` | `LiquidAI/LFM2.5-1.2B-JP-202606` | モデルID またはローカルディレクトリ |
-| `SNIPHER_LFM_AUTOSTART` | `1` | 起動時にバックグラウンドロード |
-| `SNIPHER_LFM_QUANTIZE` | `1` | 動的 INT8 量子化 |
-| `SNIPHER_LFM_RESERVED` | `256` | 未知文字学習用の予約トークン数 |
-| `SNIPHER_LFM_PROMPT_BUDGET` | `1024` | プロンプト予算（トークン） |
-| `SNIPHER_LFM_MAX_NEW_TOKENS` | `128` | 既定の最大応答トークン |
-| `SNIPHER_LFM_TEMPERATURE` | `0.3` | 既定温度 |
-| `SNIPHER_LFM_TOP_K` | `50` | 既定 top_k |
-| `SNIPHER_LFM_REPETITION_PENALTY` | `1.05` | 繰り返しペナルティ |
-| `SNIPHER_LFM_LEARN_STEPS` | `12` | 深学習の既定ステップ数 |
-| `SNIPHER_LFM_LEARN_LR` | `3e-3` | 深学習の学習率 |
-| `SNIPHER_LFM_STORE_DIR` | `var/learned_vocab` | 学習済み語彙の保存先 |
-| `SNIPHER_LFM_UPLOAD_DIR` | `var/models/upload` | ブラウザからのモデル取り込み先 |
-| `SNIPHER_LFM_SKIP_NET_CHECK` | `0` | `1` で HuggingFace 事前接続確認をスキップ |
-| `SNIPHER_ASSIST_ENABLED` | `1` | ハイブリッド補正の有効化 |
-| `SNIPHER_ASSIST_THRESHOLD` | `0.35` | 下書き確度がこの値未満なら LFM 補正 |
-| `SNIPHER_ASSIST_MAX_NEW_TOKENS` | `64` | LFM 補正の出力トークン上限 |
-
-## 7. API
-
-| メソッド | パス | 説明 |
-| --- | --- | --- |
-| GET | `/` | ホワイトテーマのチャット UI |
-| GET | `/classic` | 旧 UI（超小型エンジンのデモ） |
-| GET | `/api/status` | エンジン状態・学習済み文字・テンプレート情報・ハイブリッド設定 |
-| POST | `/api/chat` | SSE ストリーミング応答（`hybrid:false` で LFM 直接・`use_template:false` でテンプレートなし生成） |
-| GET | `/api/model/import` | ローカル取り込み状態(不足ファイルの列挙) |
-| POST | `/api/model/upload` | モデルファイルのアップロード(multipart、`activate=1` で即ロード) |
-| POST | `/api/model/load` | アップロード済み/指定ローカルモデルでホットリロード |
-| POST | `/api/vocab/check` | テキスト中の未知文字をスキャン |
-| POST | `/api/learn` | 未知文字を学習（`mode: instant` / `deep`） |
-| GET | `/api/learn/status` | 深学習ジョブの状態 |
-| DELETE | `/api/learn` | 学習済み語彙を全消去 |
-| GET/POST | `/info` `/analyze` `/generate` | 従来どおり（超小型エンジン） |
+- ヘッダー: エンジンバッジ（⚡ LFM2.5-1.2B-JP (GGUF Q4_K_M · llama.cpp) 等）
+- 自動取得バー: ダウンロード中は %・速度・ETA・ソースを表示（操作不要）
+- 吹き出し: 送信=右（グレー）/ 応答=左（白・枠線）。応答中に
+  「✨ 確率的に不安な応答 → 内部の LFM2.5 が生成」等の内部経路ノートを表示
+- メタ行: 経路（⚡/✨）・助動詞補正件数・tok/s・intent・下書き確度
+- 未知文字チップ: 自動学習中は「自動学習中…」、完了後は「学習済み」
+- ドロワー: 設定（モード/温度/最大トークン/テンプレート）、コアの状態、
+  未知文字の深学習、モデル取得（手動取り込みは「最後の手段」として折りたたみ）

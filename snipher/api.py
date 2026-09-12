@@ -19,7 +19,8 @@ from snipher.engine import SnipherEngine
 engine = SnipherEngine()
 
 # ----------------------------------------------------------------------
-# LFM2.5-1.2B-JP ニューラルエンジン（オプション。torch が無ければ素通り）
+# Snipher Core — LFM2.5-1.2B-JP を内部ニューラルコアとして動かす
+# （モデルは起動時に全自動取得・バックエンド自動選択・アップロード不要）
 # ----------------------------------------------------------------------
 from snipher.lfm import LLM_DEPS_AVAILABLE
 
@@ -41,24 +42,45 @@ def lfm_engine():
 
 
 def _maybe_start_lfm() -> None:
-    eng = lfm_engine()
-    if eng is not None and eng.cfg.autostart:
-        eng.ensure_started()
+    c = core()
+    if c.cfg.autostart:
+        c.ensure_started()
+
+
+_core = None
+_core_lock = threading.Lock()
+
+
+def core():
+    """SnipherCore のシングルトン（LFM2.5-1.2B-JP = 内部ニューラルコア）。"""
+    global _core
+    with _core_lock:
+        if _core is None:
+            from snipher.core import SnipherCore
+
+            _core = SnipherCore(torch_provider=lfm_engine)
+        return _core
 
 
 @contextlib.asynccontextmanager
 async def _lifespan(app: FastAPI):
     _maybe_start_lfm()
     yield
+    try:
+        core().shutdown()
+    except Exception:  # noqa: BLE001
+        pass
 
 
 app = FastAPI(
     title="Snipher API",
     description=(
-        "超小型・確率的日本語AI + LFM2.5-1.2B-JP チャット。"
-        "未知文字の学習とテンプレートフォールバック付きの高速な日常会話。"
+        "LFM2.5-1.2B-JP を内部構造として動かす高速日本語チャット。"
+        "モデルは起動時に全自動取得（llama.cpp GGUF / torch INT8 を自動選択）。"
+        "確率的に不安な応答だけニューラルコアが生成し、確実な定形は即答。"
+        "未知文字の自動学習とテンプレートフォールバック付き。"
     ),
-    version="0.3.0",
+    version="0.4.0",
     lifespan=_lifespan,
 )
 
@@ -72,60 +94,9 @@ app.add_middleware(
 
 
 # ----------------------------------------------------------------------
-# ハイブリッド補正: Snipher-mini の下書き → 不安な部分だけ LFM2.5 が書き直し
+# 内部パイプライン: Snipher Core（高速コア + LFM2.5-1.2B-JP ニューラルコア）
 # ----------------------------------------------------------------------
-from snipher.lfm.assist import AssistConfig, HybridAssist
-
-_assist = HybridAssist()
-_ASSIST_CFG = _assist.cfg
-
-
-def _chunk_for_stream(text: str, pieces: int = 3) -> list[str]:
-    """軽量経路のテキストを擬似ストリーミング用に文単位で分割する。"""
-    import re as _re
-
-    parts = [p for p in _re.split(r"(?<=。)|(?<=？)|(?<=！)", text) if p]
-    if len(parts) <= pieces:
-        return parts or [text]
-    merged: list[str] = []
-    per = max(1, -(-len(parts) // pieces))
-    for i in range(0, len(parts), per):
-        merged.append("".join(parts[i : i + per]))
-    return merged
-
-
-def _mini_reply(messages: list[dict], safe_only: bool | None = None) -> tuple[str, dict]:
-    """超小型エンジンで会話応答を作る(対話テーブル + 助動詞の補い)。
-
-    ニューラルエンジンが使えない環境でも、意図に沿った日本語の返答を
-    数ミリ秒で組み立てる。confidence が閾値未満の確率的生成文は、
-    LFM が無い限り安全な骨子(base_text)に退避させて出力する。
-    LFM が使えるときは HybridAssist がこの下書きを LFM に書き直させる。
-    """
-    last_user = next(
-        (m.get("content", "") for m in reversed(messages) if m.get("role") == "user"), ""
-    )
-    draft = _assist.draft(last_user)
-    uncertain = _assist.needs_lfm(draft)
-    if uncertain and (safe_only or safe_only is None):
-        text = draft.get("base_text") or draft["text"]
-    else:
-        text = draft["text"]
-    stats = {
-        "engine": "Snipher-mini+",
-        "template_mode": "rule-based",
-        "new_tokens": None,
-        "tokens_per_second": None,
-        "assist": "rule",
-        "draft": draft["text"],
-        "draft_confidence": draft.get("confidence"),
-        "intent": draft.get("intent"),
-        "fixes": draft.get("fixes", []),
-        "draft_seconds": draft.get("draft_seconds"),
-    }
-    if uncertain:
-        stats["degraded_to_base"] = text != draft["text"]
-    return text, stats
+from snipher.lfm.assist import AssistConfig, HybridAssist  # noqa: E402,F401  (互換 export)
 
 
 class AnalyzeRequest(BaseModel):
@@ -311,9 +282,17 @@ class ChatRequest(BaseModel):
     repetition_penalty: float | None = Field(None, ge=1.0, le=2.0)
     use_template: bool = Field(True, description="False でテンプレートなし生成")
     system_prompt: str | None = Field(None, max_length=2000)
+    mode: str = Field(
+        "auto",
+        pattern="^(auto|fast|lfm|neural)$",
+        description=(
+            "auto=内部パイプライン(確実な定形は即答/確率的に不安な応答は LFM2.5 が生成), "
+            "fast=高速コアのみ, lfm=常に LFM2.5 が生成"
+        ),
+    )
     hybrid: bool | None = Field(
         None,
-        description="True/False でハイブリッド補正を強制。未指定時は LFM が使えるなら有効",
+        description="旧互換フラグ。False は mode=lfm、True は mode=auto と同じ",
     )
 
 
@@ -323,157 +302,112 @@ def _sse(obj: dict) -> str:
     return f"data: {json.dumps(obj, ensure_ascii=False)}\n\n"
 
 
+def _neural_deps() -> bool:
+    """どちらかのニューラルランタイム(torch / llama.cpp)が入っているか。"""
+    if LLM_DEPS_AVAILABLE:
+        return True
+    try:
+        from snipher.lfm.gguf_backend import runtime_kind
+
+        return runtime_kind(core().cfg) is not None
+    except Exception:  # noqa: BLE001
+        return False
+
+
 @app.get("/api/status")
 def api_status():
-    """ニューラルエンジンと学習済み語彙の状態。"""
-    eng = lfm_engine()
-    if eng is None:
+    """Snipher Core の状態（ニューラルコア・自動取得の進捗・学習済み語彙）。"""
+    c = core()
+    if not _neural_deps():
         return {
             "deps": False,
-            "lfm": None,
+            "backend": None,
+            "lfm": {"state": "unavailable", "error": "torch/transformers または llama-cpp-python 未インストール"},
+            "acquire": {"phase": "idle"},
             "fallback": "Snipher-mini+",
-            "hybrid": {"available": False, "assist": "rule", "reason": "torch/transformers 未インストール"},
+            "hybrid": {"available": False, "assist": "rule", "reason": "ニューラルランタイム未インストール"},
         }
-    if eng.cfg.autostart:
-        eng.ensure_started()
-    st = eng.status()
-    st["engine_label"] = eng.engine_name() if eng.is_ready else None
+    if c.cfg.autostart:
+        c.ensure_started()
+    st = c.status()
+    ready = bool(st.get("neural_ready"))
     return {
         "deps": True,
+        "backend": st.get("backend_kind"),
         "lfm": st,
+        "acquire": st.get("acquire"),
         "fallback": "Snipher-mini+",
         "hybrid": {
-            "available": eng.is_ready,
-            "assist": "lfm" if eng.is_ready else "rule",
-            "threshold": _ASSIST_CFG.threshold,
-            "enabled": _ASSIST_CFG.enabled,
+            "available": ready,
+            "assist": "lfm" if ready else "rule",
+            "threshold": c.assist.cfg.threshold,
+            "enabled": c.assist.cfg.enabled,
         },
     }
 
 
+@app.get("/api/model/acquire")
+def api_model_acquire():
+    """自動取得ジョブの進捗（UI がポーリングする）。"""
+    c = core()
+    return {"boot_state": c.boot_state, "boot_error": c.boot_error,
+            "backend": c.backend_kind, **c.acquire_status()}
+
+
+class FetchRequest(BaseModel):
+    backend: str | None = Field(None, pattern="^(gguf|torch)$", description="取得する形式の強制指定")
+
+
+@app.post("/api/model/fetch")
+def api_model_fetch(req: FetchRequest):
+    """モデルの自動取得を（再）トリガーする。通常は起動時に全自動で走る。"""
+    return core().fetch_now(req.backend)
+
+
+class CompleteRequest(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
+
+    text: str = Field(..., min_length=1, max_length=2000)
+    register_style: str = Field("polite", alias="register", pattern="^(polite|casual)$")
+    use_neural: bool = True
+
+
+@app.post("/api/complete")
+def api_complete(req: CompleteRequest):
+    """助動詞の補い: 文末・助動詞が欠けた断片文を内部パイプラインで補完する。"""
+    try:
+        return {"ok": True, **core().complete_fragment(
+            req.text, register=req.register_style, use_neural=req.use_neural)}
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "error": str(exc)}
+
+
 @app.post("/api/chat")
 def api_chat(req: ChatRequest):
-    """SSE ストリーミングで応答するチャット。
+    """SSE ストリーミングで応答するチャット（Snipher Core 内部パイプライン）。
 
-    ハイブリッド経路（既定）:
-        Snipher-mini が一瞬で下書きを作り、確率的に不安な返答
-        （confidence が閾値未満）のときだけ LFM2.5 が書き直す。
-        助動詞・文体の欠落は常にルールで補う（polisher）。
+    - 確実な定形応答(挨拶・感謝など)  → 高速コアが数ミリ秒で即答（速度維持）
+    - 確率的に不安な応答(質問・雑談)  → LFM2.5-1.2B-JP が内部で本文を生成し、
+      助動詞の補い(polisher)を通して返す
+    - ニューラルコア準備中/未取得     → 高速コアが安全な応答を返し、
+      自動取得の進捗をイベントに載せる
     """
-    eng = lfm_engine()
-    if eng is not None and eng.cfg.autostart:
-        eng.ensure_started()
+    c = core()
+    if c.cfg.autostart:
+        c.ensure_started()
 
     msgs = [m.model_dump() for m in req.messages]
-    last_user = next((m["content"] for m in reversed(msgs) if m["role"] == "user"), "")
-    use_hybrid = req.hybrid if req.hybrid is not None else True
+    mode = req.mode
+    if req.hybrid is False:
+        mode = "lfm"
+    elif req.hybrid is True and mode == "auto":
+        mode = "auto"
 
     def gen():
-        ready = eng is not None and eng.is_ready
-        # 未知文字の検出（Ready のときだけ）
-        if ready:
-            try:
-                scan = eng.scan_unknown(last_user)
-                if scan and scan["unknown"]:
-                    learned_map = {c["char"] for c in eng.status()["learned_chars"]}
-                    for c in scan["unknown"]:
-                        if c["char"] in learned_map:
-                            c["learned"] = True  # 学習済みマーク（UI 用）
-                    yield _sse({"type": "meta", "unknown_chars": scan["unknown"]})
-            except Exception:
-                pass
-
-        if not ready:
-            reason = None
-            if eng is None:
-                reason = "torch/transformers 未インストール"
-            elif eng.state == "loading":
-                reason = "モデル読込中"
-            elif eng.state == "learning":
-                reason = "学習処理中"
-            else:
-                reason = eng.error or "モデル未ロード"
-                if "huggingface" in (reason or "").lower() or "ConnectionError" in (reason or ""):
-                    reason = "HuggingFace に未接続（モデルをローカルから取り込んでください）"
-
-            # ---- 軽量経路: 対話テーブル + 助動詞の補い（数ミリ秒） ----
-            text, stats = _mini_reply(msgs)
-            stats["fallback_reason"] = reason
-            yield _sse({"type": "start", "engine": "Snipher-mini+", "template_mode": "rule-based"})
-            for piece in _chunk_for_stream(text):
-                yield _sse({"type": "delta", "text": piece})
-            yield _sse({"type": "done", "text": text, "stats": stats})
-            return
-
-        # ---- LFM 利用可能 ----
-        if use_hybrid:
-            try:
-                draft = _assist.draft(last_user)
-                if _assist.needs_lfm(draft):
-                    # 確率的に不安な下書き → LFM2.5 が書き直す（賢い経路）
-                    yield _sse({
-                        "type": "assist",
-                        "mode": "lfm",
-                        "draft": draft["text"],
-                        "confidence": draft.get("confidence"),
-                        "reason": "low_confidence",
-                    })
-                    holder: dict = {}
-
-                    def _polish():
-                        text, stats = yield from _assist.polish_with_lfm(
-                            eng, draft, last_user,
-                            temperature=req.temperature if req.temperature is not None else 0.3,
-                            max_new_tokens=max(
-                                24, min(req.max_new_tokens or 64, _ASSIST_CFG.max_new_tokens)
-                            ),
-                        )
-                        holder["text"] = text
-                        holder["stats"] = stats
-
-                    try:
-                        for ev in _polish():
-                            yield _sse(ev)
-                    except Exception as exc:  # noqa: BLE001 — LFM 補正が失敗しても下書きで応答
-                        holder["error"] = str(exc)
-
-                    text = holder.get("text") or draft["text"]
-                    stats = holder.get("stats") or {
-                        "engine": "Snipher-mini+", "assist": "rule",
-                        "template_mode": "rule-based",
-                    }
-                    if holder.get("error"):
-                        stats["assist_fallback"] = holder["error"]
-                    yield _sse({"type": "done", "text": text, "stats": stats})
-                    return
-                # 確信を持てる下書き → そのまま高速返答（LFM は未使用・速度維持）
-                stats = {
-                    "engine": "Snipher-mini+ (LFM 未使用)",
-                    "template_mode": "rule-based",
-                    "new_tokens": None,
-                    "tokens_per_second": None,
-                    "assist": "rule",
-                    "draft": draft["text"],
-                    "draft_confidence": draft.get("confidence"),
-                    "draft_seconds": draft.get("draft_seconds"),
-                    "intent": draft.get("intent"),
-                    "fixes": draft.get("fixes", []),
-                }
-                yield _sse({
-                    "type": "assist", "mode": "rule", "confidence": draft.get("confidence"),
-                })
-                yield _sse({"type": "start", "engine": stats["engine"], "template_mode": "rule-based"})
-                for piece in _chunk_for_stream(draft["text"]):
-                    yield _sse({"type": "delta", "text": piece})
-                yield _sse({"type": "done", "text": draft["text"], "stats": stats})
-                return
-            except Exception:  # noqa: BLE001 — 補正経路が壊れても LFM 直接応答へ
-                pass
-
-        # ---- LFM 直接応答（hybrid=False または補正経路の失敗時） ----
         try:
-            for ev in eng.stream_chat(
+            for ev in c.stream_reply(
                 msgs,
+                mode=mode,
                 max_new_tokens=req.max_new_tokens,
                 temperature=req.temperature,
                 top_k=req.top_k,
@@ -483,7 +417,7 @@ def api_chat(req: ChatRequest):
             ):
                 yield _sse(ev)
         except Exception as exc:  # noqa: BLE001
-            yield _sse({"type": "error", "message": str(exc)})
+            yield _sse({"type": "error", "message": f"内部エラー: {exc}"})
 
     return StreamingResponse(
         gen(),
@@ -498,15 +432,20 @@ class VocabCheckRequest(BaseModel):
 
 @app.post("/api/vocab/check")
 def api_vocab_check(req: VocabCheckRequest):
-    """テキスト中の未知文字をスキャンする。"""
-    eng = lfm_engine()
-    if eng is None or not eng.is_ready:
+    """テキスト中の未知文字をスキャンする（GGUF バックエンドは byte-fallback で常に 0）。"""
+    c = core()
+    backend = c.active_backend()
+    if backend is None:
         return {"ok": False, "error": "ニューラルエンジンが利用できません"}
-    scan = eng.scan_unknown(req.text)
-    learned = {c["char"] for c in eng.status()["learned_chars"]}
-    for c in scan.get("unknown", []):
-        if c["char"] in learned:
-            c["token_id"] = 1
+    scan = backend.scan_unknown(req.text)
+    if scan is None:
+        return {"ok": False, "error": "ニューラルエンジンが利用できません"}
+    if getattr(backend, "kind", "") != "gguf":
+        learned = {ch["char"] for ch in backend.status()["learned_chars"]}
+        for ch in scan.get("unknown", []):
+            if ch["char"] in learned:
+                ch["token_id"] = 1
+                ch["learned"] = True
     return {"ok": True, **scan}
 
 
@@ -523,7 +462,15 @@ _learn_job: dict = {"phase": "idle", "detail": None, "result": None, "error": No
 
 @app.post("/api/learn")
 def api_learn(req: LearnRequest):
-    """未知文字を学習する。mode=deep は非同期ジョブ。"""
+    """未知文字を学習する（LFM2.5 の学習済み埋め込みを適用）。mode=deep は非同期ジョブ。
+
+    予約トークン方式の学習は torch バックエンド専用。GGUF バックエンドは
+    byte-fallback トークナイザなので未知文字は発生せず、学習は不要。
+    """
+    if core().backend_kind == "gguf" and core().neural_available():
+        return {"ok": False,
+                "error": "GGUF バックエンドでは未知文字は発生しません（byte-fallback のため学習不要）。"
+                         "埋め込み学習を使う場合は SNIPHER_LFM_BACKEND=torch で起動してください。"}
     eng = lfm_engine()
     if eng is None or not eng.is_ready:
         return {"ok": False, "error": "ニューラルエンジンが利用できません（モデル未ロード）"}
@@ -590,26 +537,29 @@ from fastapi import File, Form, UploadFile  # noqa: E402
 from snipher.lfm.config import REPO_ROOT  # noqa: E402
 
 UPLOAD_DIR = Path(os.environ.get("SNIPHER_LFM_UPLOAD_DIR", str(REPO_ROOT / "var" / "models" / "upload")))
-_ALLOWED_EXTS = {".json", ".safetensors", ".jinja", ".txt", ".model", ".bin"}
+_ALLOWED_EXTS = {".json", ".safetensors", ".jinja", ".txt", ".model", ".bin", ".gguf"}
 _REQUIRED = ["config.json", "*token*", "*.safetensors"]
 
 
 def _model_dir_status(d: Path) -> dict:
     files = []
+    gguf = None
     if d.exists():
         for p in sorted(d.iterdir()):
             if p.is_file():
                 files.append({"name": p.name, "size": p.stat().st_size})
+                if p.suffix.lower() == ".gguf" and p.stat().st_size > 10 * 1024 * 1024:
+                    gguf = str(p)
     has_config = any(f["name"] == "config.json" for f in files)
     has_tokenizer = any(("token" in f["name"].lower()) for f in files)
     has_weights = any(f["name"].endswith(".safetensors") for f in files)
-    complete = has_config and has_tokenizer and has_weights
-    missing = [r for r, ok in (
+    complete = bool(gguf) or (has_config and has_tokenizer and has_weights)
+    missing = [] if gguf else [r for r, ok in (
         ("config.json", has_config),
         ("tokenizer (tokenizer.json / tokenizer_config.json)", has_tokenizer),
-        ("*.safetensors", has_weights),
+        ("*.safetensors (または *.gguf)", has_weights),
     ) if not ok]
-    return {"dir": str(d), "files": files, "complete": complete, "missing": missing}
+    return {"dir": str(d), "files": files, "complete": complete, "missing": missing, "gguf": gguf}
 
 
 @app.get("/api/model/import")
@@ -622,10 +572,11 @@ def api_model_import():
         "engine_state": eng.state if eng else None,
         "engine_error": eng.error if eng else None,
         "hint": (
-            "HuggingFace に直接接続できない環境では、ローカル PC で "
-            "LiquidAI/LFM2.5-1.2B-JP-202606 をダウンロードし、"
-            "config.json / tokenizer.json / tokenizer_config.json / model.safetensors "
-            "をここにアップロードしてください。"
+            "モデルは起動時に全自動取得されます（操作不要）。この手動取り込みは、"
+            "ネットワークが完全に遮断された環境向けの最後の手段です。"
+            "LiquidAI/LFM2.5-1.2B-JP-202606 の config.json / tokenizer.json / "
+            "tokenizer_config.json / model.safetensors（または GGUF 1 ファイル）を"
+            "ドロップしてください。"
         ),
     }
 
@@ -668,18 +619,19 @@ class ModelLoadRequest(BaseModel):
 
 @app.post("/api/model/load")
 def api_model_load(req: ModelLoadRequest):
-    """アップロード済み（または指定のローカル）モデルでエンジンを再ロードする。"""
-    eng = lfm_engine()
-    if eng is None:
-        return {"ok": False, "error": "torch/transformers 未インストール"}
+    """アップロード済み（または指定のローカル）モデルで Snipher Core を再ロードする。
+
+    通常これを使う必要はない（起動時の自動取得が本体）。これはネットワークが
+    完全に遮断された環境向けの最後の手段。
+    """
     source = req.source
     if not source:
         st = _model_dir_status(UPLOAD_DIR)
         if not st["complete"]:
             return {"ok": False, "error": f"アップロードが不完全です。不足: {', '.join(st['missing'])}"}
-        source = str(UPLOAD_DIR)
+        source = st.get("gguf") or str(UPLOAD_DIR)
     p = Path(source)
-    if not p.is_dir():
-        return {"ok": False, "error": f"ローカルディレクトリが見つかりません: {source}"}
-    eng.reload(str(p))
+    if not (p.is_dir() or (p.is_file() and p.suffix.lower() == ".gguf")):
+        return {"ok": False, "error": f"ローカルのモデルが見つかりません: {source}"}
+    core().reload(str(p))
     return {"ok": True, "source": str(p), "state": "loading"}
