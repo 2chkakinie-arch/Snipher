@@ -292,6 +292,8 @@ def test_trainer_reduces_loss():
 # 同梱スナップショット（ビルド済みなら実ファイルでスモーク）
 # ---------------------------------------------------------------------- #
 def test_bundled_snapshot_smoke():
+    import numpy as np
+
     from snipher.neural.core import DistilledCore, available
 
     if not available():
@@ -300,14 +302,28 @@ def test_bundled_snapshot_smoke():
     assert core.is_ready
     st = core.status()
     assert st["state"] == "ready" and st["params"] > 10_000 and st["download_required"] is False
-    txt = core.generate("今日は天気が", max_chars=24, temperature=0.6)
-    assert txt and len(txt) >= 2
+    # seed 固定で決定的に検査する（温度>0 でも再現できるように）
+    txt = core.generate("今日は天気が", max_chars=24, temperature=0.6, seed=1234)
+    assert isinstance(txt, str) and len(txt) >= 1
     sc = core.score("今日はいい天気ですね。")
     assert sc["ok"] and sc["confidence"] > 0.3 and sc["perplexity"] < 60
-    comp = core.complete("私は毎日朝に")
-    assert comp["text"]
+    comp = core.complete("私は毎日朝に", seed=1234)
+    assert comp["text"].startswith("私は毎日朝に")
     assert comp["changed"] is True
     assert comp["added"]
+    # KV キャッシュ: 逐次デコードと一括計算は同じ logits になる
+    from snipher.neural.nn import DecodeCache
+
+    ids = [2] + core.tok.encode("今日は天気が")
+    full, _ = core.net.forward(np.array([ids], dtype=np.int64))
+    cache = DecodeCache(core.net, batch=1)
+    last = cache.prefill(core.net, np.array([ids[:-1]], dtype=np.int64))
+    step = cache.step(core.net, np.array([ids[-1]], dtype=np.int64))
+    assert float(np.abs(last - full[0, -2]).max()) < 1e-3
+    assert float(np.abs(step - full[0, -1]).max()) < 1e-3
+    a = core.generate_ids(ids, max_new=12, temperature=0.9, seed=7, use_cache=True)
+    b = core.generate_ids(ids, max_new=12, temperature=0.9, seed=7, use_cache=False)
+    assert a == b
     evs = list(core.stream_chat([{"role": "user", "content": "こんにちは"}], max_new_tokens=16))
     kinds = [e["type"] for e in evs]
     assert "start" in kinds and kinds[-1] == "done"

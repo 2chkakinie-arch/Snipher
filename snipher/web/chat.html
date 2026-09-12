@@ -472,14 +472,29 @@ async function send() {
             (st.new_tokens ? ` · ${st.new_tokens} tok` : "");
           const meta = document.createElement("div"); meta.className = "meta";
           const bits = [];
+          const PLAN_JA = {
+            "opaque_input": "読めない入力", "unknown_topic": "材料なし", "statement": "報告・感想",
+            "self": "自分について", "greeting": "挨拶", "safety": "安全応答",
+            "thanks": "感謝", "apology": "謝罪", "praise": "褒め", "farewell": "別れ",
+          };
+          const planName = (p) => {
+            if (!p) return "";
+            const base = String(p).split(":").pop();
+            if (String(p).startsWith("knowledge")) return "知識ベース";
+            return PLAN_JA[base] || base;
+          };
           if (st.route === "neural" || st.assist === "lfm") bits.push("✨ LFM2.5 生成");
-          if (st.route === "light") bits.push(st.neural_used ? "✨ 内蔵ニューラルコア生成" : "📚 知識ベース＋高速コア");
+          if (st.route === "light") bits.push(st.neural_used ? "✨ 内蔵ニューラルコア" : "🧩 composer＋知識ベース");
           if (st.knowledge && st.knowledge.topic) bits.push(`📚 ${st.knowledge.topic}`);
+          if (st.plan) bits.push(`計画: ${planName(st.plan)}`);
+          if (st.confidence != null) bits.push(`確度 ${(st.confidence * 100).toFixed(0)}%`);
           if (st.neural_confidence != null) bits.push(`内部確度 ${(st.neural_confidence * 100).toFixed(0)}%`);
-          if (st.route === "instant") bits.push("⚡ 高速コア即答");
-          if (st.route === "fallback") bits.push("⚡ 高速コア（ニューラル準備中）");
+          const lmConf = (st.lm && st.lm.confidence != null) ? st.lm.confidence : st.lm_confidence;
+          if (lmConf != null) bits.push(`自然さ ${(lmConf * 100).toFixed(0)}%`);
+          if (st.route === "instant") bits.push("⚡ 即答（ニューラル 0 トークン）");
+          if (st.route === "fallback") bits.push("⚡ composer（ニューラル準備中）");
           if (st.escalation) bits.push("⇧ フルウェイト起動を準備中");
-          if (st.fixes && st.fixes.length) bits.push(`助動詞補正 ${st.fixes.length}件`);
+          if (st.fixes && st.fixes.length) bits.push(`整形 ${st.fixes.length}件`);
           if (st.tokens_per_second) bits.push(`${st.tokens_per_second} tok/s`);
           if (st.intent) bits.push(`intent: ${st.intent}`);
           meta.textContent = bits.join(" · ") || " ";

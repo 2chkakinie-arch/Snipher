@@ -22,18 +22,29 @@ sys.path.insert(0, str(ROOT))
 OUT_DEFAULT = ROOT / "snipher" / "data" / "neural" / "core.npz"
 
 PROFILES = {
+    # tiny  … CI/スモーク用（数十秒）
     "tiny": {"d_model": 48, "n_layers": 2, "n_heads": 4, "conv_kernel": 3, "epochs": 2,
-             "batch": 32, "seq_len": 32, "docs": 1200, "max_vocab": 260},
+             "batch": 32, "seq_len": 32, "docs": 1200, "max_vocab": 260,
+             "authored_repeat": 2, "kb_repeat": 1},
+    # base  … 軽いスナップショット（約 1M パラメータ）
     "base": {"d_model": 192, "n_layers": 6, "n_heads": 6, "conv_kernel": 4, "epochs": 8,
-             "batch": 96, "seq_len": 64, "docs": 14000, "max_vocab": 720},
-    "big": {"d_model": 256, "n_layers": 8, "n_heads": 8, "conv_kernel": 4, "epochs": 12,
-            "batch": 128, "seq_len": 80, "docs": 26000, "max_vocab": 900},
+             "batch": 96, "seq_len": 64, "docs": 14000, "max_vocab": 720,
+             "authored_repeat": 4, "kb_repeat": 2},
+    # big   … 中間（約 2.9M パラメータ）
+    "big": {"d_model": 256, "n_layers": 8, "n_heads": 8, "conv_kernel": 4, "epochs": 8,
+            "batch": 64, "seq_len": 80, "docs": 22000, "max_vocab": 900,
+            "authored_repeat": 6, "kb_repeat": 3},
+    # huge  … 本番スナップショット（約 5.6M パラメータ / int8 で約 5MB）
+    #         LFM2.5-1.2B-JP の 1/214 の重さで、1 文字 2ms（KV キャッシュ使用）
+    "huge": {"d_model": 384, "n_layers": 10, "n_heads": 8, "conv_kernel": 4, "epochs": 6,
+             "batch": 48, "seq_len": 88, "docs": 14000, "max_vocab": 1150,
+             "authored_repeat": 8, "kb_repeat": 3},
 }
 
 
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description="Snipher 内蔵ニューラルコアの蒸留ビルド")
-    ap.add_argument("--profile", default="base", choices=sorted(PROFILES))
+    ap.add_argument("--profile", default="huge", choices=sorted(PROFILES))
     ap.add_argument("--out", default=str(OUT_DEFAULT))
     ap.add_argument("--epochs", type=int, default=None)
     ap.add_argument("--batch", type=int, default=None)
@@ -64,9 +75,16 @@ def main(argv: list[str] | None = None) -> int:
     t0 = time.time()
     lex = Lexicon()
     builder = CorpusBuilder(lex, seed=args.seed)
-    docs = builder.build(prof["docs"]) + builder.kb_docs()
-    docs = [d for d in docs if d.strip()]
-    print(f"corpus: {len(docs)} docs / {sum(len(d) for d in docs)} chars "
+
+    # ---- 教師データの内訳（質の高い順に重みを付ける） ---------------------- #
+    authored = builder.authored_docs(repeat=1)          # 人が書いた対話（最良）
+    kb_docs = builder.kb_docs()                         # 知識ベース（事実・Q&A・手順）
+    grammar = builder.build(prof["docs"])               # 文法生成（文型の網羅）
+    ar, kr = int(prof.get("authored_repeat", 4)), int(prof.get("kb_repeat", 2))
+    docs = authored * ar + kb_docs * kr + grammar
+    docs = [d for d in docs if d and d.strip()]
+    print(f"corpus: authored {len(authored)}x{ar} + kb {len(kb_docs)}x{kr} + "
+          f"grammar {len(grammar)} = {len(docs)} docs / {sum(len(d) for d in docs)} chars "
           f"({time.time() - t0:.1f}s)")
 
     tok = CharTokenizer.from_text("\n".join(docs), max_vocab=prof["max_vocab"])
@@ -83,7 +101,7 @@ def main(argv: list[str] | None = None) -> int:
     rng = np.random.default_rng(args.seed)
     order = list(range(len(docs)))
     rng.shuffle(order)
-    split = max(1, int(len(order) * 0.98))
+    split = max(1, int(len(order) * 0.96))
     train_ids, val_ids = [], []
 
     def stream(idx_list, sink):
@@ -94,9 +112,10 @@ def main(argv: list[str] | None = None) -> int:
 
     stream(order[:split], train_ids)
     stream(order[split:], val_ids)
-    if len(val_ids) < 512:              # 検証データが薄すぎたら訓練末尾を分捕る
-        val_ids = train_ids[-4096:]
-        train_ids = train_ids[:-4096]
+    if len(val_ids) < 4096:             # 検証データが薄すぎたら訓練末尾を分捕る
+        take = min(4096, max(512, len(train_ids) // 20))
+        val_ids = train_ids[-take:]
+        train_ids = train_ids[:-take]
     tr = TextDataset(np.array(train_ids, dtype=np.int64), prof["seq_len"], rng)
     va = TextDataset(np.array(val_ids, dtype=np.int64), prof["seq_len"], np.random.default_rng(1))
     print(f"tokens: train={len(train_ids):,} val={len(val_ids):,}")
@@ -116,7 +135,18 @@ def main(argv: list[str] | None = None) -> int:
         elif m["step"] % max(1, prof.get("log_every", 200)) == 0:
             print(f"    step {m['step']:>5} loss={m['loss']:.3f} lr={m['lr']:.2e} ({m['sec']:.0f}s)", flush=True)
 
-    res = trainer.train(on_log=log)
+    # 各 epoch の終わりにスナップショットを書く（途中で止めても重みは使える）
+    def snapshot(_net, m):
+        info = save(args.out, _net, tok.vocab, extra={
+            "trained_at": round(time.time(), 1), "profile": args.profile,
+            "params": _net.n_params(), "docs": len(docs), "partial": True,
+            "epoch": m.get("epoch"), "metrics": {"best_val": m}, "kv_cache": True,
+            "corpus_seed": args.seed,
+        })
+        print(f"  snapshot → {info['path']} ({info['bytes'] / 1024:.0f} KiB) "
+              f"epoch {m.get('epoch')} val_ppl={m.get('ppl')}", flush=True)
+
+    res = trainer.train(on_log=log, on_epoch=snapshot)
 
     # ---- 生成サンプル --------------------------------------------------- #
     from snipher.neural.core import DistilledCore
@@ -135,6 +165,9 @@ def main(argv: list[str] | None = None) -> int:
         "profile": args.profile,
         "params": net.n_params(),
         "docs": len(docs),
+        "corpus_mix": {"authored": len(authored) * ar, "kb": len(kb_docs) * kr,
+                       "grammar": len(grammar)},
+        "kv_cache": True,
         "train_tokens": len(train_ids),
         "metrics": res,
         "samples": samples,

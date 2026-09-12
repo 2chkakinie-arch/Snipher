@@ -135,4 +135,14 @@ def test_info():
         assert bd["neural_core_weights"] >= 300_000
         assert info["total_parameters"] >= bd["neural_core_weights"]
     else:
-        assert info["total_parameters"] < 40_000   # 未ビルド環境でも破綻しない
+        assert bd["neural_core_weights"] == 0     # 未ビルド環境でも破綻しない
+    # 巨大 n-gram LM はリポジトリ同梱（流暢さの審判）。エントリ数＝パラメータ数
+    lm = info["language_model"]
+    if lm["available"]:
+        assert bd["language_model_entries"] > 100_000
+        assert lm["order"] >= 4 and lm["vocab"] > 500
+        assert info["total_parameters"] >= bd["language_model_entries"]
+    else:
+        assert bd["language_model_entries"] == 0
+    # 高速コア（テーブル + 確率重み）は 4 万未満のまま = 10ms 応答の源泉
+    assert bd["lexicon_table_entries"] + bd["probability_weights"] < 40_000

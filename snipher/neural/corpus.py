@@ -294,6 +294,7 @@ class CorpusBuilder:
     def build(self, n: int = 12000, with_dialogue: bool = True) -> list[str]:
         """教師文書のリスト。内部に <user>/<asst> マーカーを含む文書もある。"""
         out: list[str] = list(SEED_SENTENCES)
+        out += self.authored_docs(repeat=2)
         for s in self.lex.corpus:
             if isinstance(s, dict) and s.get("src"):
                 out.append(str(s["src"]))
@@ -319,7 +320,7 @@ class CorpusBuilder:
         import json
         from pathlib import Path
 
-        docs: list[str] = []
+        docs: list[str] = list(self.authored_docs(repeat=3))
         # 対話テーブル
         try:
             tables = json.loads((Path(self.lex.data_dir) / "responses.json").read_text(encoding="utf-8"))
@@ -390,38 +391,79 @@ class CorpusBuilder:
         return docs[:n]
 
     # ------------------------------------------------------------------ #
-    def kb_docs(self, pairs_only: bool = False) -> list[str]:
-        """知識ベースを教師にも使う（事実文 + Q&A ペア）。"""
+    def authored_docs(self, repeat: int = 2) -> list[str]:
+        """人が書いた対話（data/dialogues.json）。文法生成には無い言い回しの錨。"""
         import json
         from pathlib import Path
 
-        path = Path(self.lex.data_dir) / "kb.json"
+        path = Path(self.lex.data_dir) / "dialogues.json"
         if not path.exists():
             return []
         try:
-            kb = json.loads(path.read_text(encoding="utf-8"))
+            data = json.loads(path.read_text(encoding="utf-8"))
         except Exception:
             return []
         docs: list[str] = []
-        for item in kb.get("items", []):
-            topic = str(item.get("topic", "")).strip()
-            facts = item.get("facts", [])
-            if not pairs_only:
-                for f in facts:
-                    if 6 <= len(str(f)) <= 60:
-                        docs.append(str(f))
-                for i, q in enumerate(item.get("questions", [])):
-                    a = (item.get("answers") or [None] * 99)[i]
-                    if a and 4 <= len(str(a)) <= 60:
-                        docs.append(f"<asst>{topic}のことですね。{a}")
-            qs = item.get("questions", [])
-            ans = item.get("answers", [])
-            for i, q in enumerate(qs):
-                a = ans[i] if i < len(ans) else (facts[0] if facts else None)
-                if not a:
+        for pair in data.get("dialogues", []):
+            u = str(pair.get("user", "")).strip()
+            a = str(pair.get("asst", "")).strip()
+            if not u or not a:
+                continue
+            docs.append(f"<user>{u}\n<asst>{a}")
+        return docs * max(1, int(repeat))
+
+    # ------------------------------------------------------------------ #
+    def kb_docs(self, pairs_only: bool = False) -> list[str]:
+        """知識ベース v2 を教師に使う（事実文 + 質問/答え + 手順 + 意見 + 雑談）。"""
+        from .. import knowledge
+
+        kb = knowledge.KnowledgeBase()
+        docs: list[str] = []
+
+        def _add(text: str) -> None:
+            t = str(text).strip()
+            if t and t not in docs:
+                docs.append(t)
+
+        if not pairs_only:
+            for s in kb.all_sentences():
+                if 6 <= len(s) <= 110:
+                    _add(s)
+        for it in kb.items:
+            topic = str(it.get("topic", "")).strip()
+            d = str(it.get("def", "")).strip()
+            op = str(it.get("opinion", "")).strip()
+            for pair in it.get("qa") or []:
+                if not isinstance(pair, (list, tuple)) or len(pair) < 2:
                     continue
-                q = str(q).rstrip("。").strip()
-                a = str(a).strip()
-                if 2 <= len(q) <= 30 and 4 <= len(a) <= 60:
-                    docs.append(f"<user>{q}\n<asst>{a}")
+                q, a = str(pair[0]).strip().rstrip("。?"), str(pair[1]).strip()
+                if 1 <= len(q) <= 40 and 4 <= len(a) <= 140:
+                    _add(f"<user>{q}\n<asst>{a}")
+            if d:
+                _add(f"<user>{topic}って何\n<asst>{d}")
+                _add(f"<user>{topic}とは\n<asst>{d}")
+            if op:
+                _add(f"<user>{topic}は好き\n<asst>{op}")
+                _add(f"<user>{topic}についてどう思う\n<asst>{op}")
+            for fld in ("when", "where", "who", "cost"):
+                v = str(it.get(fld, "")).strip()
+                if v:
+                    _add(f"<asst>{topic}なら、{v}")
+            for i, step in enumerate(it.get("how") or []):
+                s = str(step).strip()
+                if s:
+                    _add(f"<asst>{i + 1}番目は{s}")
+                    _add(f"<user>{topic}のやり方を教えて\n<asst>{s}")
+            for step in it.get("tips") or []:
+                s = str(step).strip()
+                if s:
+                    _add(f"<asst>コツは{s}")
+            for w in it.get("why") or []:
+                s = str(w).strip()
+                if s:
+                    _add(f"<user>なぜ{topic}\n<asst>{s}")
+            for f in it.get("followups") or []:
+                s = str(f).strip()
+                if s:
+                    _add(f"<asst>{s}")
         return docs

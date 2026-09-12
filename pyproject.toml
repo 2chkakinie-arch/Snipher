@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "snipher"
-version = "0.4.0"
+version = "2.0.0"
 description = "LFM2.5-1.2B-JP を内部構造として動かす高速日本語AIチャット（蒸留ニューラルコア同梱・サーバーレス即動作・全自動モデル取得・llama.cpp/torch 両対応・助動詞補正・BM25 知識ベース）"
 readme = "README.md"
 requires-python = ">=3.10"
