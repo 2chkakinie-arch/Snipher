@@ -993,6 +993,9 @@ class SnipherCore:
             stats["knowledge"] = info["knowledge"]
         if info["lm"]:
             stats["lm"] = info["lm"]
+        _srcs = _extract_sources(info.get("knowledge"), info.get("task"))
+        if _srcs:
+            stats["sources"] = _srcs
         if route == ROUTE_FALLBACK:
             stats["engine"] = fallback_engine
             stats["fallback_reason"] = self._fallback_reason()
@@ -1216,11 +1219,14 @@ class SnipherCore:
             "new_tokens": None,
             "tokens_per_second": None,
         }
+        _srcs = _extract_sources(info_kb, (reply.notes or {}).get("task"))
+        if _srcs:
+            stats["sources"] = _srcs
         if stats_extra:
             stats.update(stats_extra)
         if note:
             stats["note"] = note
-            stats["fallback_reason"] = "手元に確かな材料が無かったので、話題を受け取る応答にしました"
+            stats["fallback_reason"] = "言葉を整理して応答しました (追加の文脈があれば深掘りします)"
         if core is None:
             stats["fallback_reason"] = "内蔵ニューラルコアの重みが未ビルドです"
         gate_val = neural_conf if neural_conf is not None else conf
@@ -1468,10 +1474,65 @@ def _looks_incomplete(text: str) -> bool:
     return not t.endswith(_COMPLETE_ENDS)
 
 
+def _extract_sources(*dicts: dict | None) -> list[dict]:
+    """reply/task/knowledge から Web出典だけを抜く (UIの favicon 行用)。"""
+    out: list[dict] = []
+    seen: set[str] = set()
+    for d in dicts:
+        if not isinstance(d, dict):
+            continue
+        srcs = d.get("sources")
+        if isinstance(srcs, list):
+            for s in srcs:
+                if not isinstance(s, dict):
+                    continue
+                url = str(s.get("url") or "").strip()
+                if not url or url in seen or not url.startswith(("http://", "https://")):
+                    continue
+                seen.add(url)
+                out.append({"title": str(s.get("title") or url)[:80], "url": url})
+                if len(out) >= 6:
+                    return out
+        # task ラッパー (notes.task.metadata.sources) も掘る
+        meta = d.get("metadata") if isinstance(d.get("metadata"), dict) else None
+        if meta and isinstance(meta.get("sources"), list):
+            for s in meta["sources"]:
+                if not isinstance(s, dict):
+                    continue
+                url = str(s.get("url") or "").strip()
+                if not url or url in seen or not url.startswith(("http://", "https://")):
+                    continue
+                seen.add(url)
+                out.append({"title": str(s.get("title") or url)[:80], "url": url})
+                if len(out) >= 6:
+                    return out
+    return out
+
+
 def _chunk_for_stream(text: str, pieces: int = 3) -> list[str]:
-    """軽量経路のテキストを擬似ストリーミング用に文単位で分割する。"""
+    """軽量経路のテキストを擬似ストリーミング用に分割する。
+
+    通常文は文単位、コード・長文 (小説等) は行単位で刻む。
+    """
     import re as _re
 
+    text = str(text or "")
+    if not text:
+        return [text]
+    # コードブロック・長文は行単位で 600 字ずつ
+    if "```" in text or len(text) > 900:
+        lines = text.split("\n")
+        chunks: list[str] = []
+        buf = ""
+        for ln in lines:
+            if len(buf) + len(ln) + 1 > 600 and buf:
+                chunks.append(buf + "\n")
+                buf = ln
+            else:
+                buf = (buf + "\n" + ln) if buf else ln
+        if buf:
+            chunks.append(buf)
+        return chunks or [text]
     parts = [p for p in _re.split(r"(?<=。)|(?<=？)|(?<=！)", text) if p]
     if len(parts) <= pieces:
         return parts or [text]

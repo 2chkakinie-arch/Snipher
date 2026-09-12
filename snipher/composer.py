@@ -219,25 +219,27 @@ def detect_mood(text: str) -> str:
 # 枠（frame）の在庫
 # ---------------------------------------------------------------------- #
 # どの枠も「相手の発話から取った語」か「知識ベースの材料」を必ず 1 つ含む。
+# v3: 「できない」とは言わない。言葉を分解・整理しながら前に進む枠。
+# 事実の捏造はしないが、手がかりの提示 + 具体化の問いかけで必ず前進する。
 UNKNOWN_FRAMES = (
-    "「{w}」について、確かだと言える情報を私は持っていません。{ask}",
-    "「{w}」は私の知識ベースに無い言葉です。{ask}",
-    "{w}のことですね。手元に確かな材料が無いので、断定は避けます。{ask}",
-    "「{w}」には答えを出せませんでした。{ask}",
-    "{w}について、根拠のあることが一つも言えません。{ask}",
-    "「{w}」は聞いたことがありますが、確かだと断言できる材料がありません。{ask}",
+    "「{w}」ですね。まず言葉を分解して整理します。{ask}",
+    "「{w}」を受け取りました。分かる範囲から組み立てます。{ask}",
+    "{w}のことですね。一緒に掘り下げましょう。{ask}",
+    "「{w}」について、手がかりから探します。{ask}",
+    "{w}ですね。背景を少しずつ確かめます。{ask}",
+    "「{w}」、面白い言葉ですね。整理しながら進めます。{ask}",
 )
 UNKNOWN_GENERIC_FRAMES = (
-    "その話について、確かだと言える材料が手元にありません。{ask}",
-    "手元に確かな材料が無いので、断定は避けます。{ask}",
-    "今の言葉だけでは、確かなことを言えません。{ask}",
+    "その話ですね。まず要点を整理します。{ask}",
+    "受け取りました。一緒に掘り下げましょう。{ask}",
+    "その言葉から、手がかりを探します。{ask}",
 )
 UNKNOWN_ASKS = (
-    "それが何なのか、一言で教えてもらえますか。",
-    "どの部分を知りたいのか教えてください。",
-    "どんな文脈で出てきた言葉ですか。",
+    "それが何なのか、一言で教えてもらえますか。そこから広げます。",
+    "どの部分を知りたいのか教えてください。そこに絞って答えます。",
+    "どんな文脈で出てきた言葉ですか。前後が分かると特定できます。",
     "もう少し文で書いてもらえれば、そこから一緒に整理します。",
-    "何を知りたいのかを、具体的に書いてもらえますか。",
+    "何を知りたいのか、具体的に書いてもらえますか。",
 )
 UNKNOWN_ASKS_NEG = (
     "いま一番困っていることを、一言で書いてもらえますか。",
@@ -305,9 +307,9 @@ SELF_ASKS = (
 )
 
 CANNOT_FRAMES = (
-    "そこは私には分かりません。{ask}",
-    "確かな材料が無いので、答えられません。{ask}",
-    "その情報は持っていません。{ask}",
+    "そこは一緒に整理しましょう。{ask}",
+    "手がかりから探します。{ask}",
+    "分かる範囲から組み立てます。{ask}",
 )
 
 THANKS_FRAMES = (
@@ -659,9 +661,43 @@ class Composer:
                      sentences=_split(text),
                      notes={"ack": bool(ack), "followup": bool(follow), "why": why})
 
+    def _word_hint(self, w: str) -> str:
+        """未知語の中に既知の話題が含まれていれば、手がかりの一文を返す。"""
+        if not w or len(w) < 2:
+            return ""
+        try:
+            topics: list[str] = []
+            for cand in sorted({w[i:j] for i in range(len(w)) for j in range(i + 1, len(w) + 1)
+                                if j - i >= 1}, key=len, reverse=True):
+                if cand in ("こと", "もの", "について", "って", "とは"):
+                    continue
+                ids = self.kb.index.topics_of(cand) if self.kb is not None else set()
+                if ids:
+                    for i in sorted(ids)[:1]:
+                        t = str(self.kb.items[i].get("topic") or "")
+                        if t and t not in topics and t != w:
+                            topics.append(t)
+                if len(topics) >= 2:
+                    break
+            if topics:
+                joined = "・".join(topics[:2])
+                return f"「{w}」の中の{joined}の部分は、手元の知識とつながりそうです。"
+        except Exception:
+            pass
+        # カタカナ語は外来・固有名の可能性を示す
+        try:
+            import re as _re
+
+            if _re.search(r"[ァ-ヶー]{2,}", w):
+                return f"「{w}」はカタカナを含む言葉で、固有名や外来の可能性があります。"
+        except Exception:
+            pass
+        return ""
+
     def _plan_unknown(self, u: Utterance, prev: list[str]) -> Reply | None:
         asks = UNKNOWN_ASKS_NEG if u.mood == "negative" else UNKNOWN_ASKS
         w = u.echo or u.subject()
+        hint = self._word_hint(w) if w else ""
         if not w:
             # 主語にできる語が無い（「どうしたらいい」等）→ 語を埋め込まずに正直に言う
             for i in range(len(UNKNOWN_GENERIC_FRAMES)):
@@ -672,12 +708,12 @@ class Composer:
                     return Reply(text=text, plan="unknown_topic", confidence=0.28,
                                  sentences=_split(text), frame=frame, notes={})
             w = "そのこと"
-        # 知識ベースに「近い話題」があれば、無いと言うだけでなく名指しで提案する
+        # 知識ベースに「近い話題」があれば、名指しで提案する
         sug = self._suggest_topic(u.text, w)
         if sug:
             ask = _rotate(asks, self.turn)
-            text = self._polish(f"「{w}」の確かな材料は手元にありませんが、"
-                                f"{sug}については話せます。{ask}")
+            mid = f"{hint}" if hint else f"{sug}については詳しく話せます。"
+            text = self._polish(f"「{w}」ですね。{mid}{ask}")
             ok, _why = validate(text, max_len=200)
             if ok and text not in prev:
                 return Reply(text=text, plan="unknown_topic", confidence=0.36,
@@ -686,14 +722,18 @@ class Composer:
         for i in range(len(UNKNOWN_FRAMES)):
             frame = _rotate(UNKNOWN_FRAMES, self.turn + i)
             ask = _rotate(asks, self.turn + i * 2)
-            text = self._polish(frame.format(w=w, ask=ask))
+            base = frame.format(w=w, ask=ask)
+            # ヒントがあれば一文だけ足す (長くなりすぎたら枠だけにする)
+            if hint and len(base) + len(hint) < 150:
+                base = base.replace("。", f"。{hint}", 1)
+            text = self._polish(base)
             ok, _why = validate(text)
             if ok and text not in prev:
                 return Reply(text=text, plan="unknown_topic", confidence=0.30,
                              sentences=_split(text), frame=frame,
-                             notes={"echo": w})
-        # どれも通らなければ最短の正直な応答に落ちる
-        return Reply(text=f"「{w}」について、私には確かな情報がありません。"
+                             notes={"echo": w, "hint": bool(hint)})
+        # どれも通らなければ最短の前向きな応答に落ちる
+        return Reply(text=f"「{w}」ですね。一緒に整理しましょう。"
                           "何を知りたいのか教えてください。",
                      plan="unknown_topic", confidence=0.25, notes={"echo": w})
 
@@ -732,6 +772,13 @@ class Composer:
 
     def _plan_statement(self, u: Utterance, prev: list[str]) -> Reply | None:
         w = u.echo or u.subject()
+        # KBに無い語への報告・感想は、手がかりの一文を添えて前に進める
+        hint = ""
+        if w and not u.kb_words:
+            try:
+                hint = self._word_hint(w)
+            except Exception:
+                hint = ""
         if u.pred and not u.echo:
             return self._plan_predicate(u, prev) or self._plan_opaque(u, prev)
         generic = not w
@@ -751,11 +798,14 @@ class Composer:
         for i in range(len(frames)):
             frame = _rotate(frames, self.turn + i)
             ask = _rotate(STATEMENT_ASKS, self.turn + i * 3)
-            text = self._polish(_join([s for s in (ack, frame.format(w=w, ask=ask)) if s]))
+            base = frame.format(w=w, ask=ask)
+            if hint and not generic and len(base) + len(hint) < 150:
+                base = base.replace("。", f"。{hint}", 1)
+            text = self._polish(_join([s for s in (ack, base) if s]))
             ok, _why = validate(text)
             if ok and text not in prev:
                 return Reply(text=text, plan="statement", confidence=0.34,
-                             sentences=_split(text), frame=frame, notes={"echo": w})
+                             sentences=_split(text), frame=frame, notes={"echo": w, "hint": bool(hint)})
         return None
 
     def _plan_predicate(self, u: Utterance, prev: list[str]) -> Reply | None:

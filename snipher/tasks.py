@@ -336,8 +336,18 @@ def convert_unit(text: str) -> TaskAnswer | None:
 _CODE_MARKS = ("コード", "プログラム", "実装", "スクリプト", "書いて", "書き方", "関数", "バグ", "デバッグ", "コード例")
 
 def _is_code_request(text: str) -> bool:
+    """コード依頼か。旧判定 + 万能判定の OR (後方互換を保つ)。"""
     t = _norm(text).lower()
-    return any(m in t for m in _CODE_MARKS) and bool(re.search(r"python|javascript|typescript|java|go|rust|node|next|コード|プログラム|関数", t))
+    legacy = any(m in t for m in _CODE_MARKS) and bool(
+        re.search(r"python|javascript|typescript|java|go|rust|node|next|コード|プログラム|関数", t))
+    if legacy:
+        return True
+    try:
+        from .codegen import is_code_request as _gen_is_code
+
+        return bool(_gen_is_code(text))
+    except Exception:
+        return False
 
 
 def coding_answer(text: str) -> TaskAnswer | None:
@@ -348,6 +358,16 @@ def coding_answer(text: str) -> TaskAnswer | None:
         # 比較質問はコード依頼より先に、実行環境とフレームワークを分けて説明する。
         if "next" in t and any(w in t for w in ("どちら", "おすすめ", "違い", "比較", "か")):
             return comparison_answer(text)
+    # 万能シンセサイザーが全言語・全課題を 0 から組み立てる (オセロ/HTML含む)
+    try:
+        from .codegen import generate as _gen_code
+
+        display, _lang, meta = _gen_code(text)
+        generic = bool(meta.get("task") == "generic")
+        conf = 0.86 if generic else 0.985
+        return TaskAnswer(display, f"code:{meta.get('language', _lang)}", conf, "code", meta)
+    except Exception:
+        pass
     lang = "python" if "python" in t or "パイソン" in t else "javascript" if any(x in t for x in ("javascript", "js", "node")) else "python"
     if "fizzbuzz" in t or "fizz buzz" in t or "フィズ" in t:
         if lang == "python":
@@ -415,11 +435,105 @@ def _source_text(result: ResearchResult) -> str:
     return "検索で確認した情報です。\n" + "\n".join(lines) + "\n\n出典:\n" + citations
 
 
-class TaskRouter:
-    """計算・コード・比較・ウェブの入口。"""
+# ---------------------------------------------------------------------------
+# 創作・定義Web の判定ヘルパー
+# ---------------------------------------------------------------------------
 
-    def __init__(self, research: ResearchEngine | None = None):
+def _is_creative(text: str) -> bool:
+    try:
+        from .writer import is_creative_request
+
+        return bool(is_creative_request(text))
+    except Exception:
+        return False
+
+
+def _needs_definition_web(text: str, kb=None) -> bool:
+    """KBに無い定義要求は、自動でWebに編みに行く (テストの低速化を避けるため定義型のみ)。
+
+    例: 「ミームとは」「67ミームとは」「量子もつれとは」
+    対象外: 数字だけ・ASCIIゴミ・一文字・挨拶・創作・コード
+    """
+    raw = str(text or "").strip()
+    if len(raw) < 3 or len(raw) > 120:
+        return False
+    if _is_code_request(text) or _is_creative(text):
+        return False
+    try:
+        from .knowledge import question_type
+
+        if question_type(raw) != "def":
+            return False
+    except Exception:
+        if "とは" not in raw and "って何" not in raw and "意味" not in raw:
+            return False
+    # 社会的発話は除外
+    if any(w in raw for w in ("こんにちは", "こんばんは", "おはよう", "ありがとう", "さようなら", "おやすみ")):
+        return False
+    # KBに材料があればWebは不要
+    try:
+        kb_obj = kb
+        if kb_obj is None:
+            from .knowledge import KnowledgeBase
+
+            kb_obj = KnowledgeBase.shared()
+        if kb_obj is not None and kb_obj.answer(raw) is not None:
+            return False
+    except Exception:
+        pass
+    # 定義の核が短すぎる/数字だけなら対象外
+    topic = re.sub(r"(とは|って何|とは何|何ですか|なんですか|について|に関して|を教えて|教えて|はどう|どう|？|\?|！|!|。)+$", "", raw).strip()
+    topic = topic.strip("「」『』、。 ")
+    if len(topic) < 2:
+        return False
+    if re.fullmatch(r"[0-9０-９\s.,．，]+", topic):
+        return False
+    # 支離滅裂な入力は検索エンジンに投げない (フォールバック/上位モデルに譲る)
+    if any(w in raw for w in ("意味不明", "めちゃくちゃ", "でたらめ", "あああ")):
+        return False
+    # 主題の妥当性: 短い主題 (未知語の典型) はそのままWebへ。
+    # 長い主題は、KBの既知語を含む＝調べがいのある具体的な話題のときだけWebへ。
+    if len(topic) > 10 and not _topic_has_known_word(topic, kb_obj):
+        return False
+    return True
+
+
+def _topic_has_known_word(topic: str, kb_obj) -> bool:
+    """主題の中にKBの既知語 (具体的な話題の断片) が含まれるか。"""
+    try:
+        from .knowledge import GENERIC_ALIASES
+    except Exception:
+        GENERIC_ALIASES = ()
+    try:
+        index = getattr(kb_obj, "index", None)
+        aliases = getattr(index, "aliases", None) or {}
+        generic = set(GENERIC_ALIASES or ())
+        for alias in aliases:
+            a = str(alias)
+            if len(a) >= 2 and a not in generic and a in topic:
+                return True
+    except Exception:
+        pass
+    return False
+
+
+class TaskRouter:
+    """計算・コード・創作・比較・ウェブの入口。"""
+
+    def __init__(self, research: ResearchEngine | None = None, kb=None):
         self.research = research or ResearchEngine()
+        self._kb = kb
+
+    @property
+    def kb(self):
+        if self._kb is None:
+            try:
+                from .knowledge import KnowledgeBase
+
+                self._kb = KnowledgeBase.shared()
+            except Exception:
+                self._kb = False
+        return self._kb if self._kb is not False else None
 
     def classify(self, text: str, *, web: bool | None = None) -> str | None:
         t = _norm(text).lower()
@@ -442,10 +556,18 @@ class TaskRouter:
             return "equation"
         if solve_arithmetic_task(text) is not None:
             return "arithmetic"
+        # 創作はコードより先 (「小説を書いて」をコードに誤認しない)
+        if _is_creative(text):
+            # 言語の明示がある本物のコード依頼は code 優先
+            if not _is_code_request(text) or not re.search(r"python|javascript|typescript|java|go|rust|html|css|node", _norm(text).lower()):
+                return "creative"
         if _is_code_request(text):
             return "code"
         needed, _ = self.research.should_research(text, web)
         if needed:
+            return "research"
+        # KBに無い定義は、明示指定が無くてもWebに編みに行く (一体型: ON/OFFなし)
+        if web is not False and _needs_definition_web(text, self.kb):
             return "research"
         return None
 
@@ -466,9 +588,38 @@ class TaskRouter:
             return coding_answer(text)
         if kind == "compare":
             return comparison_answer(text)
+        if kind == "creative":
+            try:
+                from .writer import write as _write_creative
+
+                seed = len(str(history or "")) % 997 if history else 0
+                body, genre, meta = _write_creative(text, seed=seed)
+                plan = {"novel": "creative:novel", "essay": "creative:essay", "poem": "creative:poem"}.get(genre, "creative:novel")
+                return TaskAnswer(body, plan, 0.92, "creative", meta)
+            except Exception:
+                return None
         if kind == "research":
-            result = self.research.research(text, explicit=web, limit=5, fetch_pages=2)
-            return TaskAnswer(_source_text(result), "research:web", 0.9 if result.sources else 0.55, "research", {
+            # 定義Webの場合は明示検索として扱い、確実に取りに行く
+            explicit = web if web is not None else (True if _needs_definition_web(text, self.kb) else None)
+            result = self.research.research(text, explicit=explicit, limit=5, fetch_pages=2)
+            if not result.sources:
+                # 材料ゼロでは authoritative を名乗らない → composer の生成に譲る
+                return None
+            try:
+                from .knowledge import question_type as _qtype
+                from .synthesize import synthesize as _synthesize
+
+                qtype = _qtype(text)
+                synth = _synthesize(text, result.sources, qtype)
+            except Exception:
+                synth = None
+            if synth is not None and synth.get("text"):
+                return TaskAnswer(synth["text"], "research:web", 0.88, "research", {
+                    "query": result.query, "reason": result.reason, "sources": result.sources,
+                    "cached": result.cached, "elapsed_ms": result.elapsed_ms,
+                    "synthesized": True, "topic": synth.get("topic"),
+                })
+            return TaskAnswer(_source_text(result), "research:web", 0.9, "research", {
                 "query": result.query, "reason": result.reason, "sources": result.sources,
                 "cached": result.cached, "elapsed_ms": result.elapsed_ms,
             })
