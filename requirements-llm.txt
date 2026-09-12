@@ -1,6 +1,13 @@
-# LFM2.5-1.2B-JP ニューラルチャットエンジン用の依存（オプション）。
+# LFM2.5-1.2B-JP ニューラルコア用の依存（オプション）。
 # インストールしなくても Snipher は超小型エンジンで動作します。
-#   pip install -r requirements.txt -r requirements-llm.txt
+#
+# 推奨（CPU 最速・軽量）: llama.cpp バックエンド
+#   pip install llama-cpp-python        # ビルドに cmake と C++ コンパイラが必要
+#   pip install -r requirements.txt -r requirements-llm.txt   # torch バックエンド
+#
+# 両方入れると llama.cpp(GGUF Q4_K_M ~731MB) が自動で優先され、
+# 未知文字の埋め込み学習を使うときだけ torch バックエンドに
+# SNIPHER_LFM_BACKEND=torch で切り替えられます。
 torch>=2.3
 transformers>=4.57
 tokenizers>=0.20

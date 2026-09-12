@@ -1,4 +1,19 @@
-"""LFM ニューラルエンジンの設定（環境変数で上書き可能）。"""
+"""LFM ニューラルコアの設定（環境変数で上書き可能）。
+
+Snipher の内部構造として LFM2.5-1.2B-JP を動かすための設定を集約する。
+
+バックエンド（自動選択が既定）:
+    - ``gguf`` : llama.cpp（llama-cpp-python または llama-server）+ 公式 GGUF。
+      CPU で最速。LFM2.5-1.2B-JP-202606-Q4_K_M.gguf (~731MB) を自動取得する。
+    - ``torch``: transformers + 動的 INT8 量子化。model.safetensors (~2.2GB) を
+      自動取得する。未知文字の埋め込み学習（予約トークン）はこのバックエンド
+      でのみ可能。
+    - ``off``  : ニューラルコアを無効化（超小型エンジンのみ）。
+
+モデルの取得は完全に自動（tools なし・アップロード不要）:
+    キャッシュ → SNIPHER_LFM_URLS → ギガワタス共有(公式の代替ミラー) →
+    HuggingFace 公式 → hf-mirror の順に試行し、レジューム付きで取得する。
+"""
 
 from __future__ import annotations
 
@@ -12,11 +27,23 @@ from pathlib import Path
 os.environ.setdefault("HF_HUB_ETAG_TIMEOUT", "5")
 os.environ.setdefault("HF_HUB_DOWNLOAD_TIMEOUT", "15")
 
-# Liquid AI の日本語チャットモデル（LFM2 アーキテクチャ / 1.17B / 32K context）
+# Liquid AI の日本語チャットモデル（LFM2.5 アーキテクチャ / 1.17B / 32K context）
 DEFAULT_MODEL_ID = "LiquidAI/LFM2.5-1.2B-JP-202606"
+# 公式 GGUF リポジトリ（llama.cpp 用・CPU 推論に最適化済み）
+DEFAULT_GGUF_REPO = "LiquidAI/LFM2.5-1.2B-JP-202606-GGUF"
+# 既定の量子化。Q4_K_M = 731MB で品質と速度のバランスが最も良い。
+DEFAULT_GGUF_QUANT = os.environ.get("SNIPHER_LFM_GGUF_QUANT", "Q4_K_M").strip() or "Q4_K_M"
+
+# ユーザー提供のモデル共有ミラー（model.safetensors 2.18GB）。
+# HuggingFace に直接繋がらない環境向けの重量ファイルの代替ソースとして、
+# 自動取得の試行リストに組み込まれている（期限切れの場合は自動でスキップ）。
+GIGA_WATASU_SHARE_URL = os.environ.get(
+    "SNIPHER_LFM_SHARE_PAGE", "https://giga-watasu.jp/d/aabdc5853ed6a0696ee4a965"
+).strip()
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_STORE_DIR = REPO_ROOT / "var" / "learned_vocab"
+DEFAULT_CACHE_DIR = REPO_ROOT / "var" / "models"
 
 DEFAULT_SYSTEM_PROMPT = (
     "あなたは親しみやすい日本語の会話パートナーです。"
@@ -50,22 +77,35 @@ def _env_float(name: str, default: float) -> float:
 class LfmConfig:
     """環境変数 SNIPHER_LFM_* で上書きできる設定。"""
 
-    # モデルソース: ローカルディレクトリ or HuggingFace モデルID
+    # モデルソース: ローカルディレクトリ / .gguf ファイル / HuggingFace モデルID。
+    # 未指定なら自動取得（acquire.py がキャッシュへダウンロードする）。
     model_source: str = field(
         default_factory=lambda: os.environ.get("SNIPHER_LFM_MODEL", "").strip()
         or DEFAULT_MODEL_ID
     )
-    # 初回起動時に自動ロードするか
+    # 明示的な GGUF パス（指定すると gguf バックエンドがそれをそのまま使う）
+    gguf_path: str = field(default_factory=lambda: os.environ.get("SNIPHER_LFM_GGUF", "").strip())
+    # バックエンド: auto | gguf | torch | off
+    backend: str = field(
+        default_factory=lambda: os.environ.get("SNIPHER_LFM_BACKEND", "auto").strip().lower() or "auto"
+    )
+    # llama-server バイナリの場所（llama-cpp-python が無い場合の代替）
+    llama_server_bin: str = field(
+        default_factory=lambda: os.environ.get("SNIPHER_LLAMA_SERVER", "").strip()
+    )
+    # 初回起動時に自動ロード（+ 必要なら自動ダウンロード）するか
     autostart: bool = field(default_factory=lambda: _env_bool("SNIPHER_LFM_AUTOSTART", True))
-    # 推論時の動的 INT8 量子化（CPU 高速化）
+    # 自動取得を有効にするか（off ならローカル/環境変数のモデルだけを使う）
+    auto_fetch: bool = field(default_factory=lambda: _env_bool("SNIPHER_LFM_AUTO_FETCH", True))
+    # 推論時の動的 INT8 量子化（torch バックエンドの CPU 高速化）
     quantize_int8: bool = field(default_factory=lambda: _env_bool("SNIPHER_LFM_QUANTIZE", True))
     # 未知文字学習用の予約トークン枠
     reserved_tokens: int = field(default_factory=lambda: _env_int("SNIPHER_LFM_RESERVED", 256))
     # プロンプト予算（トークン）。超過すると古い履歴から落とす
     prompt_budget: int = field(default_factory=lambda: _env_int("SNIPHER_LFM_PROMPT_BUDGET", 1024))
-    # 生成の既定値
+    # 生成の既定値（LFM2.5 公式推奨: temperature 0.1 / top_k 50 / rep 1.05）
     max_new_tokens: int = field(default_factory=lambda: _env_int("SNIPHER_LFM_MAX_NEW_TOKENS", 128))
-    temperature: float = field(default_factory=lambda: _env_float("SNIPHER_LFM_TEMPERATURE", 0.3))
+    temperature: float = field(default_factory=lambda: _env_float("SNIPHER_LFM_TEMPERATURE", 0.1))
     top_k: int = field(default_factory=lambda: _env_int("SNIPHER_LFM_TOP_K", 50))
     repetition_penalty: float = field(
         default_factory=lambda: _env_float("SNIPHER_LFM_REPETITION_PENALTY", 1.05)
@@ -79,8 +119,25 @@ class LfmConfig:
             os.environ.get("SNIPHER_LFM_STORE_DIR", "").strip() or DEFAULT_STORE_DIR
         )
     )
+    # 自動取得したモデルのキャッシュ先
+    cache_dir: Path = field(
+        default_factory=lambda: Path(
+            os.environ.get("SNIPHER_LFM_CACHE_DIR", "").strip() or DEFAULT_CACHE_DIR
+        )
+    )
+    # 取得失敗時の再試行間隔（秒）
+    fetch_retry_seconds: int = field(
+        default_factory=lambda: _env_int("SNIPHER_LFM_FETCH_RETRY", 300)
+    )
+    # llama.cpp のスレッド数（0 = 自動: 物理コア数の半分、最低1）
+    n_threads: int = field(default_factory=lambda: _env_int("SNIPHER_LLM_THREADS", 0))
 
     @property
     def is_local(self) -> bool:
         p = Path(self.model_source)
-        return p.exists() and p.is_dir()
+        return p.exists() and (p.is_dir() or p.is_file())
+
+    def extra_urls(self) -> list[str]:
+        """SNIPHER_LFM_URLS に指定された追加の直接ダウンロード URL。"""
+        raw = os.environ.get("SNIPHER_LFM_URLS", "")
+        return [u.strip() for u in raw.replace(",", "\n").splitlines() if u.strip()]

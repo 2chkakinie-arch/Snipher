@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "snipher"
-version = "0.3.0"
-description = "超小型・確率的日本語AI + LFM2.5-1.2B-JP ハイブリッドチャット（助動詞補正・未知文字学習・オフライン取り込み付き）"
+version = "0.4.0"
+description = "LFM2.5-1.2B-JP を内部構造として動かす高速日本語AIチャット（全自動モデル取得・llama.cpp/torch 両対応・助動詞補正・未知文字学習）"
 readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "MIT" }
@@ -18,13 +18,17 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-# ニューラルエンジン（LFM2.5-1.2B-JP）を使う場合
+# ニューラルコア（LFM2.5-1.2B-JP）を使う場合 — torch バックエンド
 llm = [
   "torch>=2.3",
   "transformers>=4.57",
   "tokenizers>=0.20",
   "safetensors>=0.4",
   "accelerate>=0.30",
+]
+# CPU 最速の GGUF バックエンド（llama.cpp）。torch より軽いので推奨。
+gguf = [
+  "llama-cpp-python>=0.3.9",
 ]
 dev = ["pytest", "pytest-timeout", "httpx"]
 
