@@ -85,6 +85,25 @@ class SnipherEngine:
             out["reason"] = str(exc)
         return out
 
+    def language_model(self) -> dict:
+        """巨大 n-gram 言語モデル（流暢さの審判）の情報。"""
+        out = {"available": False, "params": 0, "order": 0, "vocab": 0, "bytes": 0, "engine": None}
+        try:
+            from . import lm as lm_mod
+
+            model = lm_mod.shared()
+            if model is None or not model.is_ready:
+                out["reason"] = f"重みが未ビルドです（python tools/build_lm.py）: {lm_mod.DEFAULT_PATH}"
+                return out
+            out.update({"available": True, "params": model.n_params(), "order": model.order,
+                        "vocab": model.n_vocab, "bytes": model.bytes_on_disk(),
+                        "engine": model.engine_name(), "tokens": int(model.total),
+                        "load_seconds": model.load_seconds, "calib": model.calib,
+                        "trained_at": model.trained_at})
+        except Exception as exc:  # noqa: BLE001
+            out["reason"] = str(exc)
+        return out
+
     def info(self) -> dict:
         """モデルのパラメータ数と設計情報を返す。"""
         cfg = self.lexicon.config
@@ -100,25 +119,31 @@ class SnipherEngine:
         kb_params = int(sum(kb_stats.get(k, 0) for k in ("topics", "facts", "questions", "answers")))
         net = self.neural()
         net_params = int(net.get("params") or 0)
+        lm = self.language_model()
+        lm_params = int(lm.get("params") or 0)
         return {
             "name": "Snipher",
-            "version": "0.4.0",
+            "version": "2.0.0",
             "architecture": (
-                "ルールベース構文解析 + 確率的テーブル生成(if構文ベース) "
-                "+ LFM2.5 アーキテクチャの蒸留ニューラルコア + BM25 知識ベース"
+                f"知識ベース検索({int(kb_stats.get('topics') or 0)} 話題) + composer(文の設計図) "
+                "+ 巨大 n-gram 言語モデル(流暢さの審判) "
+                "+ LFM2.5 アーキテクチャの蒸留ニューラルコア(KV キャッシュ付き) "
+                "+ ルールベース構文解析/確率的テーブル生成"
             ),
             "language": "日本語のみ",
-            "total_parameters": table_params + weight_params + kb_params + net_params,
+            "total_parameters": table_params + weight_params + kb_params + net_params + lm_params,
             "parameter_breakdown": {
                 "lexicon_table_entries": table_params,
                 "probability_weights": weight_params,
                 "knowledge_base_entries": kb_params,
                 "neural_core_weights": net_params,
+                "language_model_entries": lm_params,
             },
             "table_entries": table_params,
             "probability_weights": weight_params,
             "knowledge_base": kb_stats or None,
             "neural_core": {k: v for k, v in net.items() if k != "metrics"},
+            "language_model": lm,
             "weights": cfg.get("weights", {}),
             "temperature": cfg.get("temperature"),
             "lexicon_stats": stats,

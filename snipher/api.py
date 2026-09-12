@@ -343,6 +343,8 @@ def api_status():
             "light_available": light.get("state") == "ready",
         },
         "light": light,
+        "lm": st.get("lm"),
+        "composer": {"available": True, "engine": "Snipher composer (文の設計図)"},
         "knowledge": st.get("knowledge"),
         "tiers": st.get("tiers"),
         "serverless": is_serverless(),

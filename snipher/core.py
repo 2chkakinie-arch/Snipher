@@ -35,6 +35,9 @@
 from __future__ import annotations
 
 import logging
+import math
+import os
+import re
 import threading
 import time
 from pathlib import Path
@@ -86,6 +89,10 @@ class SnipherCore:
         self._light_state = "unchecked"        # unchecked|ready|absent|off|error
         self._remote = None
         self.kb = KnowledgeBase.shared()
+        # ---- 文章生成（composer）と流暢さの審判（n-gram LM） ---- #
+        self._composer = None
+        self._lm = None
+        self._lm_state = "unchecked"           # unchecked|ready|absent|off|error
 
     @staticmethod
     def _env_signature() -> tuple:
@@ -108,6 +115,7 @@ class SnipherCore:
             self.polisher = self.assist.polisher
             self._acquirer = None
             self._torch_engine = None
+            self._composer = None
             self._boot_started = False
             self.boot_state = "idle"
             self._boot_gen += 1
@@ -221,6 +229,253 @@ class SnipherCore:
     def any_neural(self) -> bool:
         return self.active_backend() is not None or self.light_ready()
 
+    # ------------------------------------------------------------------ #
+    # 文章生成（composer）と流暢さの審判（巨大 n-gram LM）
+    # ------------------------------------------------------------------ #
+    def lm(self):
+        """文字 n-gram 言語モデル（snipher/data/lm.npz）。無ければ None。
+
+        役割は生成ではなく **判定**: 候補文の perplexity を測って、日本語として
+        壊れている文を捨てる／自然な文を選ぶ。数十万〜数百万エントリを持ち、
+        1 文の判定は 1ms 未満。ダウンロード不要でリポジトリに同梱。
+        """
+        want = (os.environ.get("SNIPHER_LM", "auto") or "auto").lower()
+        if want == "off":
+            self._lm_state = "off"
+            return None
+        if self._lm_state == "ready":
+            return self._lm
+        if self._lm_state in ("absent", "error") and want != "on":
+            return None
+        from . import lm as lm_mod
+
+        try:
+            model = lm_mod.shared()
+        except Exception:  # noqa: BLE001
+            model = None
+        if model is None or not model.is_ready:
+            self._lm_state = "absent" if want != "on" else "error"
+            self._lm = None
+            return None
+        self._lm = model
+        self._lm_state = "ready"
+        log.info("n-gram 言語モデルを有効化: %s", model.engine_name())
+        return model
+
+    def lm_ready(self) -> bool:
+        return self.lm() is not None
+
+    def composer(self):
+        """発話から日本語の応答を組み立てる composer（知識ベース + 文法 + LM）。"""
+        if self._composer is None:
+            from .composer import Composer
+
+            self._composer = Composer(kb=self.kb, polisher=self.polisher, lm=self.lm())
+        return self._composer
+
+    def judge(self, text: str, core=None, lm=None) -> dict:
+        """候補文を (内蔵ニューラルコア + n-gram LM) の両方で採点する。
+
+        どちらか片方でも自信を持てない文は通さない（幾何平均）。
+        LM が「壊れた文字」を検出したら、さらに減点する。
+        """
+        text = str(text or "").strip()
+        if not text:
+            return {"confidence": 0.0, "perplexity": None, "neural": None, "lm": None,
+                    "lm_bad_ratio": None}
+        neural_conf: float | None = None
+        ppl: float | None = None
+        if core is not None:
+            try:
+                sc = core.score(text)
+                neural_conf = float(sc.get("confidence") or 0.0)
+                ppl = sc.get("perplexity")
+            except Exception:  # noqa: BLE001
+                neural_conf = None
+        lm_conf: float | None = None
+        bad: float | None = None
+        if lm is None:
+            lm = self.lm()
+        if lm is not None:
+            try:
+                ls = lm.score(text)
+                lm_conf = float(ls["confidence"])
+                bad = float(ls["bad_ratio"])
+                if ppl is None:
+                    ppl = ls["perplexity"]
+            except Exception:  # noqa: BLE001
+                lm_conf = None
+        parts = [c for c in (neural_conf, lm_conf) if c is not None]
+        if not parts:
+            conf = 0.0
+        elif len(parts) == 1:
+            conf = parts[0] * 0.9            # 片方だけの判定は少し割り引く
+        else:
+            conf = math.sqrt(max(0.0, parts[0]) * max(0.0, parts[1]))
+        if bad is not None and bad > 0.12:
+            conf *= max(0.2, 1.0 - bad)
+        return {"confidence": round(conf, 4), "perplexity": ppl, "neural": neural_conf,
+                "lm": lm_conf, "lm_bad_ratio": bad}
+
+    # ---- 知識ベースの文の 4-gram 転置索引（幻覚の検出に使う・1 回だけ作る） ---- #
+    _kb_grams: tuple[dict, list] | None = None
+
+    def _kb_gram_index(self) -> tuple[dict, list] | None:
+        if self._kb_grams is not None:
+            return self._kb_grams
+        if self.kb is None:
+            return None
+        try:
+            index: dict[str, list[int]] = {}
+            topics: list[str] = []
+            for item in self.kb.items:
+                tp = str(item.get("topic") or "")
+                sents: list[str] = []
+                for key in ("def", "opinion"):
+                    v = item.get(key)
+                    if isinstance(v, str) and v.strip():
+                        sents.append(v.strip())
+                for key in ("facts", "why", "how", "tips", "answers", "followups"):
+                    for v in item.get(key) or []:
+                        if isinstance(v, str) and v.strip():
+                            sents.append(v.strip())
+                for sent in sents:
+                    sid = len(topics)
+                    topics.append(tp)
+                    for i in range(len(sent) - 3):
+                        index.setdefault(sent[i:i + 4], []).append(sid)
+            self._kb_grams = (index, topics)
+        except Exception:  # noqa: BLE001
+            log.debug("知識ベースの 4-gram 索引を作れません", exc_info=True)
+            self._kb_grams = None
+        return self._kb_grams
+
+    def recited_topic(self, text: str, *, ratio: float = 0.6) -> str:
+        """生成文が知識ベースの文の丸書きなら、その話題名を返す（""= 丸書きではない）。
+
+        小さなニューラルコアは、知らない話題を聞かれると **覚えている別の知識** を
+        語り出すことがあります。それを「それっぽい返事」として出してしまわないための検査です。
+        """
+        idx = self._kb_gram_index()
+        t = str(text or "").strip()
+        if idx is None or len(t) < 8:
+            return ""
+        grams = {t[i:i + 4] for i in range(len(t) - 3)}
+        if not grams:
+            return ""
+        gram_index, topics = idx
+        counts: dict[int, int] = {}
+        for g in grams:
+            for sid in gram_index.get(g, ()):
+                counts[sid] = counts.get(sid, 0) + 1
+        best_sid, best = -1, 0.0
+        for sid, n in counts.items():
+            r = n / len(grams)
+            if r > best:
+                best, best_sid = r, sid
+        return topics[best_sid] if best >= ratio and best_sid >= 0 else ""
+
+    # 会話の受け答えに必ず現れる語（一人称・二人称・依頼）。
+    # これが無い生成文は「知識の断片」であって、返事ではありません。
+    _DIALOGUE_MARKERS = ("私", "あなた", "返事", "言葉", "話", "続き", "教えて",
+                         "聞かせて", "どうぞ", "ください", "ましょう", "一緒に")
+    _QUESTION_END = re.compile(
+        r"(ますか|ですか|ましょうか|でしょうか|ませんか|たいですか|くれますか|"
+        r"か。|か？|か！|？|\?)\s*$")
+    # 話題として数えない語（形式名詞・一般的な動詞）
+    _NOT_TOPIC_WORDS = ("こと", "もの", "とき", "ある", "いる", "する", "なる", "いう")
+
+    def conversational(self, text: str, user_text: str) -> bool:
+        """生成文が「会話の受け答え」になっているか。
+
+        話題の語が無い発話（「何してるの」「話して」）への返事は、語の重なりだけでは
+        判定できません。次のいずれかを満たすものだけを通します:
+
+        A. 相手の内容語を一つでも返している（こと・もの等の形式名詞は数えない）
+        B. 問いかけで終わっていて、かつ会話の語（話・ください・ましょう…）を含む
+        C. 会話の語を 2 つ以上含む（私・あなた・返事・言葉 …）
+
+        「例外のとき量があることが多いです。」のような、文法的でも中身の無い文は
+        A/B/C のどれも満たさないので落ちます。
+        """
+        t = str(text or "").strip()
+        u = str(user_text or "").strip()
+        if not t:
+            return False
+        try:
+            from .composer import _ECHO_SKIP
+            from .knowledge import GENERIC_ALIASES, content_words
+
+            index = self.kb.index if self.kb is not None else None
+            skip = set(_ECHO_SKIP) | set(GENERIC_ALIASES) | set(self._NOT_TOPIC_WORDS)
+            a = {w for w in content_words(t, index) if w not in skip and len(w) >= 2}
+            b = {w for w in content_words(u, index) if w not in skip and len(w) >= 2}
+            if a & b:                                     # A
+                return True
+        except Exception:  # noqa: BLE001
+            log.debug("conversational の語比較に失敗", exc_info=True)
+        marks = sum(1 for m in self._DIALOGUE_MARKERS if m in t)
+        if marks >= 2:                                    # C
+            return True
+        return bool(self._QUESTION_END.search(t)) and marks >= 1   # B
+
+    def redundant(self, extra: str, text: str) -> bool:
+        """付け足す一文が、すでに出した文と同じことを言っていないか。"""
+        e, t = str(extra or "").strip(), str(text or "").strip()
+        if not e or e in t:
+            return True
+        for i in range(max(0, len(e) - 7)):       # 8 文字以上の共通部分列
+            if e[i:i + 8] and e[i:i + 8] in t:
+                return True
+        try:
+            from .knowledge import content_words
+
+            index = self.kb.index if self.kb is not None else None
+            a = set(content_words(e, index))
+            b = set(content_words(t, index))
+            if a and len(a & b) / len(a) >= 0.5:
+                return True
+        except Exception:  # noqa: BLE001
+            pass
+        return False
+
+    def relevant(self, text: str, user_text: str, *, topic: str = "") -> bool:
+        """生成文が発話と話題を共有しているか（それっぽいだけの雑談を弾く）。
+
+        判定は 3 段:
+
+        1. 発話の話題語（知識ベースが知っている語）と生成文が語を共有 → 関連あり
+        2. 探している話題名が生成文に出ている → 関連あり
+        3. 発話に話題語が無い（「何してるの」のような世間話）→ 語の重なりでは
+           判定できないので、**別の話題の知識の丸書きでなければ** 通す
+        """
+        try:
+            from .composer import _ECHO_SKIP
+            from .knowledge import content_words
+
+            index = self.kb.index if self.kb is not None else None
+            a = set(content_words(str(text or ""), index))
+            b = {w for w in content_words(str(user_text or ""), index)
+                 if w not in _ECHO_SKIP and (index is None or index.topics_of(w))}
+            if a & b:
+                return True
+            if topic:
+                tw = set(content_words(str(topic), index)) | {str(topic)}
+                if tw & a or str(topic) in str(text or ""):
+                    return True
+            if not b:
+                # 発話に話題の語が無い（世間話）→ 別の話題の知識の丸書きではなく、
+                # かつ「会話の受け答え」の形をしているものだけ通す
+                recited = self.recited_topic(text)
+                if recited and recited != str(topic or ""):
+                    return False
+                return self.conversational(text, user_text)
+            return False
+        except Exception:  # noqa: BLE001
+            # 判定できないなら採用しない（幻覚の門は「閉じる側」に倒す）
+            log.debug("relevant の判定に失敗", exc_info=True)
+            return False
+
     def tiers(self) -> dict:
         """どの知能階層が生きているか（/api/status・/info 用）。"""
         heavy = None
@@ -236,6 +491,11 @@ class SnipherCore:
             "distilled": self._light_state if self._light_state != "unchecked" else (
                 "ready" if self.light_ready() else self._light_state),
             "knowledge_base": self.kb.stats() if self.kb is not None else None,
+            "language_model": (lambda m: ({"state": "ready", "params": m.n_params(),
+                                          "order": m.order, "bytes": m.bytes_on_disk()}
+                                         if m is not None else {"state": self._lm_state,
+                                                                "params": 0}))(self.lm()),
+            "composer": "ready",
             "serverless": is_serverless(),
         }
 
@@ -501,6 +761,10 @@ class SnipherCore:
             "state": self._light_state, "kind": "distilled", "params": 0}
         st["light_backend"] = st["light"].get("engine")
         st["light_ready"] = light is not None
+        lm = self.lm()
+        st["lm"] = lm.status() if lm is not None else {"state": self._lm_state, "kind": "ngram",
+                                                       "params": 0}
+        st["lm_ready"] = lm is not None
         st["knowledge"] = self.kb.stats() if self.kb is not None else None
         st["neural_ready_any"] = self.any_neural()
         return st
@@ -616,16 +880,72 @@ class SnipherCore:
             yield from self._light_reply(messages, draft, route, mode=mode)
             return
 
-        # 3) instant / fallback: 高速コアの応答をそのまま返す（速度維持）
-        if route == ROUTE_FALLBACK and float(draft.get("confidence", 1.0)) < self.assist.cfg.threshold:
-            text = draft.get("base_text") or draft["text"]  # 不安な生成文は安全な骨子へ
-            degraded = text != draft["text"]
-        else:
-            text = draft["text"]
-            degraded = False
+        # 3) instant / fallback: ニューラルを 1 トークンも使わず、その場で文を組み立てる
+        yield from self._fast_reply(messages, draft, route, t0=t0)
+
+    def _fast_reply(self, messages: list[dict], draft: dict, route: str, *, t0: float | None = None):
+        """⚡ 高速経路（instant / fallback）。ニューラルを 1 トークンも使わない。
+
+        v2 では「定型文の引き当て」ではなく **composer がその場で文を組み立てる**:
+        発話を解析して計画（知識ベース／話題の受け取り／読み取れない入力／挨拶／社会的応答）
+        を選び、文法と n-gram LM の検証を通した文だけを返す。材料が無ければ無いと正直に言う。
+        """
+        t0 = time.time() if t0 is None else t0
+        last_user = last_user_of(messages)
+        rule_text = str(draft.get("text") or "").strip()
+        base_text = str(draft.get("base_text") or rule_text).strip()
+        conf = float(draft.get("confidence", 1.0))
+        fallback_engine = "Snipher-mini+"
+        fast_engine = "Snipher Core (高速経路)"
+        text = rule_text
+        degraded = False
+        if route == ROUTE_FALLBACK and conf < self.assist.cfg.threshold:
+            text = base_text or rule_text
+            degraded = text != rule_text
+        info = {"engine": fallback_engine if route == ROUTE_FALLBACK else fast_engine,
+                "template_mode": "rule-based", "plan": "draft", "confidence": conf,
+                "fixes": list(draft.get("fixes") or []), "knowledge": None, "lm": None,
+                "degraded": degraded, "source": "rule"}
+
+        composer = None
+        try:
+            composer = self.composer()
+        except Exception:  # noqa: BLE001
+            log.debug("composer を初期化できません", exc_info=True)
+        reply = None
+        if composer is not None:
+            try:
+                reply = composer.compose(last_user, history=messages)
+            except Exception:  # noqa: BLE001
+                log.debug("composer が失敗", exc_info=True)
+        if reply is not None and reply.text:
+            from .composer import validate as _validate
+
+            ok, _why = _validate(reply.text, max_len=220)
+            if ok and len(reply.text) >= 4:
+                text = reply.text
+                lm_info = None
+                lm = self.lm()
+                if lm is not None:
+                    try:
+                        sc = lm.score(text)
+                        lm_info = {"confidence": sc["confidence"], "perplexity": sc["perplexity"],
+                                   "bad_ratio": sc["bad_ratio"]}
+                    except Exception:  # noqa: BLE001
+                        lm_info = None
+                info.update({
+                    "engine": fallback_engine if route == ROUTE_FALLBACK else "Snipher composer (高速経路)",
+                    "template_mode": "composer", "plan": reply.plan,
+                    "confidence": round(float(reply.confidence), 4),
+                    "fixes": info["fixes"] + ["composer"],
+                    "knowledge": reply.knowledge, "lm": lm_info,
+                    "degraded": False, "source": "composer",
+                    "sentences": len(reply.sentences),
+                })
+
         stats = {
-            "engine": "Snipher-mini+" if route == ROUTE_FALLBACK else "Snipher Core (高速経路)",
-            "template_mode": "rule-based",
+            "engine": info["engine"],
+            "template_mode": info["template_mode"],
             "new_tokens": None,
             "tokens_per_second": None,
             "assist": "rule",
@@ -633,161 +953,245 @@ class SnipherCore:
             "draft_confidence": draft.get("confidence"),
             "draft_seconds": round(time.time() - t0, 5),
             "intent": draft.get("intent"),
-            "fixes": draft.get("fixes", []),
+            "fixes": info["fixes"],
             "route": route,
+            "plan": info["plan"],
+            "confidence": info["confidence"],
+            "source": info["source"],
+            "seconds": round(time.time() - t0, 4),
         }
+        if info["knowledge"]:
+            stats["knowledge"] = info["knowledge"]
+        if info["lm"]:
+            stats["lm"] = info["lm"]
         if route == ROUTE_FALLBACK:
-            stats["engine"] = "Snipher-mini+"
+            stats["engine"] = fallback_engine
             stats["fallback_reason"] = self._fallback_reason()
-            stats["degraded_to_base"] = degraded
+            stats["degraded_to_base"] = info["degraded"]
             stats["acquire"] = self.acquire_status().get("phase")
         yield {"type": "assist", "mode": "rule", "confidence": draft.get("confidence"),
-               "route": route}
-        yield {"type": "start", "engine": stats["engine"], "template_mode": "rule-based"}
+               "route": route, "plan": info["plan"]}
+        yield {"type": "start", "engine": stats["engine"], "template_mode": stats["template_mode"]}
         for piece in _chunk_for_stream(text):
             yield {"type": "delta", "text": piece}
         yield {"type": "done", "text": text, "stats": stats}
 
     def _light_reply(self, messages: list[dict], draft: dict, route: str, *, mode: str = "auto"):
-        """✨ 内蔵ニューラルコア（LFM2.5 の蒸留スナップショット）＋知識ベース経路。
+        """✨ 内蔵ニューラルコア + 知識ベース + composer の協働経路。
 
-        フルウェイトをロードできない環境（Vercel 等）でも「どんな会話」に使えるよう、
+        分担はこうです:
 
-            知識ベース検索（事実） → 内蔵コアが文章化・会話を続ける
-            確信的な部分（ルール下書き）はそのまま使い、不安な部分だけを生成する
+            知識ベース  … 事実を出す（無ければ「無い」と言う）
+            composer    … 事実を自然な日本語の応答に組み立て、話題を受け取る
+            内蔵コア    … 材料が無いときに本文の生成に挑戦し、文末を補う
+            n-gram LM   … 候補文を採点して、壊れた文・的外れな文を捨てる
 
-        という分担をする。生成は 1 文字あたり 2〜3ms（NumPy）で、高速経路は通らない。
+        生成は 1 文字あたり数ミリ秒（NumPy）。フルウェイトは 1 バイトも要りません。
         """
-        core = self.light_core()
-        last_user = next((m.get("content", "") for m in reversed(messages)
-                         if m.get("role") == "user"), "")
-        t0 = time.time()
-        kb = self.kb_answer(last_user)
-        info = {"route": route, "knowledge": None, "engine": "Snipher-mini+"}
-        if kb:
-            info["knowledge"] = {"topic": kb.get("topic"), "score": kb.get("score"),
-                                 "coverage": kb.get("coverage"), "usage": kb.get("usage")}
+        import re as _re
 
-        yield {"type": "assist", "mode": "light", "route": route,
-               "confidence": draft.get("confidence"),
-               "reason": "knowledge_hit" if kb else "uncertain_slot",
-               "knowledge": info["knowledge"]}
-        rule_text = draft.get("text") or ""
-        base_text = draft.get("base_text") or rule_text
+        core = self.light_core()
+        lm = self.lm()
+        composer = None
+        try:
+            composer = self.composer()
+        except Exception:  # noqa: BLE001
+            log.debug("composer を初期化できません", exc_info=True)
+        last_user = last_user_of(messages)
+        t0 = time.time()
+
         conf = float(draft.get("confidence", 1.0))
-        text = ""
-        gen_text = ""
-        light_conf: float | None = None        # 候補を採点したときだけ値が入る
-        ppl: float | None = None
-        used_core = False
-        if kb is not None:
-            text = str(kb.get("text") or "").strip()
-            if core is not None and conf < self.assist.cfg.threshold:
-                # 事実を伝えたあと、会話を続ける一文だけを内蔵コアに作らせる
-                gen_text = core.reply(last_user, context=messages, max_chars=40,
-                                      temperature=0.55, top_k=24) or ""
-        elif core is not None:
-            gen_text = core.reply(last_user, context=messages,
-                                  max_chars=self.cfg.light_max_chars,
-                                  temperature=0.85, top_k=40) or ""
-            used_core = bool(gen_text)
-        # 確率的に不安なときだけ、下書き候補をもう数案ふやして内蔵コアに選ばせる
-        extra_cands: list[str] = []
-        if core is not None and kb is None and conf < self.assist.cfg.threshold:
+        rule_text = str(draft.get("text") or "").strip()
+        base_text = str(draft.get("base_text") or rule_text).strip()
+
+        # ---- 1) composer が計画と文を作る（知識ベースを内部で引く） ------------- #
+        reply = None
+        if composer is not None:
             try:
-                gen = self.assist.responder.gen
-                for _ in range(3):
-                    d = gen.generate(prompt=draft.get("topic"), register="polite", tense="nonpast")
-                    t = _clean_sentence(str(d.get("text") or ""))
-                    if t:
-                        extra_cands.append(t)
-            except Exception:  # noqa: BLE001 - 候補水増しは無くても困らない
-                extra_cands = []
-        chosen_from_model = False
-        if core is not None and not text:
-            used_core = True
-            scored = []
-            for cand in filter(None, {rule_text, base_text, gen_text, *extra_cands}):
-                sc = core.score(cand)
-                prefer = 0.06 if cand == rule_text else 0.0     # 迷ったらルールを尊重
-                scored.append((sc["confidence"] + prefer, cand, sc))
-            scored.sort(key=lambda t: -t[0])
-            _, text, sc = scored[0]
-            light_conf = sc["confidence"]
-            ppl = sc["perplexity"]
-            chosen_from_model = text == gen_text or text in extra_cands
+                reply = composer.compose(last_user, history=messages)
+            except Exception:  # noqa: BLE001
+                log.debug("composer が失敗", exc_info=True)
+        if reply is None:                                    # composer が動かない環境
+            kb = self.kb_answer(last_user)
+            from .composer import Reply as _Reply
+            body = str((kb or {}).get("text") or (rule_text if conf >= self.assist.cfg.threshold
+                                                  else base_text)).strip()
+            reply = _Reply(text=body, plan="kb_answer" if kb else "draft",
+                           confidence=float((kb or {}).get("confidence", conf)),
+                           knowledge=({"topic": kb.get("topic"), "score": kb.get("score"),
+                                       "coverage": kb.get("coverage"), "usage": kb.get("usage")}
+                                      if kb else None))
+
+        info_kb = reply.knowledge
+        material = bool(info_kb and info_kb.get("topic"))
+        topic = str((info_kb or {}).get("topic") or "")
+        text = str(reply.text or "").strip()
         if not text:
             text = rule_text if conf >= self.assist.cfg.threshold else base_text
-        # 根拠（知識ベース）が無く、内蔵コアの確信度も低いなら — 事実を主張せず
-        # 話題を受け取る安全応答に切り替える（それっぽい誤情報より正直で有益）。
-        # モデルが書いた文にはルールより厳しいバー（+0.11）を適用する。
-        bar = self.cfg.light_gate + (0.11 if chosen_from_model else 0.0)
-        if (core is not None and kb is None and light_conf is not None
-                and light_conf < bar):
-            topic = str(draft.get("topic") or "").strip()
-            text = (f"{topic}のことですね。" if topic else "なるほど、そういうことですね。") \
-                + "もう少し詳しく聞かせてください。"
-            used_core = False
-            stats_note = "low_confidence_ack"
-        else:
-            stats_note = None
-        # 助動詞の補い（内蔵コアの神経系）
+
+        yield {"type": "assist", "mode": "light", "route": route, "plan": reply.plan,
+               "confidence": conf, "reason": "knowledge_hit" if material else "uncertain_slot",
+               "knowledge": info_kb}
+
+        # ---- 2) 内蔵ニューラルコアの出番 --------------------------------------- #
+        gen_text = ""
+        used_core = False
+        neural_conf: float | None = None      # 昇格判定に使う確信度
+        report_conf: float | None = None      # 表示用の確信度
+        ppl: float | None = None
+        lm_conf: float | None = None
+        note: str | None = None
+        chosen_from_model = False
+        extra = ""
+        stats_extra: dict = {}
+
+        needs_follow = not bool(_re.search(r"(か|かな|でしょう)[。！？!?]", text))
+        if core is not None:
+            if material:
+                # 事実を伝えたあと、会話を続ける一文が **無ければ** だけ作らせる。
+                # 知識ベースの followups（人が書いた問い）があるなら、それを優先する
+                # （生成文は文法的でも中身が空のことがあるため）。
+                if needs_follow and len(text) < 120:
+                    gen_text = core.reply(last_user, context=messages, max_chars=28,
+                                          temperature=0.5, top_k=20) or ""
+                    used_core = bool(gen_text)
+                    if gen_text:
+                        sc = self.judge(gen_text, core=core, lm=lm)
+                        report_conf = sc["confidence"]
+                        ppl = sc["perplexity"]
+                        lm_conf = sc["lm"]
+                        on_topic = self.relevant(gen_text, last_user, topic=topic)
+                        if (sc["confidence"] >= 0.75 and (sc["lm"] or 0.0) >= 0.7 and on_topic
+                                and not self.redundant(gen_text, text)
+                                and len(text) + len(gen_text) < 190):
+                            extra = gen_text
+            else:
+                # 材料が無い → 本文の生成に挑戦させる。
+                # 小さなモデルは 1 発だと外すので、温度を変えて複数候補を作り、
+                # 「文法チェック → 内蔵コアの自信 → n-gram LM の自然さ → 話題の一致」を
+                # 全部通した中から最も良い 1 文だけを採用する（best-of-N）。
+                from .composer import validate as _validate
+
+                bar = self.cfg.light_gate
+                cands: list[str] = []
+                for temp, topk, sd in ((0.60, 24, 11), (0.85, 40, 23), (0.45, 12, 37)):
+                    try:
+                        one = (core.reply(last_user, context=messages,
+                                          max_chars=self.cfg.light_max_chars,
+                                          temperature=temp, top_k=topk, seed=sd) or "").strip()
+                    except Exception:  # noqa: BLE001
+                        one = ""
+                    if one and one not in cands:
+                        cands.append(one)
+                used_core = bool(cands)
+                best: tuple[float, str, dict] | None = None
+                for one in cands:
+                    ok, _why = _validate(one, max_len=200)
+                    if not ok:
+                        continue
+                    sc = self.judge(one, core=core, lm=lm)
+                    if sc["confidence"] < bar or float(sc["lm"] or 0.0) < bar:
+                        continue
+                    if not self.relevant(one, last_user, topic=topic):
+                        continue
+                    rank = float(sc["confidence"]) * float(sc["lm"] or 0.0)
+                    if best is None or rank > best[0]:
+                        best = (rank, one, sc)
+                if best is not None:
+                    gen_text = best[1]
+                    sc = best[2]
+                    text = gen_text
+                    chosen_from_model = True
+                    stats_extra["candidates"] = len(cands)
+                elif cands:
+                    gen_text = cands[0]
+                    sc = self.judge(gen_text, core=core, lm=lm)
+                    note = "low_confidence_ack"
+                    stats_extra["candidates"] = len(cands)
+                    stats_extra["rejected"] = "gate"
+                else:
+                    sc = None
+                if sc is not None:
+                    neural_conf = sc["confidence"]
+                    report_conf = sc["confidence"]
+                    ppl = sc["perplexity"]
+                    lm_conf = sc["lm"]
+                if neural_conf is None:
+                    sc = self.judge(text, core=core, lm=lm)
+                    neural_conf = report_conf = sc["confidence"]
+                    ppl = sc["perplexity"]
+                    lm_conf = sc["lm"]
+
+        # ---- 3) 助動詞の補い（内蔵コアの神経系） -------------------------------- #
         added = ""
         if core is not None and _looks_incomplete(text):
             used_core = True
-            comp = core.complete(text)
-            if comp.get("changed") and comp.get("confidence", 0) >= 0.25:
+            try:
+                comp = core.complete(text)
+            except Exception:  # noqa: BLE001
+                comp = {}
+            if comp.get("changed") and float(comp.get("confidence", 0) or 0) >= 0.25:
                 added = comp.get("added") or ""
                 text = comp.get("text") or text
-        # 会話継続の一文（知識ベースヒット時だけ後ろに足す）
-        extra = ""
-        if gen_text and kb is not None and core is not None:
-            sc = core.score(gen_text)
-            used_core = True
-            if sc["confidence"] >= 0.55 and gen_text not in text:
-                extra = gen_text
+
+        # ---- 4) 磨いて出す ---------------------------------------------------- #
         polished = self.polisher.polish(f"{text}{extra}", register="polite")
         fixes = list(polished["fixes"])
         if added:
             fixes.append("neural_completion")
-        final = polished["text"] or text
-        engine = (core.engine_name() if used_core
-                  else "Snipher 知識ベース" if kb is not None else "Snipher-mini+")
-        yield {"type": "start", "engine": engine,
-               "template_mode": "distilled-numpy" if used_core else "knowledge+rule"}
+        if composer is not None:
+            fixes.append("composer")
+        final = str(polished["text"] or text).strip() or text
+        if used_core:
+            engine = core.engine_name()
+            template_mode = "distilled-numpy"
+        elif material:
+            engine = "Snipher 知識ベース + composer"
+            template_mode = "knowledge+composer"
+        else:
+            engine = "Snipher composer"
+            template_mode = "composer"
+
+        yield {"type": "start", "engine": engine, "template_mode": template_mode}
         for piece in _chunk_for_stream(final, pieces=2):
             yield {"type": "delta", "text": piece}
+
         stats = {
             "engine": engine,
-            "template_mode": "distilled-numpy" if used_core else ("knowledge-bm25" if kb else "rule-based"),
+            "template_mode": template_mode,
             "neural_used": used_core,
             "assist": "light",
             "route": route,
+            "plan": reply.plan,
             "draft": rule_text,
             "draft_confidence": conf,
+            "confidence": round(float(reply.confidence), 4),
             "intent": draft.get("intent"),
             "fixes": fixes,
-            "generated": bool(gen_text and (gen_text in final or gen_text == final)),
-            "candidates": 3 + len(extra_cands),
-            "knowledge": info["knowledge"],
-            "neural_confidence": round(light_conf, 4) if light_conf is not None else None,
+            "generated": chosen_from_model or bool(extra),
+            "candidates": 1 + (1 if gen_text else 0),
+            "knowledge": info_kb,
+            "neural_confidence": round(report_conf, 4) if report_conf is not None else None,
+            "lm_confidence": lm_conf,
             "perplexity": ppl,
             "seconds": round(time.time() - t0, 4),
             "new_tokens": None,
             "tokens_per_second": None,
         }
-        if stats_note:
-            stats["note"] = stats_note
+        if stats_extra:
+            stats.update(stats_extra)
+        if note:
+            stats["note"] = note
             stats["fallback_reason"] = "手元に確かな材料が無かったので、話題を受け取る応答にしました"
         if core is None:
             stats["fallback_reason"] = "内蔵ニューラルコアの重みが未ビルドです"
-        gate_val = light_conf if light_conf is not None else conf
+        gate_val = neural_conf if neural_conf is not None else conf
         if gate_val < self.cfg.light_gate and not self.neural_available():
             # 確信度が低い → フルウェイトが使える環境なら裏で起動準備（応答は止めない）
             self.ensure_started()
             stats["escalation"] = "queued_full_weights"
             stats["escalation_gate"] = self.cfg.light_gate
-        elif not used_core and kb is None:
+        elif not used_core and not material:
             stats["fallback_reason"] = "確信度が足りるので生成は見送りました"
         yield {"type": "done", "text": final, "stats": stats}
 

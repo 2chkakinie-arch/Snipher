@@ -21,8 +21,8 @@ from pathlib import Path
 
 import numpy as np
 
-from .nn import MicroNet, forward_backward
-from .tokenizer import ASST, BOS, EOS, SYS, USER, CharTokenizer
+from .nn import DecodeCache, MicroNet, forward_backward
+from .tokenizer import ASST, BOS, EOS, PAD, SYS, UNK, USER, CharTokenizer
 from . import store as _store
 
 DEFAULT_PATH = Path(__file__).resolve().parent.parent / "data" / "neural" / "core.npz"
@@ -34,6 +34,33 @@ def _top_k_filter(logits: np.ndarray, k: int) -> np.ndarray:
         return logits
     cutoff = np.partition(logits, -k)[-k]
     return np.where(logits < cutoff, -np.inf, logits)
+
+
+class _Decoder:
+    """KV キャッシュ付きの逐次デコーダ。
+
+    1 文字ごとに全文を再計算していた従来の O(T^2) を O(1)/文字にします。
+    文脈が `ctx` を超えたらキャッシュを捨てて直近 `ctx` で prefill し直す
+    （＝従来のスライディングウィンドウと同じ見え方、メモリも一定）。
+    """
+
+    def __init__(self, net: MicroNet, ids: list[int], ctx: int = 56):
+        self.net = net
+        self.ids = ids                     # 呼び出し側と履歴リストを共有する
+        self.ctx = max(4, int(ctx))
+        self.cache = DecodeCache(net, batch=1)
+        window = list(ids)[-self.ctx:] or [BOS]
+        self.logits = self.cache.prefill(net, np.array([window], dtype=np.int64))[0]
+
+    def advance(self, new_id: int) -> np.ndarray:
+        """new_id を **呼び出し側が ids に追加したあと** で呼ぶ。次の予測を返す。"""
+        if self.cache.length >= self.ctx:
+            self.cache = DecodeCache(self.net, batch=1)
+            window = list(self.ids)[-self.ctx:]
+            self.logits = self.cache.prefill(self.net, np.array([window], dtype=np.int64))[0]
+        else:
+            self.logits = self.cache.step(self.net, np.array([new_id], dtype=np.int64))[0]
+        return self.logits
 
 
 class DistilledCore:
@@ -102,6 +129,7 @@ class DistilledCore:
             "trained_at": self.meta.get("trained_at"),
             "metrics": self.meta.get("metrics"),
             "runtime": "numpy",
+            "kv_cache": True,
             "download_required": False,
         }
 
@@ -129,17 +157,26 @@ class DistilledCore:
 
     def generate_ids(self, prompt_ids: list[int], *, max_new: int = 64, temperature: float = 0.8,
                      top_k: int = 40, repetition_penalty: float = 1.08, seed: int | None = None,
-                     forbid: tuple[int, ...] = (USER, SYS), ctx: int = 56) -> list[int]:
+                     forbid: tuple[int, ...] = (PAD, UNK, USER, SYS), ctx: int = 56,
+                     use_cache: bool = True) -> list[int]:
+        """続きのトークン ID 列を生成する（KV キャッシュ使用・結果は非キャッシュと同一）。"""
         assert self.net is not None and self.tok is not None
         rng = np.random.default_rng(seed)
         ids = list(prompt_ids)
         out: list[int] = []
         net = self.net
+        dec: _Decoder | None = None
+        if use_cache:
+            try:
+                dec = _Decoder(net, ids, ctx)
+            except Exception:  # noqa: BLE001 - キャッシュが使えなければ従来経路へ
+                dec = None
+        last = dec.logits if dec is not None else None
         for _ in range(max_new):
-            window = ids[-ctx:] if len(ids) > ctx else ids
-            x = np.array([window], dtype=np.int64)
-            logits, _ = net.forward(x)
-            last = logits[0, -1]
+            if dec is None:
+                window = ids[-ctx:] if len(ids) > ctx else ids
+                logits, _ = net.forward(np.array([window or [BOS]], dtype=np.int64))
+                last = logits[0, -1]
             nxt = self._sample(last, rng, temperature, top_k, ids, repetition_penalty)
             if nxt == EOS or nxt in forbid:
                 break
@@ -148,6 +185,8 @@ class DistilledCore:
             ch = self.tok.itos.get(nxt, "")
             if ch in _STOP or len(out) >= max_new:
                 break
+            if dec is not None:
+                last = dec.advance(nxt)
         return out
 
     def generate(self, prompt: str = "", *, max_chars: int = 64, temperature: float = 0.8,
@@ -160,7 +199,7 @@ class DistilledCore:
             head += [ASST]
         ids = head + self.tok.encode(prompt)  # type: ignore[union-attr]
         gen = self.generate_ids(ids, max_new=max_chars, temperature=temperature, top_k=top_k,
-                                forbid=(USER, SYS) if as_assistant else ())
+                                forbid=(PAD, UNK, USER, SYS) if as_assistant else (PAD, UNK))
         text = self.tok.decode(gen)  # type: ignore[union-attr]
         return text.strip()
 
@@ -178,12 +217,12 @@ class DistilledCore:
                 hist += f"<asst>{m.get('content', '')}\n"
         ids = [BOS] + self.tok.encode(hist + f"<user>{user_text}\n<asst>")  # type: ignore[union-attr]
         gen = self.generate_ids(ids, max_new=max_chars, temperature=temperature, top_k=top_k,
-                                seed=seed, forbid=(USER, SYS, ASST))
+                                seed=seed, forbid=(PAD, UNK, USER, SYS, ASST))
         return self.tok.decode(gen).strip()  # type: ignore[union-attr]
 
     # ------------------------------------------------------------------ #
     def complete(self, fragment: str, *, max_chars: int = 40, temperature: float = 0.35,
-                 top_k: int = 30) -> dict:
+                 top_k: int = 30, seed: int | None = None) -> dict:
         """助動詞の補い: 断片文を自然な一文に補完する。
 
         ルール(polisher)で埋まらなかった文末を、内蔵ニューラルコアが
@@ -196,7 +235,7 @@ class DistilledCore:
         # 学習時と同じ形（続き: <断片>\n全文）でプロンプトし、続きだけを採る
         ids = [BOS] + self.tok.encode(f"続き: {frag}\n")  # type: ignore[union-attr]
         gen = self.generate_ids(ids, max_new=max_chars, temperature=temperature, top_k=top_k,
-                                forbid=(USER, SYS, ASST))
+                                seed=seed, forbid=(PAD, UNK, USER, SYS, ASST))
         text = self.tok.decode(gen).strip()  # type: ignore[union-attr]
         # 断片を繰り返して出力するモデルにも対応して重複を除く
         added = text
@@ -286,13 +325,14 @@ class DistilledCore:
         produced: list[str] = []
         n = 0
         try:
+            dec = _Decoder(self.net, cur, ctx=56)  # type: ignore[arg-type]
+            last = dec.logits
             while n < max_new:
-                window = cur[-56:] if len(cur) > 56 else cur
-                logits, _ = self.net.forward(np.array([window], dtype=np.int64))  # type: ignore[union-attr]
-                nxt = self._sample(logits[0, -1], rng, temp, k, cur, rep)
-                if nxt == EOS or nxt in (USER, SYS, ASST):
+                nxt = self._sample(last, rng, temp, k, cur, rep)
+                if nxt == EOS or nxt in (PAD, UNK, USER, SYS, ASST):
                     break
                 cur.append(nxt)
+                last = dec.advance(nxt)
                 ch = self.tok.itos.get(nxt, "")  # type: ignore[union-attr]
                 if not ch:
                     continue

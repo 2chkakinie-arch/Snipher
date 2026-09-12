@@ -109,7 +109,9 @@ class Trainer:
         return {"loss": loss, "acc": acc, "ppl": float(math.exp(min(20.0, loss)))}
 
     # ------------------------------------------------------------------ #
-    def train(self, on_log=None) -> dict:
+    def train(self, on_log=None, on_epoch=None) -> dict:
+        """学習ループ。`on_epoch(net, metrics)` は各 epoch の検証後に呼ばれる
+        （重い学習でも途中のスナップショットを保存できるようにするため）。"""
         c = self.cfg
         steps_per_epoch = max(1, len(self.train_ds.ids) // (c.batch * c.seq_len))
         self.total_steps = steps_per_epoch * c.epochs
@@ -138,5 +140,10 @@ class Trainer:
                 on_log("eval", m)
             if m["loss"] < best["loss"]:
                 best = dict(m)
+            if on_epoch:
+                try:
+                    on_epoch(self.net, m)
+                except Exception:  # noqa: BLE001 - 保存失敗で学習は止めない
+                    pass
         return {"best_val": best, "final": self.history[-1] if self.history else {},
                 "steps": self.step, "seconds": round(time.time() - t0, 1)}

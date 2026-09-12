@@ -19,6 +19,7 @@ KB の 1 エントリ = 1 話題。Snipher は次の 2 とおりに使います�
 from __future__ import annotations
 
 import json
+import re
 import sys
 from pathlib import Path
 
@@ -105,7 +106,9 @@ def items() -> list[dict]:
          "好きかどうか が最大のポイントです。楽しくない運動は続きません。"],
         ["週にどれくらい動けていますか。"], ["走る", "歩く", "泳ぐ"])
 
-    add("food", "食事", ["食事", "ご飯", "昼飯", "朝ごはん", "献立", "栄養", "カロリー", "ダイエット"], ["食事", "食べ物"],
+    add("food", "食事", ["食事", "ご飯", "昼飯", "朝ごはん", "献立", "栄養", "カロリー", "ダイエット",
+                        "空腹", "お腹すいた", "お腹がすいた", "お腹が空いた", "何食べる", "食べたい",
+                        "食べよう", "ペコペコ", "晩ご飯", "夕飯"], ["食事", "食べ物"],
         ["主食・主菜・副菜がそろうと、栄養のバランスが崩れにくいです。",
          "塩分は加工食品で上がりやすいので、汁物は 1 日 1 杯が目安です。",
          "食物繊維は野菜・豆・海藻の順に摂ると取り戻しやすいです。",
@@ -616,17 +619,278 @@ def items() -> list[dict]:
     return K
 
 
-def build() -> dict:
-    K = items()
+# ---------------------------------------------------------------------- #
+# v2: 人が書いた新しい内容（tools/kb_data/*）と、v1 のテーブルを 1 つに束ねる
+# ---------------------------------------------------------------------- #
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from kb_data import all_items as new_items, validate as validate_new  # noqa: E402
+from snipher.knowledge import GENERIC_ALIASES  # noqa: E402
+
+# v1 のうち、kb_data 側により詳しい項目を書き直したので使わないもの
+SUPERSEDED = {
+    "weather", "season", "nature", "sleep", "exercise", "cleaning", "work", "study",
+    "japanese", "ai", "programming", "computer", "internet", "space", "math", "money",
+    "movie", "music", "book", "game", "travel", "car", "emotion", "child", "school",
+    "cat", "dog", "pet", "environment", "hobby", "coffee", "tea", "ramen", "sushi",
+    "onsen", "focus", "memory", "photography", "garden", "fashion", "car_life", "snipher",
+}
+
+# v1 から残す項目にだけ、後から人が書いた定義を足す（「Xとは」に答えられるようにする）
+LEGACY_DEFS = {
+    "health": "健康は、体の働きと心の調子が保たれていて、日常の活動が無理なく続けられる状態です。",
+    "food": "食事は、体を作る材料とエネルギーを、食べ物から取る毎日の行為です。",
+    "cook": "料理は、素材に火と調味を加えて、食べやすく美味しくする作業です。",
+    "english": "英語は、世界中で最も多くの人が第二言語として使う、ドイツ語系の言語です。",
+    "language": "語学は、別の言葉を読み書きし、聞いて話す力を身につける学習です。",
+    "science": "科学は、観察と実験で確かめられる形にして、自然の仕組みを説明する営みです。",
+    "economy": "経済は、人と組織がお金と物と労働をやり取りして、価値を巡らせる仕組みです。",
+    "news": "ニュースは、起きた出来事を集めて確かめ、重要性の順に伝える情報です。",
+    "sport": "スポーツは、規則を決めて体力と技術と判断を競い合う身体活動です。",
+    "transport": "交通は、人と物を場所から場所へ移動させる手段と、その仕組みの総称です。",
+    "polite": "敬語は、相手との距離と立場を、言葉の形で表す日本語の仕組みです。",
+    "advice": "相談は、自分だけでは整理できないことを、別の視点を入れて考え直す行為です。",
+    "history": "日本史は、この列島で起きた出来事と、そこに生きた人々の記録です。",
+    "geography": "地理は、地形と気候と人の暮らしが、場所ごとにどう違うかを扱う学問です。",
+    "culture": "文化は、ある集団が長い時間をかけて作った、言葉・作法・表現・道具のまとまりです。",
+    "linux": "Linux は、自由に中身を見て改変できる設計の OS で、サーバーの大半を動かしています。",
+    "web": "ウェブは、文書をリンクで繋いで、ブラウザからたどれる形にした情報の仕組みです。",
+    "gift": "贈り物は、気持ちを物の形に変えて相手に渡す行為で、選ぶ時間に意味があります。",
+    "festival": "行事は、季節や人生の区切りに、決まった形で繰り返される集まりや祝い事です。",
+    "safety": "防災は、災害が起きる前に備え、起きたときの被害を小さくする取り組みです。",
+    "money_help": "行政は、暮らしに関わる手続きと制度を、公共の側で担う仕組みです。",
+    "sport_life": "運動は、体を動かして筋力と持久力を保つ習慣です。",
+}
+
+
+# v1 から残す項目に、後から人が書いた「一人称の感想」を足す（「好きなXは?」に答えられるようにする）
+LEGACY_OPINIONS = {
+    "health": "体調が良い日は、それだけで一日がうまくいくと思います。無理をしない範囲で整えたいです。",
+    "food": "私は温かい汁物がある食事が好きです。一品足すだけで満足度が上がります。",
+    "cook": "料理は段取りが九割だと思います。切り終わってから火を付けると慌てません。",
+    "english": "英語は、まず声に出して慣れるほうが文法より先に進むと思います。",
+    "language": "言葉を学ぶと、見えなかった分類が見えるようになるのが面白いところです。",
+    "science": "「なぜ」を一つずつ潰していく態度が、科学のいちばん良い部分だと思います。",
+    "economy": "数字の動きより、その裏にある人の選択を考えると分かりやすいです。",
+    "news": "見出しだけで判断せず、本文の数字と日付を確認する癖がいちばんだと思います。",
+    "sport": "見るのもするのも好きです。特に、勝負が決まる直前の静けさが印象に残ります。",
+    "transport": "移動時間は、本を読むのにちょうどいい長さだと思います。",
+    "polite": "敬語は完璧でなくても、丁寧に話そうとする姿勢が伝われば十分だと思います。",
+    "advice": "答えを出すより、状況を整理するほうが役立つことが多いと思います。",
+    "history": "年号より、その時代に生きた人の選択を追うほうが面白いと思います。",
+    "geography": "地図を見ると、その土地の暮らしが想像できて好きです。",
+    "culture": "日常の中に残っている作法を見ると、その土地の考え方が分かります。",
+    "linux": "中身を見て直せる、という自由がいちばんの魅力だと思います。",
+    "web": "リンクをたどって別の場所へ行ける、という単純な仕組みが好きです。",
+    "gift": "贈り物は値段より、相手の話を覚えていたことが伝わるかどうかだと思います。",
+    "festival": "季節の行事は、一年に区切りを付けてくれるのが良いところです。",
+    "safety": "備えは面倒ですが、一度整えると気持ちが静かになります。",
+    "money_help": "手続きは面倒でも、一度調べてしまえば二度目は楽になります。",
+}
+
+
+def _lst(v) -> list[str]:
+    if v is None:
+        return []
+    if isinstance(v, str):
+        return [v] if v.strip() else []
+    return [str(x) for x in v if str(x).strip()]
+
+
+def legacy_to_v2(it: dict) -> dict:
+    """v1 のエントリを v2 の形に変換する（questions/answers → qa、def を補う）。"""
+    qs = _lst(it.get("questions"))
+    ans = _lst(it.get("answers"))
+    qa: list[list[str]] = []
+    for i, q in enumerate(qs):
+        if i < len(ans):
+            qa.append([q, ans[i]])
+    facts = _lst(it.get("facts"))
+    topic = it.get("topic", "")
+    dfn = LEGACY_DEFS.get(it.get("id", "")) or ""
+    if not dfn and facts:
+        dfn = facts[0]
+    if not dfn:
+        dfn = f"{topic}は、暮らしの中でよく話題になる事柄です。"
     return {
-        "_comment": "Snipher 知識ベース。tools/build_kb.py から生成される（手で編集しない）。",
-        "version": 1,
-        "items": K,
+        "id": it.get("id", topic),
+        "topic": topic,
+        "cat": (_lst(it.get("tags")) or ["生活"])[0],
+        "aliases": _lst(it.get("aliases")) or [topic],
+        "tags": _lst(it.get("tags")),
+        "def": dfn,
+        "facts": facts,
+        "why": [],
+        "how": [],
+        "when": "",
+        "where": "",
+        "who": "",
+        "cost": "",
+        "tips": [],
+        "opinion": LEGACY_OPINIONS.get(it.get("id", ""), ""),
+        "qa": qa,
+        "followups": _lst(it.get("followups")),
+        "related": [],
+        "verbs": _lst(it.get("verbs")),
+        "_legacy": True,
+    }
+
+
+def _richness(it: dict) -> int:
+    """項目の情報量（どちらを残すかの判定に使う）。"""
+    return (len(it.get("def", "")) // 10
+            + 12 * len(it.get("facts", []))
+            + 10 * len(it.get("qa", []))
+            + 6 * len(it.get("how", []))
+            + 6 * len(it.get("why", []))
+            + 4 * len(it.get("tips", []))
+            + (4 if it.get("opinion") else 0)
+            + (3 if it.get("when") else 0) + (3 if it.get("where") else 0)
+            + (3 if it.get("cost") else 0) + (3 if it.get("who") else 0))
+
+
+def merge() -> tuple[list[dict], list[str]]:
+    """新しい内容（kb_data）を優先して、v1 のテーブルと 1 つに束ねる。"""
+    notes: list[str] = []
+    new = new_items()
+    errs = validate_new(new)
+    if errs:
+        raise SystemExit("kb_data の検証に失敗しました:\n  " + "\n  ".join(errs[:40]))
+
+    by_id: dict[str, dict] = {}
+    by_topic: dict[str, dict] = {}
+    for it in new:
+        by_id[it["id"]] = it
+        by_topic[it["topic"]] = it
+
+    for old in items():
+        if old.get("id") in SUPERSEDED:
+            continue
+        v2 = legacy_to_v2(old)
+        # 同じ話題を新しい側が持っていれば、そちらを残す
+        clash = by_topic.get(v2["topic"]) or by_id.get(v2["id"])
+        if clash is not None:
+            if _richness(v2) > _richness(clash):
+                notes.append(f"v1 を採用: {v2['topic']}")
+                by_topic.pop(clash["topic"], None)
+                by_id.pop(clash["id"], None)
+                by_id[v2["id"]] = v2
+                by_topic[v2["topic"]] = v2
+            else:
+                notes.append(f"v2 を採用(v1 を破棄): {v2['topic']}")
+            continue
+        by_id[v2["id"]] = v2
+        by_topic[v2["topic"]] = v2
+
+    merged = list(by_id.values())
+
+    # 汎用語（好き/暇/咲く …）は alias から落とす。これだけでは話題を特定できないため。
+    for it in merged:
+        keep = [a for a in it["aliases"] if a not in GENERIC_ALIASES or a == it["topic"]]
+        it["aliases"] = keep or [it["topic"]]
+
+    # alias の重複を解消する（同じ alias が複数の話題を指すと検索がぶれる）
+    owner: dict[str, dict] = {}
+    for it in sorted(merged, key=lambda x: -_richness(x)):
+        keep: list[str] = []
+        for a in dict.fromkeys(it.get("aliases") or []):
+            if a == it["topic"]:
+                keep.append(a)
+                owner.setdefault(a, it)
+                continue
+            prev = owner.get(a)
+            if prev is None:
+                owner[a] = it
+                keep.append(a)
+            else:
+                notes.append(f"alias 重複を解消: {a} → {prev['topic']}（{it['topic']} から除去）")
+        it["aliases"] = keep or [it["topic"]]
+
+    # 出力の形を整える（v1 互換の questions/answers も残す）
+    out: list[dict] = []
+    for it in sorted(merged, key=lambda x: (x.get("cat", ""), x["topic"])):
+        qa = [[str(q), str(a)] for q, a in (it.get("qa") or [])]
+        row = {
+            "id": it["id"],
+            "topic": it["topic"],
+            "cat": it.get("cat", ""),
+            "aliases": it.get("aliases") or [it["topic"]],
+            "tags": it.get("tags") or [],
+            "def": it.get("def", ""),
+            "facts": it.get("facts", []),
+            "why": it.get("why", []),
+            "how": it.get("how", []),
+            "when": it.get("when", ""),
+            "where": it.get("where", ""),
+            "who": it.get("who", ""),
+            "cost": it.get("cost", ""),
+            "tips": it.get("tips", []),
+            "opinion": it.get("opinion", ""),
+            "qa": qa,
+            "questions": [q for q, _ in qa],
+            "answers": [a for _, a in qa],
+            "followups": it.get("followups", []),
+            "related": it.get("related", []),
+            "verbs": it.get("verbs", []),
+        }
+        out.append(row)
+    return out, notes
+
+
+def check_quality(rows: list[dict]) -> list[str]:
+    """書き出し前の最終チェック（日本語として壊れている項目を弾く）。"""
+    bad: list[str] = []
+    latin = re.compile(r"[a-zA-Z]{12,}")
+    for r in rows:
+        if not r["def"]:
+            bad.append(f"{r['id']}: 定義がありません")
+        if not r["facts"] and not r["qa"]:
+            bad.append(f"{r['id']}: 事実も問答もありません")
+        for a in r["aliases"]:
+            if len(a) < 1 or len(a) > 24:
+                bad.append(f"{r['id']}: alias が不自然です → {a!r}")
+        for field in ("def", "opinion", "when", "where", "who", "cost"):
+            v = r.get(field) or ""
+            if v and latin.search(v):
+                bad.append(f"{r['id']}.{field}: 英字が長すぎます → {v[:40]}")
+    return bad
+
+
+def build() -> dict:
+    rows, notes = merge()
+    bad = check_quality(rows)
+    if bad:
+        raise SystemExit("品質チェックに失敗しました:\n  " + "\n  ".join(bad[:40]))
+    n_def = sum(1 for r in rows if r["def"])
+    return {
+        "_comment": "Snipher 知識ベース v2。tools/build_kb.py + tools/kb_data/ から生成（手で編集しない）。",
+        "version": 2,
+        "items": rows,
+        "_notes": notes,
+        "_stats": {
+            "topics": len(rows),
+            "defs": n_def,
+            "facts": sum(len(r["facts"]) for r in rows),
+            "qa": sum(len(r["qa"]) for r in rows),
+            "how": sum(len(r["how"]) for r in rows),
+            "why": sum(len(r["why"]) for r in rows),
+            "opinions": sum(1 for r in rows if r["opinion"]),
+            "followups": sum(len(r["followups"]) for r in rows),
+            "aliases": sum(len(r["aliases"]) for r in rows),
+            "sentences": sum(
+                (1 if r["def"] else 0) + len(r["facts"]) + len(r["why"]) + len(r["how"])
+                + len(r["tips"]) + len(r["qa"]) * 2 + len(r["followups"])
+                + (1 if r["opinion"] else 0)
+                + sum(1 for k in ("when", "where", "who", "cost") if r.get(k))
+                for r in rows),
+        },
     }
 
 
 def main(argv: list[str]) -> int:
     payload = build()
+    stats = payload["_stats"]
     text = json.dumps(payload, ensure_ascii=False, indent=1) + "\n"
     check = "--check" in argv
     if check:
@@ -635,11 +899,14 @@ def main(argv: list[str]) -> int:
         print("kb.json is up to date" if same else "kb.json is STALE (run: python tools/build_kb.py)")
         return 0 if same else 1
     OUT.write_text(text, encoding="utf-8")
-    K = payload["items"]
-    n_facts = sum(len(i["facts"]) for i in K)
-    n_q = sum(len(i["questions"]) for i in K)
-    n_a = sum(len(i["answers"]) for i in K)
-    print(f"wrote {OUT} : {len(K)} topics, {n_facts} facts, {n_q} questions, {n_a} answers")
+    print(f"wrote {OUT}")
+    print(f"  topics={stats['topics']} defs={stats['defs']} facts={stats['facts']} qa={stats['qa']} "
+          f"how={stats['how']} why={stats['why']} opinions={stats['opinions']}")
+    print(f"  aliases={stats['aliases']} sentences={stats['sentences']} "
+          f"size={OUT.stat().st_size / 1024:.0f} KiB")
+    if "--verbose" in argv:
+        for n in payload["_notes"]:
+            print("   -", n)
     return 0
 
 
