@@ -598,10 +598,16 @@ class KnowledgeBase:
 
     def exact_topic(self, query: str) -> dict | None:
         """発話全体が 1 つの話題名と一致する場合（「暇」「猫」のような一言発話）。"""
-        q = _strip_punct(query)
+        raw = str(query or "")
+        q = _strip_punct(raw)
         q = re.sub(r"(とは|って|は|が|を|の|ですか|でしょうか|について|のこと|何|なん)+$", "", q)
         if not q:
             return None
+        # 純粋な数字の一言 (「67」) は年齢・数量の可能性が高く、話題名への
+        # 即断はしない。定義マーカー (とは/って何/意味) がある場合のみ通す。
+        if re.fullmatch(r"[0-9０-９\s.,．，]+", q):
+            if not re.search(r"(とは|って何|意味|定義|何|なん)", raw):
+                return None
         for i in self.index.topics_of(q):
             if self.index.kind_of(q, i) in ("topic", "alias", "tag"):
                 return self.items[i]
@@ -752,6 +758,12 @@ class KnowledgeBase:
         """発話に合う材料があれば返し、無ければ None（= 知らない）。"""
         if not self.items:
             return None
+        # 純粋な数字・記号だけ (「67」「あ」) は話題特定しない。
+        # 定義マーカー (とは/って何/意味) がある場合のみ、数字ミーム等へ通す。
+        _stripped = re.sub(r"[\s。、！？!?・…「」『』()（）:：;；〜~\-_]", "", str(query or ""))
+        if _stripped and re.fullmatch(r"[0-9０-９.,．，]+", _stripped):
+            if not re.search(r"(とは|って何|意味|定義)", str(query or "")):
+                return None
         # 複合質問の短い常識は、単語 BM25 だけに任せると「夜」か「挨拶」の
         # どちらか一方へ寄る。両方の語が揃った場合は意味を確定させる。
         normalized_query = normalize(query)
