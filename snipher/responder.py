@@ -20,6 +20,7 @@ from pathlib import Path
 from .generator import Generator
 from .lexicon import Lexicon
 from .parser import Parser
+from .tasks import TaskRouter
 
 _RULE_CONFIDENCE = 0.95
 
@@ -47,6 +48,7 @@ class Responder:
         self.lex = lexicon or Lexicon()
         self.parser = parser or Parser(self.lex)
         self.gen = generator or Generator(self.lex)
+        self.tasks = TaskRouter()
         tables = _load_tables()
         self.intents = tables.get("intents", [])
         self.question_tbl = tables.get("question", {})
@@ -57,6 +59,23 @@ class Responder:
         """ユーザー発話 → 返答。{"text","intent","confidence","use_generator","fixes_hint"}"""
         clean = self._normalize(text)
         topic = self._find_topic(text)
+
+        # 計算・コード・比較は、会話テーブルより先に厳密な道具へ渡す。
+        # Responder 単体を使う古い統合コードでも、KB の近い話題を誤返答しない。
+        try:
+            task = self.tasks.answer(text, web=False)
+        except Exception:  # noqa: BLE001
+            task = None
+        if task is not None:
+            return {
+                "text": task.text,
+                "base_text": task.text,
+                "intent": "task",
+                "topic": task.metadata.get("item") if task.metadata else None,
+                "confidence": round(float(task.confidence), 4),
+                "use_generator": False,
+                "task": task.as_dict(),
+            }
 
         # 1) キーワード一致の意図テーブル
         for intent in self.intents:

@@ -82,7 +82,8 @@ QTYPE_PATTERNS: tuple[tuple[str, tuple[str, ...]], ...] = (
                  "美味しい", "楽しい", "興味", "推し")),
     ("count", ("いくつ", "何個", "何種類", "何匹", "何本")),
     ("def", ("とは", "って何", "とは何", "何ですか", "なんですか", "どういうもの", "どんなもの",
-             "何者", "どういう", "意味", "定義", "どんな")),
+             "何者", "どういう", "意味", "定義", "どんな", "なんという", "何という", "何と言う",
+             "なんて言う", "何て言う", "呼び方")),
 )
 
 # 困りごとのサイン（定義より tips / qa を優先する）
@@ -751,6 +752,19 @@ class KnowledgeBase:
         """発話に合う材料があれば返し、無ければ None（= 知らない）。"""
         if not self.items:
             return None
+        # 複合質問の短い常識は、単語 BM25 だけに任せると「夜」か「挨拶」の
+        # どちらか一方へ寄る。両方の語が揃った場合は意味を確定させる。
+        normalized_query = normalize(query)
+        if "夜" in normalized_query and any(x in normalized_query for x in ("挨拶", "あいさつ")):
+            greeting = next((it for it in self.items if str(it.get("topic")) == "挨拶"), None)
+            if greeting is not None:
+                chosen = {"item": greeting, "index": self.items.index(greeting), "score": 1.0,
+                          "coverage": 1.0, "covered_n": 2, "word_hits": ["夜", "挨拶"],
+                          "topic_hit": True, "via": "semantic_shortcut"}
+                return self._material(
+                    chosen, question_type(query), query,
+                    ("夜の挨拶", "夜の挨拶は「こんばんは」です。", 1.0),
+                )
         words, word_score, word_hits = self.match_words(query)
         content = {w for w in words if w not in _FUNC_WORDS}
         qtype = question_type(query)

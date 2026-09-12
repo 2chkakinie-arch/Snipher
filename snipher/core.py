@@ -46,6 +46,8 @@ from .knowledge import KnowledgeBase
 from .lfm.assist import AssistConfig, HybridAssist
 from .lfm.config import DEFAULT_GGUF_QUANT, LfmConfig, is_serverless
 from .polisher import Polisher
+from .research import ResearchEngine
+from .tasks import TaskRouter
 
 log = logging.getLogger(__name__)
 
@@ -89,6 +91,10 @@ class SnipherCore:
         self._light_state = "unchecked"        # unchecked|ready|absent|off|error
         self._remote = None
         self.kb = KnowledgeBase.shared()
+        # ---- 道具層（厳密計算・コード・現在情報） -------------------------- #
+        # ResearchEngine はネットワークを行わず、必要判定後にだけ fetch する。
+        self.research = ResearchEngine()
+        self.tasks = TaskRouter(self.research)
         # ---- 文章生成（composer）と流暢さの審判（n-gram LM） ---- #
         self._composer = None
         self._lm = None
@@ -247,11 +253,11 @@ class SnipherCore:
             return self._lm
         if self._lm_state in ("absent", "error") and want != "on":
             return None
-        from . import lm as lm_mod
-
         try:
+            from . import lm as lm_mod
             model = lm_mod.shared()
         except Exception:  # noqa: BLE001
+            # numpy が無い最小環境でも、composer と道具層は動かし続ける。
             model = None
         if model is None or not model.is_ready:
             self._lm_state = "absent" if want != "on" else "error"
@@ -270,7 +276,8 @@ class SnipherCore:
         if self._composer is None:
             from .composer import Composer
 
-            self._composer = Composer(kb=self.kb, polisher=self.polisher, lm=self.lm())
+            self._composer = Composer(kb=self.kb, polisher=self.polisher, lm=self.lm(),
+                                      task_router=self.tasks)
         return self._composer
 
     def judge(self, text: str, core=None, lm=None) -> dict:
@@ -766,6 +773,7 @@ class SnipherCore:
                                                        "params": 0}
         st["lm_ready"] = lm is not None
         st["knowledge"] = self.kb.stats() if self.kb is not None else None
+        st["research"] = self.research.status()
         st["neural_ready_any"] = self.any_neural()
         return st
 
@@ -812,14 +820,28 @@ class SnipherCore:
     # ------------------------------------------------------------------ #
     # 会話（内部パイプライン）
     # ------------------------------------------------------------------ #
-    def route_of(self, draft: dict, mode: str) -> str:
+    def route_of(self, draft: dict, mode: str, user_text: str = "",
+                 web: bool | None = None) -> str:
         """auto モードの経路判定。
 
-            確実な定形               → instant（数ミリ秒・ニューラル不使用）
-            曖昧/自由応答 + 重いコア → neural（LFM2.5 フルウェイト or リモート）
-            曖昧/自由応答 + 蒸留コア → light / knowledge（内蔵ニューラルコア）
-            ニューラル一切なし        → fallback（高速コアのみ）
+            厳密タスク（計算・コード・検索） → instant（道具層の確定結果）
+            確実な定形                     → instant（数ミリ秒・ニューラル不使用）
+            曖昧/自由応答 + 重いコア         → neural（LFM2.5 フルウェイト or リモート）
+            曖昧/自由応答 + 蒸留コア         → light / knowledge（内蔵ニューラルコア）
+            ニューラル一切なし              → fallback（高速コアのみ）
+
+        ``user_text`` は後方互換で任意。タスク判定は入力そのものを見ないと
+        できないため、チャット経路からだけ渡す。
         """
+        # 仕事の結果を小さな生成モデルで上書きすると、正解が壊れる。
+        # これは mode=lfm の強制指定よりも優先する（計算結果を確率生成で
+        # 書き換えないための安全規則）。
+        if user_text:
+            try:
+                if self.tasks.classify(user_text, web=web) is not None:
+                    return ROUTE_INSTANT
+            except Exception:  # noqa: BLE001
+                pass
         if mode == "fast":
             return ROUTE_INSTANT
         if mode == "light":
@@ -848,7 +870,8 @@ class SnipherCore:
     def stream_reply(self, messages: list[dict], *, mode: str = "auto",
                      max_new_tokens: int | None = None, temperature: float | None = None,
                      top_k: int | None = None, repetition_penalty: float | None = None,
-                     use_template: bool = True, system_prompt: str | None = None):
+                     use_template: bool = True, system_prompt: str | None = None,
+                     web: bool | None = None):
         """SSE 用イベントジェネレータ。Snipher Core の内部パイプライン本体。"""
         last_user = next(
             (m.get("content", "") for m in reversed(messages) if m.get("role") == "user"), ""
@@ -865,7 +888,7 @@ class SnipherCore:
         # 2) 高速コアの下書き（数ミリ秒）
         t0 = time.time()
         draft = self.assist.draft(last_user)
-        route = self.route_of(draft, mode)
+        route = self.route_of(draft, mode, user_text=last_user, web=web)
 
         if route == ROUTE_NEURAL:
             yield from self._neural_reply(messages, draft, mode,
@@ -877,13 +900,14 @@ class SnipherCore:
             return
 
         if route in (ROUTE_LIGHT, ROUTE_KNOWLEDGE):
-            yield from self._light_reply(messages, draft, route, mode=mode)
+            yield from self._light_reply(messages, draft, route, mode=mode, web=web)
             return
 
         # 3) instant / fallback: ニューラルを 1 トークンも使わず、その場で文を組み立てる
-        yield from self._fast_reply(messages, draft, route, t0=t0)
+        yield from self._fast_reply(messages, draft, route, t0=t0, web=web)
 
-    def _fast_reply(self, messages: list[dict], draft: dict, route: str, *, t0: float | None = None):
+    def _fast_reply(self, messages: list[dict], draft: dict, route: str, *,
+                    t0: float | None = None, web: bool | None = None):
         """⚡ 高速経路（instant / fallback）。ニューラルを 1 トークンも使わない。
 
         v2 では「定型文の引き当て」ではなく **composer がその場で文を組み立てる**:
@@ -915,13 +939,14 @@ class SnipherCore:
         reply = None
         if composer is not None:
             try:
-                reply = composer.compose(last_user, history=messages)
+                reply = composer.compose(last_user, history=messages, web=web)
             except Exception:  # noqa: BLE001
                 log.debug("composer が失敗", exc_info=True)
         if reply is not None and reply.text:
             from .composer import validate as _validate
 
-            ok, _why = _validate(reply.text, max_len=220)
+            authoritative = bool((reply.notes or {}).get("authoritative"))
+            ok, _why = (True, "authoritative") if authoritative else _validate(reply.text, max_len=220)
             if ok and len(reply.text) >= 4:
                 text = reply.text
                 lm_info = None
@@ -934,12 +959,15 @@ class SnipherCore:
                     except Exception:  # noqa: BLE001
                         lm_info = None
                 info.update({
-                    "engine": fallback_engine if route == ROUTE_FALLBACK else "Snipher composer (高速経路)",
-                    "template_mode": "composer", "plan": reply.plan,
+                    "engine": (f"Snipher tool ({(reply.notes or {}).get('task', {}).get('kind', 'task')})"
+                               if authoritative else fallback_engine if route == ROUTE_FALLBACK
+                               else "Snipher composer (高速経路)"),
+                    "template_mode": "tool-grounded" if authoritative else "composer", "plan": reply.plan,
                     "confidence": round(float(reply.confidence), 4),
                     "fixes": info["fixes"] + ["composer"],
                     "knowledge": reply.knowledge, "lm": lm_info,
-                    "degraded": False, "source": "composer",
+                    "degraded": False, "source": "task" if authoritative else "composer",
+                    "task": (reply.notes or {}).get("task") if authoritative else None,
                     "sentences": len(reply.sentences),
                 })
 
@@ -958,6 +986,7 @@ class SnipherCore:
             "plan": info["plan"],
             "confidence": info["confidence"],
             "source": info["source"],
+            "task": info.get("task"),
             "seconds": round(time.time() - t0, 4),
         }
         if info["knowledge"]:
@@ -970,13 +999,15 @@ class SnipherCore:
             stats["degraded_to_base"] = info["degraded"]
             stats["acquire"] = self.acquire_status().get("phase")
         yield {"type": "assist", "mode": "rule", "confidence": draft.get("confidence"),
-               "route": route, "plan": info["plan"]}
+               "route": route, "plan": info["plan"],
+               "reason": "task_result" if info.get("task") else "rule_result"}
         yield {"type": "start", "engine": stats["engine"], "template_mode": stats["template_mode"]}
         for piece in _chunk_for_stream(text):
             yield {"type": "delta", "text": piece}
         yield {"type": "done", "text": text, "stats": stats}
 
-    def _light_reply(self, messages: list[dict], draft: dict, route: str, *, mode: str = "auto"):
+    def _light_reply(self, messages: list[dict], draft: dict, route: str, *,
+                     mode: str = "auto", web: bool | None = None):
         """✨ 内蔵ニューラルコア + 知識ベース + composer の協働経路。
 
         分担はこうです:
@@ -1008,7 +1039,7 @@ class SnipherCore:
         reply = None
         if composer is not None:
             try:
-                reply = composer.compose(last_user, history=messages)
+                reply = composer.compose(last_user, history=messages, web=web)
             except Exception:  # noqa: BLE001
                 log.debug("composer が失敗", exc_info=True)
         if reply is None:                                    # composer が動かない環境
@@ -1023,6 +1054,7 @@ class SnipherCore:
                                       if kb else None))
 
         info_kb = reply.knowledge
+        authoritative = bool((reply.notes or {}).get("authoritative"))
         material = bool(info_kb and info_kb.get("topic"))
         topic = str((info_kb or {}).get("topic") or "")
         text = str(reply.text or "").strip()
@@ -1030,7 +1062,8 @@ class SnipherCore:
             text = rule_text if conf >= self.assist.cfg.threshold else base_text
 
         yield {"type": "assist", "mode": "light", "route": route, "plan": reply.plan,
-               "confidence": conf, "reason": "knowledge_hit" if material else "uncertain_slot",
+               "confidence": conf,
+               "reason": "task_result" if authoritative else ("knowledge_hit" if material else "uncertain_slot"),
                "knowledge": info_kb}
 
         # ---- 2) 内蔵ニューラルコアの出番 --------------------------------------- #
@@ -1046,7 +1079,7 @@ class SnipherCore:
         stats_extra: dict = {}
 
         needs_follow = not bool(_re.search(r"(か|かな|でしょう)[。！？!?]", text))
-        if core is not None:
+        if core is not None and not authoritative:
             if material:
                 # 事実を伝えたあと、会話を続ける一文が **無ければ** だけ作らせる。
                 # 知識ベースの followups（人が書いた問い）があるなら、それを優先する
@@ -1142,7 +1175,11 @@ class SnipherCore:
         if composer is not None:
             fixes.append("composer")
         final = str(polished["text"] or text).strip() or text
-        if used_core:
+        if authoritative:
+            task_kind = str((reply.notes or {}).get("task", {}).get("kind") or "task")
+            engine = f"Snipher tool ({task_kind})"
+            template_mode = "tool-grounded"
+        elif used_core:
             engine = core.engine_name()
             template_mode = "distilled-numpy"
         elif material:
@@ -1170,6 +1207,7 @@ class SnipherCore:
             "fixes": fixes,
             "generated": chosen_from_model or bool(extra),
             "candidates": 1 + (1 if gen_text else 0),
+            "task": (reply.notes or {}).get("task") if authoritative else None,
             "knowledge": info_kb,
             "neural_confidence": round(report_conf, 4) if report_conf is not None else None,
             "lm_confidence": lm_conf,
@@ -1191,7 +1229,7 @@ class SnipherCore:
             self.ensure_started()
             stats["escalation"] = "queued_full_weights"
             stats["escalation_gate"] = self.cfg.light_gate
-        elif not used_core and not material:
+        elif not authoritative and not used_core and not material:
             stats["fallback_reason"] = "確信度が足りるので生成は見送りました"
         yield {"type": "done", "text": final, "stats": stats}
 

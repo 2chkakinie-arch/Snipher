@@ -22,6 +22,7 @@ from dataclasses import dataclass, field
 
 from .knowledge import GENERIC_ALIASES, KnowledgeBase, content_words, question_type
 from .polisher import Polisher
+from .tasks import TaskRouter
 
 # ---------------------------------------------------------------------- #
 # 発話の解析
@@ -426,12 +427,15 @@ class Composer:
     """発話と知識ベースの材料から、日本語の応答を組み立てる。"""
 
     def __init__(self, kb: KnowledgeBase | None = None, polisher: Polisher | None = None,
-                 lm=None, seed: int = 0):
+                 lm=None, seed: int = 0, task_router: TaskRouter | None = None):
         self.kb = kb if kb is not None else KnowledgeBase.shared()
         self.polisher = polisher or Polisher()
         self.lm = lm                    # 任意: n-gram LM（候補の採点に使う）
         self.seed = seed
         self.turn = 0
+        # 定型文より先に、計算・コード・比較・現在情報を扱う厳密な道具層。
+        # TaskRouter は標準ライブラリだけで、必要な質問だけウェブへ出る。
+        self.tasks = task_router or TaskRouter()
 
     # ------------------------------------------------------------------ #
     def analyze(self, text: str) -> Utterance:
@@ -535,16 +539,48 @@ class Composer:
 
     # ------------------------------------------------------------------ #
     def compose(self, text: str, *, material: dict | None = None,
-                history: list[dict] | None = None, turn: int | None = None) -> Reply:
-        """応答を組み立てる。material が無ければ自分で知識ベースを引く。"""
+                history: list[dict] | None = None, turn: int | None = None,
+                web: bool | None = None) -> Reply:
+        """応答を組み立てる。
+
+        計算・コード・比較・現在情報は、知識ベースの話題当てより先に
+        ``TaskRouter`` を通す。これが無いと、例えば文章題の「鉛筆」を
+        買い物の説明へ誤ルーティングしてしまう。
+        """
         self.turn = int(turn if turn is not None else self.turn + 1)
-        u = self.analyze(text)
         history = history or []
         prev = _previous_assistant_texts(history)
 
+        # 厳密に解ける仕事は、生成モデルの確率や KB の近さで上書きしない。
+        try:
+            task = self.tasks.answer(text, web=web, history=history)
+        except Exception:  # noqa: BLE001
+            task = None
+        if task is not None:
+            return Reply(
+                text=task.text,
+                plan=task.plan,
+                confidence=float(task.confidence),
+                knowledge=(
+                    {"task": task.kind, **task.metadata}
+                    if task.metadata else {"task": task.kind}
+                ),
+                sentences=_split(task.text) if "```" not in task.text else [task.text],
+                notes={"authoritative": task.authoritative, "task": task.as_dict()},
+            )
+
+        u = self.analyze(text)
+
         if material is None:
             try:
-                material = self.kb.answer(text)
+                # オフライン指定で「今日」「最新」などを KB の古い材料で答えない。
+                # その場合は安全な案内へ落とし、ユーザーが web を許可した次の
+                # ターンで ResearchEngine に任せる。
+                current_needed, _reason = self.tasks.research.should_research(text, None)
+                if web is False and current_needed:
+                    material = None
+                else:
+                    material = self.kb.answer(text)
             except Exception:  # noqa: BLE001
                 material = None
         if material is not None:
