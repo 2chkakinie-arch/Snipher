@@ -187,6 +187,13 @@
       </label>
       <label>温度 <input id="temperature" type="range" min="0" max="1" step="0.05" value="0.1"><span class="val" id="temperatureVal">0.1</span></label>
       <label>最大応答 <input id="maxNew" type="number" min="16" max="512" step="16" value="128"> トークン</label>
+      <label>ウェブ調査
+        <select id="webSel">
+          <option value="auto" selected>自動（最新情報・出典が必要なときだけ Edge 検索）</option>
+          <option value="on">常に検索を許可</option>
+          <option value="off">使わない（オフライン）</option>
+        </select>
+      </label>
       <label>テンプレート
         <select id="templateSel">
           <option value="auto">自動（native → 内蔵 ChatML → なし）</option>
@@ -426,6 +433,7 @@ async function send() {
         mode: $("modeSel").value,
         temperature: Number($("temperature").value),
         max_new_tokens: Number($("maxNew").value),
+        web: $("webSel").value,
         use_template: useTemplate,
       }),
       signal: aborter.signal,
@@ -452,6 +460,8 @@ async function send() {
           } else if (ev.mode === "light") {
             const kn = ev.knowledge && ev.knowledge.topic ? ` · 知識ベース: ${ev.knowledge.topic}` : "";
             an.textContent = `✨ 確率的に不安な応答（確度 ${((ev.confidence ?? 0) * 100).toFixed(0)}%）→ 内蔵ニューラルコア（LFM2.5 蒸留）が生成します${kn}`;
+          } else if (ev.reason === "task_result") {
+            an.textContent = `🧰 厳密タスク（確度 ${((ev.confidence ?? 1) * 100).toFixed(0)}%）→ 計算・コード・検索の専用道具`;
           } else {
             an.textContent = `⚡ 確実な定形応答（確度 ${((ev.confidence ?? 1) * 100).toFixed(0)}%）→ 高速コアが即答`;
           }

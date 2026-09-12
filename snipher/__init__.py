@@ -27,6 +27,8 @@ from .generator import Generator  # noqa: E402
 from .polisher import Polisher  # noqa: E402
 from .responder import Responder  # noqa: E402
 from .engine import SnipherEngine  # noqa: E402
+from .research import HtmlFetcher, ResearchEngine, ResearchPolicy, edge_search, html_fetch  # noqa: E402
+from .tasks import TaskAnswer, TaskRouter, safe_arithmetic  # noqa: E402
 
 __all__ = [
     "Lexicon",
@@ -37,5 +39,13 @@ __all__ = [
     "Polisher",
     "Responder",
     "SnipherEngine",
+    "HtmlFetcher",
+    "ResearchEngine",
+    "ResearchPolicy",
+    "edge_search",
+    "html_fetch",
+    "TaskAnswer",
+    "TaskRouter",
+    "safe_arithmetic",
     "DEFAULT_WEIGHTS",
 ]

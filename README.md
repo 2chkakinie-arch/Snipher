@@ -332,6 +332,40 @@ P(w) = softmax( S(w) / temperature )
 
 ---
 
+## 道具層: 計算・コード・現在情報
+
+知識ベースの近い話題を返すだけでは、文章題やプログラミング依頼に答えられません。
+Snipher には composer の前に **TaskRouter** を置き、仕事ごとに適した小さな道具へ
+分岐します。
+
+| 入力 | 道具 | 動作 |
+|---|---|---|
+| 単価×個数、四則、一次/二次方程式 | `tasks.py` の安全な計算器 | `eval` を使わず Fraction で式・途中計算・答えを返す |
+| Python / JavaScript の依頼 | コードタスク | よくある処理は実行可能なコード例、未知の仕様は雛形と必要な仕様を返す |
+| Node.js と Next.js の比較 | 比較タスク | 実行環境と React フレームワークを混同せず、用途別に判断する |
+| 最新、今日、ニュース、価格、天気、検索、出典 | `research.py` | 必要性を先に判定し、必要なときだけ Edge/Bing HTML 検索へ進む |
+
+### Edge HTML 検索 / html-fetch
+
+`snipher.research` はブラウザ自動操作を常用せず、Edge に近い User-Agent で検索結果の
+HTML を取得します。`HTMLParser` で title・本文・リンクを抽出し、上位ページだけを
+並列取得します。サイズ、タイムアウト、HTTP(S) のみ、localhost/プライベート IP 拒否、
+短い TTL キャッシュを内蔵しているため、検索不要のターンはネットワークに触れません。
+Bing が利用できない場合は DuckDuckGo の HTML 結果へ自動でフォールバックします。
+
+```python
+from snipher.research import ResearchEngine
+
+result = ResearchEngine().research("今日のニュース", limit=5)
+for source in result.sources:
+    print(source["title"], source["url"])
+```
+
+計算・HTML 抽出・Edge スクレイピングはネットワークなしのテスト
+`tests/test_tasks.py` / `tests/test_research.py` で検査しています。
+
+---
+
 ## REST API
 
 | メソッド | パス | 説明 |
@@ -342,7 +376,10 @@ P(w) = softmax( S(w) / temperature )
 | POST | `/analyze` | `{"text": "..."}` を解析（文構造・助動詞・要点） |
 | POST | `/generate` | 確率的な日本語文の生成 |
 | GET | `/api/status` | Snipher Core の状態（バックエンド・自動取得・学習済み語彙） |
-| POST | `/api/chat` | SSE ストリーミング応答。`mode: auto/fast/lfm/light` |
+| POST | `/api/chat` | SSE ストリーミング応答。`mode: auto/fast/lfm/light`、`web: auto/on/off` |
+| POST | `/api/research` | Edge HTML 検索 + 上位ページ取得 + 出典 |
+| GET | `/api/search` | 軽量なウェブ検索（`?q=...&k=...`） |
+| GET/POST | `/api/fetch` | SSRF/サイズ制限付き html-fetch |
 | POST | `/api/complete` | 助動詞の補い（断片文の補完: ルール + 必要なら LFM2.5） |
 | GET | `/api/neural` | 内蔵ニューラルコア（蒸留スナップショット）の状態 |
 | POST | `/api/neural/probe` | 蒸留コアに生成・補完・採点させてみる |

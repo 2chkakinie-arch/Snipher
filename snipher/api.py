@@ -283,6 +283,11 @@ class ChatRequest(BaseModel):
     repetition_penalty: float | None = Field(None, ge=1.0, le=2.0)
     use_template: bool = Field(True, description="False でテンプレートなし生成")
     system_prompt: str | None = Field(None, max_length=2000)
+    # auto: 現在情報/出典が必要なときだけ Edge HTML 検索。on/off で明示指定。
+    web: str = Field("auto", pattern="^(auto|on|off)$",
+                     description="ウェブ調査: auto=必要時のみ / on=明示的に検索 / off=無効")
+    # JS クライアントや旧 API の bool 指定も受け付ける。
+    web_search: bool | None = Field(None, description="web の旧互換 bool。指定時は web より優先")
     mode: str = Field(
         "auto",
         pattern="^(auto|fast|lfm|neural|light)$",
@@ -346,6 +351,7 @@ def api_status():
         "lm": st.get("lm"),
         "composer": {"available": True, "engine": "Snipher composer (文の設計図)"},
         "knowledge": st.get("knowledge"),
+        "research": st.get("research"),
         "tiers": st.get("tiers"),
         "serverless": is_serverless(),
         "note": (None if ready else
@@ -485,6 +491,49 @@ def api_kb(q: str = "", k: int = 3):
             "answer": kb.answer(q), "results": kb.search(q, k)}
 
 
+class ResearchRequest(BaseModel):
+    query: str = Field(..., min_length=1, max_length=1000)
+    limit: int = Field(5, ge=1, le=10)
+    fetch_pages: int = Field(2, ge=0, le=3)
+    web: bool | None = Field(True, description="False ならネットワークを使わず判定だけ行う")
+
+
+@app.post("/api/research")
+def api_research(req: ResearchRequest):
+    """Edge/Bing HTML 検索と本文取得を行い、出典付き材料を返す。"""
+    result = core().research.research(req.query, explicit=req.web,
+                                      limit=req.limit, fetch_pages=req.fetch_pages)
+    return {"ok": True, **result.as_dict()}
+
+
+@app.get("/api/search")
+def api_search(q: str = "", k: int = 5, web: bool = True):
+    """軽量検索 API（/api/research の GET 互換）。"""
+    if not q.strip():
+        return {"ok": False, "error": "q is required"}
+    result = core().research.research(q, explicit=web, limit=max(1, min(10, int(k))), fetch_pages=0)
+    return {"ok": True, **result.as_dict()}
+
+
+class HtmlFetchRequest(BaseModel):
+    url: str = Field(..., min_length=8, max_length=2000)
+
+
+@app.post("/api/fetch")
+def api_fetch(req: HtmlFetchRequest):
+    """安全な HTML fetcher を直接使うデバッグ/統合 API。"""
+    result = core().research.html_fetch(req.url)
+    return {"ok": result.error is None, **result.as_dict()}
+
+
+@app.get("/api/fetch")
+def api_fetch_get(url: str = ""):
+    if not url.strip():
+        return {"ok": False, "error": "url is required"}
+    result = core().research.html_fetch(url)
+    return {"ok": result.error is None, **result.as_dict()}
+
+
 @app.get("/api/model/remote")
 def api_remote_status():
     """LFM2.5 フルウェイトのリモート委譲（任意設定）の疎通確認。"""
@@ -567,6 +616,8 @@ def api_chat(req: ChatRequest):
                 repetition_penalty=req.repetition_penalty,
                 use_template=req.use_template,
                 system_prompt=req.system_prompt,
+                web=(req.web_search if req.web_search is not None else
+                     (True if req.web == "on" else False if req.web == "off" else None)),
             ):
                 yield _sse(ev)
         except Exception as exc:  # noqa: BLE001
