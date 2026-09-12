@@ -2,20 +2,30 @@
 
 **LFM2.5-1.2B-JP を「内部構造」として動かす、高速で賢い日本語チャット AI**
 
-Snipher は 2 つの AI を並べたハイブリッドではありません。
-Liquid AI の **LFM2.5-1.2B-JP**（1.17B パラメータ / 32K context / 日英対応）が
-**Snipher 本体のニューラルコア**として内蔵され、確率的に不安な部分の文章生成・
-助動詞の補い・未知文字の学習・テンプレートがない時の生成を担います。
-挨拶などの確実な定形応答だけが数ミリ秒の高速コア（対話テーブル + 独自確率式 +
-polisher）で即答されるため、**速度を維持したまま LFM2.5 レベルの日常会話**ができます。
+Snipher は 2 つの AI を並べたハイブリッドではありません。Liquid AI の
+**LFM2.5-1.2B-JP**（1.17B パラメータ / 32K context / 日英対応）の仕事を
+**Snipher 本体の内側**に統合した設計です: 確率的に不安な部分の文章生成・
+助動詞の補い・未知文字の学習・テンプレートがない時の生成をニューラルコアが担い、
+挨拶などの確実な定形応答だけを数ミリ秒の高速コア（対話テーブル + 独自確率式 +
+polisher）が即答するので、**今の速度を保ったまま賢く**なります。
 
-- **全自動**: 起動するとモデルを自分で取得（レジューム対応・マルチソース）・
-  ロード・量子化します。**ファイルのアップロードなどは一切不要**
-- **CPU 最速**: llama.cpp + 公式 GGUF（Q4_K_M / 731MB）を自動選択。
-  torch しか無い環境では動的 INT8 量子化で動作
-- **シンプルなホワイトテーマ**のチャット UI（SSE ストリーミング・tok/s 表示）
-- 依存の重い部分（torch / llama-cpp-python）はオプション。
-  どちらも無い環境では超小型エンジン（502+ パラメータ）が自動フォールバック
+そして重要なのは、そのニューラルコアが **3 階層の自動選択**になっていること。
+Vercel のようなサーバーレスでは 731MB(GGUF) / 2.2GB(safetensors) を読む物理的な
+余地が無い（関数バンドル 500MB・永続ディスク無し・コールドスタート）ので、
+**LFM2.5 と同じアーキテクチャを蒸留した 92 万パラメータのスナップショット
+（NumPy・約 0.9MB）をリポジトリに同梱**して動かします。ダウンロードも
+アップロードも不要、ロードは数十ミリ秒です。
+
+- **全自動**: 常駐環境（VPS / Render / Docker）では起動時にフルウェイトを
+  自分で取得（レジューム対応・マルチソース）・ロード・量子化。
+  サーバーレスでは同梱スナップショット＋BM25 知識ベースで即稼働。
+- **速度維持**: 即答経路はニューラルコアを 1 トークンも消費しない（1〜15ms）。
+  生成経路も 1 文字 2〜3ms（NumPy）で、SSE ストリーム表示。
+- **どんな会話でも**: 語彙テーブル（名詞 770 / 動詞 226 / 形容詞 164 …）と
+  知識ベース（66 トピック / 187 事実）を土台に、事実検索＋生成で応答。
+- **壊れない**: フルウェイト取得失敗・依存なし・オフライン、いずれでも
+  高速コアが安全な応答を返す。
+- シンプルな**ホワイトテーマ**のチャット UI（SSE ストリーミング・tok/s 表示）
 
 ---
 
@@ -30,23 +40,48 @@ polisher）で即答されるため、**速度を維持したまま LFM2.5 レ�
    │    ├─ 確率的な下書き   独自確率式が各スロットの softmax 確度を記録   │
    │    └─ 助動詞の補い     文末・助動詞・文体の欠落をルールで即時修復    │
    │                                                              │
-   │ ② ニューラルコア = LFM2.5-1.2B-JP（内部構造）                   │
-   │    ├─ 不安な部分の生成  下書きの確度が低い/質問/雑談 →              │
-   │    │                  会話履歴ごと LFM2.5 が本文をストリーム生成    │
-   │    ├─ 助動詞の補い     LFM 出力にも polisher を適用（二重に補完）    │
-   │    ├─ 未知文字の学習   𠮷 や絵文字を学習済み埋め込みの合成で          │
-   │    │                  1 トークン化（入力時に自動検出・自動学習）      │
-   │    └─ テンプレート     native → 内蔵 ChatML → なし（素の生成）      │
+   │ ② 知識ベース（BM25・約 0.1ms）                                 │
+   │    └─ snipher/data/kb.json を検索し事実を引用（確度が低ければ不採用） │
    │                                                              │
-   │ ③ モデル自動取得（起動時・全自動）                               │
-   │    キャッシュ → SNIPHER_LFM_URLS → 共有ミラー → HuggingFace 公式   │
-   │    → hf-mirror（Range レジューム・破損検証・失敗時は自動再試行）      │
+   │ ③ ニューラルコア（LFM2.5 の仕事）・3 階層を自動選択                │
+   │    T1 ローカル フルウェイト  llama.cpp(GGUF 731MB) / torch(INT8)  │
+   │       … 常駐環境では起動時に全自動で取得・量子化・ロード            │
+   │    T2 リモート委譲         SNIPHER_LFM_REMOTE_URL のホストに生成を依頼│
+   │       … Vercel から VPS 常駐の LFM2.5 をそのまま使える            │
+   │    T3 内蔵蒸留コア         LFM2.5 Hybrid と同じ構造の小型 LM        │
+   │       … 語彙テーブル＋kb.json から自動蒸留 / int8 で同梱（0.9MB）    │
+   │                                                              │
+   │    共通の役割: 不安な部分の生成 / 助動詞の補い / perplexity でゲート  │
+   │    どの階層の出力も必ず polisher を通して整形（暴走しても壊れない）     │
    └──────────────────────────────────────────────────────────────┘
 ```
 
-- 確実な定形応答は LFM を 1 トークンも消費せず即答 → **従来の速度を維持**
-- 確率的に不安な応答だけ LFM2.5 が生成 → **賢さは LFM2.5 レベル**
-- LFM が失敗・未ロードでも下書き/骨子で必ず応答 → **壊れない**
+- 確実な定形応答はニューラルコアを 1 トークンも消費せず即答 → **従来の速度を維持**
+- 確率的に不安な応答だけニューラルコアが生成 → **賢さは LFM2.5 レベルに段階昇格**
+- 内蔵蒸留コアの perplexity 確信度が閾値を切ったときだけ、フルウェイトの
+  起動を裏で進める（応答は待たせない）
+- 生成が失敗・空でも下書き/骨子で必ず応答 → **壊れない**
+
+### 内蔵ニューラルコア（`snipher/neural/`）
+
+| 項目 | 内容 |
+|---|---|
+| 構造 | ShortConv → SelfAttn → GLU の 6 ブロック Hybrid（LFM2 と同じ系譜）/ RMSNorm / SiLU ゲート |
+| パラメータ | 920,640（int8 量子化 + 行別スケール → 重み 876 KiB） |
+| 語彙 | 文字レベル 720（未知文字が原理的に出ない） |
+| 学習データ | 語彙テーブル＋kb.json から自動生成した 28,572 文書（外部データ 0・手作業 0） |
+| 品質 | 文字 top-1 精度 **0.810** / perplexity **2.16**（val・10 epoch 約 18 分） |
+| 依存 | numpy のみ（torch / transformers / llama.cpp 不要） |
+| ロード | 数十ミリ秒・ダウンロード不要（Vercel でも即動く） |
+
+語彙や知識を増やしたら、スナップショットも自分で作り直せる（全部ローカル実行）:
+
+```bash
+python tools/build_lexicon.py            # 辞書テーブルをマージ + 文法検証
+python tools/build_kb.py                 # 知識ベース kb.json を再生成
+python tools/distill_neural.py           # 内蔵コアを再蒸留（10 epoch・約 13 分）
+python tools/distill_neural.py --profile tiny   # 数秒の検証用ビルド
+```
 
 ### バックエンド（自動選択）
 
@@ -121,6 +156,45 @@ python tools/fetch_model.py --quant Q8_0       # 他の量子化
 
 ---
 
+## 知識ベース（どんな話題でも引ける土台）
+
+`snipher/data/kb.json` は「会話で使い回せる事実の集合」です。
+`tools/build_kb.py` から生成し（手で編集しない）、検索は 1 クエリ **約 0.1ms**。
+
+    文字バイグラム + ASCII トークン化 → BM25(k1=1.4, b=0.72) → 確度ゲート
+
+- 発話を tokenize して上位トピックを引き、**クエリ覆盖率（coverage）と
+  alias ヒットで採用/不採用を判定**（BM25 の相対スコアはゲートに使わない）
+- 採用された事実はそのまま応答に使い、内蔵ニューラルコアには
+  「事実を伝えた後の会話の延续」だけを作らせる（ハルシネーションを減らす）
+- `kb.json` は学習データも兼ねる: 内蔵ニューラルコアの蒸留時は
+  この事実文がそのまま教師になる（知識を増やす → モデルも強くなる好循環）
+
+現状: **66 トピック / 187 事実 / 107 の質問 / 110 の応答**（天気・睡眠・防災・
+AI・日本語・猫・コーヒー…）。`python tools/build_kb.py` に項目を足せば、
+辞書テーブルと同じく再生成だけで知識が増えます。
+
+```bash
+curl -s "localhost:8000/api/kb?q=なぜ雨が降るの" | jq '.answer'
+```
+
+## 語彙テーブル（パラメータの本体）
+
+ルール/確率経路の品質はテーブル規模で決まる。`tools/build_lexicon.py` が
+唯一の編集窓口（生成物 `snipher/data/*.json` は直接触らない）:
+
+| テーブル | エントリ | | テーブル | エントリ |
+|---|---|---|---|---|
+| 名詞 | 770 | | 助動詞 | 51 |
+| 動詞 | 226 | | 副詞 | 93 |
+| 形容詞 | 164 | | 接続詞 | 35 |
+| 助詞 | 60 | | 文型パターン | 26 |
+| 意図（intents） | 71 | | コーパス文 | 51 |
+
+ビルド時に自動で **活用の整合性検証**（五段の語幹行、形容詞の活用級、
+キー/スロット名のホワイトリスト、topic_affinity の実在確認）を通すので、
+壊れた語彙が本番データに入ることはありません（`検証 OK` が出たら成功）。
+
 ## 未知文字の学習（LFM2.5 のパラメータを適用）
 
 - **自動**: 入力に `𠮷` や絵文字などの未知文字があると自動検出し、
@@ -165,12 +239,17 @@ P(w) = softmax( S(w) / temperature )
 |---------|------|------|
 | GET | `/` | ホワイトテーマのチャット UI |
 | GET | `/health` | ヘルスチェック |
-| GET | `/info` | 高速コアのモデル情報・パラメータ数 |
+| GET | `/info` | モデル情報・パラメータ総数（テーブル/知識ベース/蒸留コアの内訳つき） |
 | POST | `/analyze` | `{"text": "..."}` を解析（文構造・助動詞・要点） |
 | POST | `/generate` | 確率的な日本語文の生成 |
 | GET | `/api/status` | Snipher Core の状態（バックエンド・自動取得・学習済み語彙） |
-| POST | `/api/chat` | SSE ストリーミング応答。`mode: auto/fast/lfm` |
+| POST | `/api/chat` | SSE ストリーミング応答。`mode: auto/fast/lfm/light` |
 | POST | `/api/complete` | 助動詞の補い（断片文の補完: ルール + 必要なら LFM2.5） |
+| GET | `/api/neural` | 内蔵ニューラルコア（蒸留スナップショット）の状態 |
+| POST | `/api/neural/probe` | 蒸留コアに生成・補完・採点させてみる |
+| POST/GET | `/api/neural/rebuild` | 蒸留コアを自分で再ビルド（常駐環境のみ・progress 取得可） |
+| GET | `/api/kb` | 知識ベース検索（`?q=...`、`answer` は採用された返信材料） |
+| GET | `/api/model/remote` | LFM2.5 リモート委譲の疎通確認 |
 | GET | `/api/model/acquire` | 自動取得ジョブの進捗 |
 | POST | `/api/model/fetch` | 自動取得の再試行 |
 | GET | `/api/model/import` | 手動取り込みディレクトリの状態 |
@@ -185,6 +264,18 @@ P(w) = softmax( S(w) / temperature )
 curl -N -X POST http://localhost:8000/api/chat \
   -H 'Content-Type: application/json' \
   -d '{"messages":[{"role":"user","content":"今日はいい天気だね"}],"mode":"auto"}'
+
+# 知識ベース検索
+curl -s "localhost:8000/api/kb?q=雨はなぜ降るの"
+
+# 内蔵ニューラルコア: 状態 / 生成テスト / 再蒸留（サーバーが自分で作り直す）
+curl -s localhost:8000/api/neural
+curl -s -X POST localhost:8000/api/neural/probe -H 'content-type: application/json' \
+     -d '{"text":"今日は天気"}'
+curl -s -X POST localhost:8000/api/neural/rebuild -H 'content-type: application/json' -d '{"profile":"tiny"}'
+
+# LFM2.5 リモート委譲の疎通確認
+curl -s localhost:8000/api/model/remote
 
 # 助動詞の補い
 curl -X POST http://localhost:8000/api/complete \
@@ -208,6 +299,11 @@ curl -X POST http://localhost:8000/api/complete \
 | `SNIPHER_LFM_AUTO_FETCH` | `1` | 起動時の自動取得 |
 | `SNIPHER_LFM_QUANTIZE` | `1` | torch バックエンドの INT8 量子化 |
 | `SNIPHER_ASSIST_THRESHOLD` | `0.35` | これ未満の確度ならニューラルコアが生成 |
+| `SNIPHER_LIGHT_CORE` | `auto` | 内蔵蒸留コア: `auto`（重みが有れば使用）/ `on` / `off` |
+| `SNIPHER_LIGHT_MAX_CHARS` | `64` | 蒸留コア 1 応答の生成上限文字数 |
+| `SNIPHER_LIGHT_GATE` | `0.34` | この確信度を下回ったときだけフルウェイト起動を裏で準備 |
+| `SNIPHER_LFM_REMOTE_URL` | 空 | LFM2.5 を常駐させたホスト（別の Snipher でも可）へ生成を委譲 |
+| `SNIPHER_LFM_REMOTE_TOKEN` | 空 | リモート委譲の Bearer トークン |
 | `SNIPHER_LLM_THREADS` | 自動 | llama.cpp のスレッド数 |
 | `SNIPHER_LLAMA_SERVER` | 自動探索 | llama-server バイナリのパス |
 
@@ -244,8 +340,15 @@ SNIPHER_LFM_MODEL=var/tiny-lfm2 uvicorn snipher.api:app
   ニューラルコアは動かないため、高速コアのフォールバックで応答します。
   スタンダード以上 + `pip install llama-cpp-python` をビルドコマンドに追加すれば
   フル動作）
-- **Vercel**: `pyproject.toml` の `[tool.vercel]` によりサーバーレス起動
-  （エフェメラル環境のため高速コア中心の動作になります）
+- **Vercel**: `pyproject.toml` の `[tool.vercel]` によりサーバーレス起動。
+  731MB のモデルは読み込まない（読み込めるサイズではない）ので、
+  **同梱の内蔵蒸留コア（0.9MB）＋BM25 知識ベース＋高速コア**でフル機能動作する。
+  `vercel.json` が `maxDuration=60 / memory=1024` とバンドル除外を設定済みで、
+  サーバーレス環境では `SNIPHER_LFM_AUTO_FETCH` が自動で `off`
+  （無駄なダウンロードを試みない）。より賢くしたければ
+  `SNIPHER_LFM_REMOTE_URL` に LFM2.5 を常駐させた VPS の URL を 1 行入れるだけ。
+- **Docker / VPS**: `pip install -r requirements.txt -r requirements-llm.txt`
+  なら起動時にフルウェイトを自動取得。常駐なので T1 が生き、同じ UI のまま品質が上がる
 
 ---
 
@@ -263,7 +366,18 @@ snipher/
   generator.py    # 確率的生成(スロット確度の記録)
   polisher.py     # 助動詞の補い・文体修復(ルール)
   responder.py    # 意図分類 + 対話テーブル応答
+  knowledge.py    # ★ BM25 知識ベース（検索 0.1ms・確度ゲート付き）
   data/           # 高速コアの全知識(JSON テーブル)
+    kb.json       #   知識ベース（tools/build_kb.py から生成）
+    neural/core.npz  # 内蔵ニューラルコアの重み（int8・0.9MB・tools/distill_neural.py）
+  neural/         # ★ LFM2.5 を蒸留した内蔵ニューラルコア（NumPy のみ）
+    tokenizer.py    # 文字レベル語彙（未知文字が出ない）
+    nn.py           # ShortConv/注意 Hybrid + 手書き backward（勾配検証済み）
+    corpus.py       # 語彙テーブル+kb.json から教師文を自動生成（品質フィルタ付き）
+    train.py        # Adam + warmup/cosine の学習ループ
+    store.py        # int8 量子化 + zlib ヘッダの npz コンテナ
+    core.py         # generate / reply / complete（助動詞の補い）/ score
+    cache.py        # プロセス共通インスタンス（遅延ロード・スレッドセーフ）
   lfm/            # LFM2.5-1.2B-JP ニューラルコア
     acquire.py      # ★ モデルの全自動取得(マルチソース・レジューム)
     gguf_backend.py # ★ llama.cpp バックエンド(CPU 最速)
@@ -275,9 +389,12 @@ snipher/
     vocab.py        # 未知文字スキャン
   web/chat.html   # ホワイトテーマのチャット UI
 tools/
+  build_lexicon.py   # ★ 語彙テーブル生成 + 文法/活用検証（data/*.json は生成物）
+  build_kb.py        # ★ 知識ベース kb.json の生成
+  distill_neural.py  # ★ 内蔵ニューラルコアの蒸留ビルド（--profile tiny/base/big）
   fetch_model.py     # 事前取得 CLI(自動取得と同じロジック)
   make_test_model.py # 開発用小型モデル生成
-tests/            # 単体テスト(82+)
+tests/            # 単体テスト(90+)
 docs/             # 設計書(design.md / lfm.md)
 demo.py           # 高速コアの CLI デモ
 ```

@@ -1,3 +1,7 @@
+# LFM2.5-1.2B-JP のフルウェイトもロードする場合（VPS 相当のメモリが必要）:
+#   buildCommand: "pip install -r requirements.txt -r requirements-llm.txt"
+#   plan: starter 以上（torch + 1.2B は 512MB では足りない）
+# 既定（free）でも内蔵ニューラルコア＋知識ベースで会話できます。
 services:
   - type: web
     name: snipher

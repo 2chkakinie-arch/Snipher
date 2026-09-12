@@ -105,6 +105,7 @@ def test_route_fast_mode_never_neural():
 
 def test_route_fallback_without_neural():
     core = _core_with(None)
+    core.disable_light()          # 内蔵蒸留コアも無い（＝ルールのみ）環境の契約
     draft = core.assist.draft("こんにちは")
     assert core.route_of(draft, "auto") == ROUTE_FALLBACK
 
@@ -171,6 +172,7 @@ def test_forced_lfm_mode_skips_assist_event():
 
 def test_fallback_uses_base_text_for_uncertain():
     core = _core_with(None)
+    core.disable_light()
     evs = _events(core, "意味不明きょくせんぷる語の羅列はどう？")
     done = evs[-1]
     assert done["stats"]["route"] == "fallback"

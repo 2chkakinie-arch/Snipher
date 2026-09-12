@@ -123,5 +123,16 @@ def test_probability_sample_deterministic():
 def test_info():
     engine = SnipherEngine()
     info = engine.info()
-    assert info["total_parameters"] < 10000  # パラメータが極小であること
     assert len(info["weights"]) == 6
+    # 高速コア（テーブル + 確率重み）は軽量のまま = 10ms 応答の源泉
+    bd = info["parameter_breakdown"]
+    assert 1400 <= bd["lexicon_table_entries"] < 40_000
+    assert bd["probability_weights"] == 6
+    # 知識とニューラルコアも総パラメータに計上される（増やした分だけ増える）
+    assert info["knowledge_base"]["facts"] > 150
+    assert info["total_parameters"] >= bd["lexicon_table_entries"] + bd["knowledge_base_entries"]
+    if info["neural_core"]["available"]:
+        assert bd["neural_core_weights"] >= 300_000
+        assert info["total_parameters"] >= bd["neural_core_weights"]
+    else:
+        assert info["total_parameters"] < 40_000   # 未ビルド環境でも破綻しない

@@ -47,6 +47,19 @@ def test_status_shape_without_neural(client):
 
 
 def test_chat_fallback_is_instant_japanese(client):
+    # 内蔵蒸留コアが無い（＝ルールのみ）環境の契約を見るため、明示的に無効化
+    from snipher import api as api_mod
+
+    c = api_mod.core()
+    prev_state, prev_light = c._light_state, c._light
+    c.disable_light()
+    try:
+        _run_fallback_assertions(client)
+    finally:
+        c._light, c._light_state, c.cfg.light_core = prev_light, prev_state, "auto"
+
+
+def _run_fallback_assertions(client):
     evs = _sse(client, {"messages": [{"role": "user", "content": "こんにちは"}], "mode": "auto"})
     kinds = [e["type"] for e in evs]
     assert kinds[0] == "assist" and "start" in kinds and "delta" in kinds and kinds[-1] == "done"
