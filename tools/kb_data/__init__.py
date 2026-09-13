@@ -105,7 +105,8 @@ def T(id: str, topic: str, *, cat: str = "", ali: Any = None, tags: Any = None,
 # ---------------------------------------------------------------------- #
 # 集約
 # ---------------------------------------------------------------------- #
-MODULES = ("food", "nature", "culture", "tech", "life", "animals", "talk", "netculture")
+MODULES = ("food", "nature", "culture", "tech", "life", "animals", "talk", "netculture",
+             "words")
 
 
 def all_items() -> list[dict]:

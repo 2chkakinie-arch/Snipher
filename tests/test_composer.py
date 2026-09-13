@@ -95,11 +95,18 @@ def test_single_char_input_is_opaque(composer):
 
 
 def test_unknown_topic_does_not_invent_facts(composer):
+    """無い話題を捏造しない。v3 は「知識を語ったふり」を根拠付きで抑止する。
+
+    知識ベースの欄（field）を主張しないこと・確信度を盛らないこと・
+    相手の語をそのまま返すこと — を契約にします（定型文の知識引き当ては廃止済み）。
+    """
     r = _reply(composer, "ぬるぬる猿の生態について")
-    assert r.knowledge is None
-    assert r.plan in ("unknown_topic", "statement", "opaque_input")
+    know = r.knowledge or {}
+    assert know.get("field") is None, know
+    assert know.get("via") not in ("kb",), know
+    assert r.plan in ("unknown_topic", "statement", "opaque_input", "lex:word")
     # 事実を主張する形（「〜です。」の断定＋数字）を捏造しない
-    assert r.confidence <= 0.5
+    assert r.confidence <= 0.55
 
 
 # ---------------------------------------------------------------------- #

@@ -1082,7 +1082,21 @@ class SnipherCore:
         stats_extra: dict = {}
 
         needs_follow = not bool(_re.search(r"(か|かな|でしょう)[。！？!?]", text))
-        if core is not None and not authoritative:
+        force_light = str(mode or "") in ("lfm", "neural", "light")
+        if core is not None and (not authoritative or force_light):
+            if force_light:
+                # 明示的に light/lfm が選ばれたターンは、材料がなくても生成を試みる
+                gen_text = core.reply(last_user, context=messages, max_chars=34,
+                                      temperature=0.6, top_k=24) or ""
+                used_core = bool(gen_text)
+                if gen_text:
+                    sc = self.judge(gen_text, core=core, lm=lm)
+                    report_conf = sc["confidence"]
+                    ppl = sc["perplexity"]
+                    lm_conf = sc["lm"]
+                    if sc["confidence"] >= 0.62 and self.relevant(gen_text, last_user):
+                        text = _re.sub(r"[。！!？?]?$", "。", text.rstrip("。")) + " " + gen_text
+                        chosen_from_model = True
             if material:
                 # 事実を伝えたあと、会話を続ける一文が **無ければ** だけ作らせる。
                 # 知識ベースの followups（人が書いた問い）があるなら、それを優先する
@@ -1169,6 +1183,19 @@ class SnipherCore:
             if comp.get("changed") and float(comp.get("confidence", 0) or 0) >= 0.25:
                 added = comp.get("added") or ""
                 text = comp.get("text") or text
+
+        # ---- 3.5) どの経路でも最終文は必ず判定する --------------------------- #
+        # 昇格（フルウェイト起動）の判定は「内蔵コアの自信」で行う。知識ベースや
+        # ツールが答えられた回でも、文そのものの自然さは測っておくと、
+        # 後から重みが揃ったときにどれを差し替えるべきかが分かる。
+        if neural_conf is None and core is not None:
+            try:
+                sc = self.judge(f"{text}{extra}", core=core, lm=lm)
+                neural_conf = report_conf = float(sc["confidence"])
+                ppl = sc["perplexity"]
+                lm_conf = sc["lm"]
+            except Exception:  # noqa: BLE001
+                pass
 
         # ---- 4) 磨いて出す ---------------------------------------------------- #
         polished = self.polisher.polish(f"{text}{extra}", register="polite")

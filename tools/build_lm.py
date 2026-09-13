@@ -47,7 +47,27 @@ def strip_markers(doc: str) -> list[str]:
     return out
 
 
-def collect(grammar: int, seed: int = 20250912) -> tuple[list[str], list[str], list[str]]:
+def read_corpus(path: Path | None, limit: int) -> list[str]:
+    """tools/build_corpus.py が作った実辞書ベースの文（corpus.txt.gz）を読む。"""
+    if not path or not Path(path).exists():
+        return []
+    import gzip as _gzip
+
+    fp = Path(path)
+    opener = _gzip.open if fp.suffix == ".gz" else open
+    out: list[str] = []
+    with opener(fp, "rt", encoding="utf-8") as fh:      # type: ignore[operator]
+        for line in fh:
+            line = line.strip()
+            if 4 <= len(line) <= 140:
+                out.append(line)
+            if len(out) >= limit:
+                break
+    return out
+
+
+def collect(grammar: int, seed: int = 20250912,
+            corpus: Path | None = None) -> tuple[list[str], list[str], list[str]]:
     """(学習文, 評価用の保持文, 語彙構築用の全文) を返す。
 
     語彙（文字集合）は保持文も含めて作る。文字種を知らないだけで perplexity が
@@ -74,12 +94,14 @@ def collect(grammar: int, seed: int = 20250912) -> tuple[list[str], list[str], l
     kb_train = [s for s in kb_sents if s not in held_set]
 
     cb = CorpusBuilder(seed=seed)
-    docs = cb.build(max(1000, grammar))
+    docs = cb.build(max(1000, grammar)) if grammar else []
     gen: list[str] = []
     for doc in docs:
         for line in strip_markers(doc):
             if 4 <= len(line) <= 140:
                 gen.append(line)
+    # 実辞書の語で組み立てた文（語彙が一桁多い。流暢さの審判の主食）
+    gen.extend(read_corpus(corpus, 400_000))
     rng.shuffle(gen)
 
     # 人が書いた日本語は 3 倍に重み付け（分布の中心に置く）
@@ -152,11 +174,13 @@ def main(argv: list[str] | None = None) -> int:
                     help="次数ごとの最小出現回数（既定 1,1,1,2,2,3）")
     ap.add_argument("--max-vocab", type=int, default=3500, help="文字語彙の上限")
     ap.add_argument("--out", type=Path, default=ROOT / "snipher" / "data" / "lm.npz")
+    ap.add_argument("--corpus", type=Path, default=ROOT / "snipher" / "data" / "corpus.txt.gz",
+                    help="tools/build_corpus.py の生成文（無ければ無視）")
     ap.add_argument("--quiet", action="store_true")
     args = ap.parse_args(argv)
 
     t0 = time.time()
-    texts, held, all_text = collect(args.grammar)
+    texts, held, all_text = collect(args.grammar, corpus=args.corpus)
     if not args.quiet:
         chars = sum(len(normalize(t)) for t in texts)
         print(f"[lm] 学習文 {len(texts):,} / {chars:,} 文字 / 保持 {len(held)} 文")

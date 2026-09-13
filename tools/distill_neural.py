@@ -22,6 +22,15 @@ sys.path.insert(0, str(ROOT))
 OUT_DEFAULT = ROOT / "snipher" / "data" / "neural" / "core.npz"
 
 PROFILES = {
+    # v3big … v3 より語彙と幅を広げた最終候補（d=384 / L=8 / 語彙 3,000）
+    "v3big": {"d_model": 384, "n_layers": 8, "n_heads": 8, "conv_kernel": 4, "epochs": 3,
+              "batch": 40, "seq_len": 112, "docs": 14000, "max_vocab": 3000,
+              "authored_repeat": 6, "kb_repeat": 3, "corpus_docs": 26000},
+    # v3    … 実辞書の語彙で組んだ大規模コーパスで育てる本番プロファイル
+    #         （d=288 / L=6 / 語彙 2,400 字。int8 量子化で 7 MB 前後・1 文字 2ms 台）
+    "v3": {"d_model": 288, "n_layers": 6, "n_heads": 8, "conv_kernel": 4, "epochs": 2,
+           "batch": 48, "seq_len": 96, "docs": 12000, "max_vocab": 2400,
+           "authored_repeat": 5, "kb_repeat": 3, "corpus_docs": 24000},
     # tiny  … CI/スモーク用（数十秒）
     "tiny": {"d_model": 48, "n_layers": 2, "n_heads": 4, "conv_kernel": 3, "epochs": 2,
              "batch": 32, "seq_len": 32, "docs": 1200, "max_vocab": 260,
@@ -52,6 +61,8 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--docs", type=int, default=None)
     ap.add_argument("--lr", type=float, default=None)
     ap.add_argument("--seed", type=int, default=13)
+    ap.add_argument("--corpus", default=str(ROOT / "snipher" / "data" / "corpus.txt.gz"))
+    ap.add_argument("--corpus-docs", type=int, default=0, help="0=すべて")
     ap.add_argument("--report", default=None, help="学習レポート(JSON)の書き出し先")
     args = ap.parse_args(argv)
 
@@ -79,7 +90,20 @@ def main(argv: list[str] | None = None) -> int:
     # ---- 教師データの内訳（質の高い順に重みを付ける） ---------------------- #
     authored = builder.authored_docs(repeat=1)          # 人が書いた対話（最良）
     kb_docs = builder.kb_docs()                         # 知識ベース（事実・Q&A・手順）
-    grammar = builder.build(prof["docs"])               # 文法生成（文型の網羅）
+    grammar = builder.build(prof["docs"]) if prof.get("docs") else []   # 文法生成（文型の網羅）
+    if not args.corpus_docs:
+        args.corpus_docs = int(prof.get("corpus_docs") or 0)
+    if args.corpus and Path(args.corpus).exists():
+        import gzip as _gzip
+
+        fp = Path(args.corpus)
+        opener = _gzip.open if fp.suffix == ".gz" else open
+        with opener(fp, "rt", encoding="utf-8") as fh:   # type: ignore[operator]
+            lines = [ln.strip() for ln in fh if ln.strip()]
+        if args.corpus_docs:
+            lines = lines[: args.corpus_docs]
+        grammar = [f"<asst>{' '.join(lines[i:i + 3])}" for i in range(0, len(lines) - 2, 3)] + grammar
+        print(f"corpus: {args.corpus} → {len(grammar):,} docs")
     ar, kr = int(prof.get("authored_repeat", 4)), int(prof.get("kb_repeat", 2))
     docs = authored * ar + kb_docs * kr + grammar
     docs = [d for d in docs if d and d.strip()]

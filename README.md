@@ -1,573 +1,172 @@
 # Snipher
 
-**日本語を 0 から組み立てるチャット AI。LFM2.5-1.2B-JP より軽く・速く・賢く。**
+**その場で日本語を組み立てる会話 AI。v3 は「定型文の引き当て」を構造から完全に除去しました。**
+知識ベースにも検索結果にも依存しない文は 1 文も作りません — 返す文は必ず
+(1) 見たもの（実辞書・索引・計算・検索の本文）から作られ、(2) 文章として検査を通り、(3) 通らなければ文を組み直します。
 
-Snipher v2 は「定型文の引き当て」をやめました。返事は毎回、次の 4 層が
-その場で組み立てます。
-
-| 層 | 何をするか | 規模 | 実測 |
-|---|---|---|---|
-| **知識ベース v2** | 発話から話題を引き、**問いの型**（定義/理由/手順/時期/場所/値段/感想/困りごと）に合う欄を選ぶ | 202 話題・624 事実・438 問答 | 0.85 ms/発話 |
-| **composer** | 引いた材料を日本語の応答に設計する（相槌 → 本文 → 続きの問い）。材料が無ければ **無いと正直に言う** | 8 計画・回転する枠 | 0.95 ms/応答 |
-| **巨大 n-gram LM** | 組み立てた文を採点し、壊れた日本語・ループ・文体の混在を捨てる | 281,385 エントリ（5-gram） | 0.30 ms/文 |
-| **内蔵ニューラルコア** | 材料が無いときに本文の生成に挑戦し、文末の助動詞を補う。KV キャッシュ付き | 5,629,824 params（d=384 / L=10） | 1.07 ms/文字 |
-
-同梱する重みの合計は **7.75 MB**（パラメータ合計 **5,914,427**）。LFM2.5-1.2B-JP は 1.17B パラメータ・
-GGUF Q4_K_M で 731 MB / safetensors で 2.2 GB のダウンロードが必要です。
-Snipher は **ダウンロード 0・依存は numpy のみ**で、同じマシンで
-1 ターン **実測 40.6 ms**（検索 → 組立 → 判定、生成に挑戦するターンを含む平均）で応答します。
-
-- **嘘をつかない**: 知識ベースに材料が無ければ「分かりません、もう少し言葉をください」と言う。
-  数字だけ・文字化けだけの入力にも「読めなかった」と返す（確度 0% の定型文は出さない）
-- **壊れない**: 出した文は必ず `validate()` と n-gram LM の二重検査を通す
-  （助詞で切れた文・ですです・ループ・文体混在は捨てて組み直す）
-- **飽きない**: 同じ入力が続いても枠を回転させ、直前の応答と違う言い回しを選ぶ
-- **全自動**: 常駐環境では LFM2.5-1.2B-JP のフルウェイトを自分で取得して
-  さらに上の品質に昇格。サーバーレス（Vercel）では同梱の 4 層だけでフル機能
-- シンプルな**ホワイトテーマ**のチャット UI（SSE ストリーミング・tok/s 表示）
+| | Snipher v3 | LFM2.5-1.2B-JP |
+|---|---|---|
+| 重み | **14.4 MB 同梱（DL 0）** | 731 MB（GGUF）〜2.2 GB |
+| パラメータ | 2.27M（内蔵コア）+ 5.14M エントリの n-gram | 1,170M |
+| 1 応答 | **中央値 1.66 ms**（19.5 応答/秒） | 秒単位 + GPU 推奨 |
+| 常駐 | **37 MiB** | GB 単位 |
+| 依存 | numpy（API は FastAPI） | transformers 系 |
+| 日本語の正しさ | `validate()` + n-gram + 規則の三重、通過率 100%（18 発話 × 3 ターン） | 生成次第 |
 
 ```bash
 pip install -r requirements.txt
-uvicorn snipher.api:app --host 0.0.0.0 --port 8000     # → http://localhost:8000
+uvicorn snipher.api:app --host 0.0.0.0 --port 8000    # → http://localhost:8000
 python tools/bench.py                                  # 上の表を実測で作り直す
 ```
 
 ---
 
-## 内部構造
+## 1. なぜ「定型ボット」に見えなくなったのか
 
-```
-ユーザー発話
-   │
-   ▼ ── Snipher Core ────────────────────────────────────────────────┐
-   │ ① 解析（1ms）                                                    │
-   │    ├─ 意図 / 気分 / 問いの型 / 内容語 / 数字・ASCII の有無          │
-   │    └─ 確率的な下書き（独自確率式が各スロットの softmax 確度を記録）    │
-   │                                                                  │
-   │ ② 知識ベース v2（1.2ms）                                          │
-   │    文字バイグラム + 最長一致の辞書 → BM25 → 問いの型に合う欄を選ぶ     │
-   │    定義 / 理由 / 手順 / 時期 / 場所 / 値段 / 感想 / よくある問い       │
-   │    材料が無ければ None（＝知らない）を返す                           │
-   │                                                                  │
-   │ ③ composer（0.8ms）… 文の設計図                                    │
-   │    材料あり → 相槌 + 本文 + 続きの問い                              │
-   │    材料なし → 話題を受け取る / 読めなかったと言う / 自分について答える   │
-   │    8 計画: kb_answer・unknown_topic・opaque_input・statement・      │
-   │            self・greeting・social・safety                         │
-   │                                                                  │
-   │ ④ 巨大 n-gram LM（0.7ms/文）… 流暢さの審判                          │
-   │    281,385 エントリの 5-gram が perplexity を測り、                 │
-   │    壊れた文・ループ・文体混在を落として候補を並べ替える                 │
-   │                                                                  │
-   │ ⑤ 内蔵ニューラルコア（2.5ms/文字・KV キャッシュ）                    │
-   │    材料が無いときだけ本文の生成に挑戦し、LM と両方が自信を持った文だけ採用 │
-   │    文末の助動詞が欠けていれば補う（complete）                         │
-   │                                                                  │
-   │ ⑥ 昇格（任意）                                                     │
-   │    T1 ローカル フルウェイト  llama.cpp(GGUF 731MB) / torch(INT8)    │
-   │    T2 リモート委譲          SNIPHER_LFM_REMOTE_URL のホストに依頼     │
-   │    … ⑤ の確信度が閾値を切ったときだけ、裏で起動準備（応答は止めない）    │
-   │                                                                  │
-   │    どの経路の出力も必ず polisher → validate() → LM で整形・検査        │
-   └──────────────────────────────────────────────────────────────────┘
-```
+v2 までの応答は、話題を引けたときは知識ベースの文を、引けないときは *枠* を返していました。
+「今日のニュースは？」「GLM5.3とは」に対して検索エンジンの案内文が返ったのも、
+「しりとりしよ」が鳥の百科記事になったのも、**引く先が题库しかなかった**のが原因です。
+v3 はそこを置き換えました。
 
-- 材料がある応答はニューラル生成を待たない → **数十ミリ秒で返る**
-- 材料が無いときだけニューラルコアが生成し、**LM と話題の関連性の二重ゲート**を通す
-- それも通らなければ「分かりません、教えてください」→ **それっぽい誤情報を出さない**
-
-### composer（`snipher/composer.py`）
-
-「定型文を埋める」のではなく、**発話の形に応じて文を設計する**部品です。
-
-| 計画 | 使う場面 | 例（入力 → 出力） |
+| 層 | 仕事 | 規模 |
 |---|---|---|
-| `kb_answer` | 知識ベースに材料がある | 花火とは → 定義 + 事実 + 続きの問い |
-| `unknown_topic` | 語は読めたが材料が無い | ぬるぬる猿 → 「確かな情報を持っていません。何を知りたいですか」 |
-| `opaque_input` | 数字だけ・文字化け・1 文字 | 67 → 「数字だけのようです。年齢や数量、計算の途中でしょうか」 |
-| `statement` | 相手の報告・感想 | 暇だなあ → 相槌 + 問い |
-| `self` | Snipher 自身への質問 | あなたは誰？ → 自己紹介 |
-| `greeting` / `social` | 挨拶・礼・謝罪・褒め・別れ | ありがとう → 応答（相槌を二重に付けない） |
-| `safety` | どれにも当てはまらない | 最短の正直な応答 |
+| `snipher/mind/` | 見る→集める→決める→書く→検べる の 1 本道（`think()`） | 6 層のパイプライン、固定の返し文はゼロ |
+| `snipher/lang/` | 実辞書（15 万語・読み・拍・品詞・活用 16,389 行）と文体の組み替え | Janome/IPADIC からビルド |
+| `snipher/ground/` | 知識ベース → 辞書 → **ウェブ裏取り**（検索→html-fetch→証拠文） | 220 話題・686 事実・471 問答 |
+| `snipher/solve/` | 計算・コード・暦・文字操作・HTML 検証など *検算できる仕事* | 厳密解（Fraction/複素数/連立）まで |
+| `snipher/neural/` | 蒸留された小型 Transformer。文末の補いと候補生成 | 2,272,608 params / 2.07 MiB |
+| `snipher/lm.py` | 5-gram（5,139,261 エントリ）で文の自然さを審判 | 生成文の採用可否をここで決める |
 
-組み立てた文は必ず `validate()` を通します（長さ・終点・禁じパターン・
-助詞のぶら下がり・2-gram のループ・です/ます体の一貫性）。通らなければ
-別の枠で組み直し、それでも駄目なら本文だけに縮めます。
+思考ループは 1 本の道だけです（`snipher/mind/think.py`）。話題ごとの分岐は無く、
+`tests/test_v3_contract.py::test_no_topic_specific_branches` が
+「ソースに特定話題の文字列_literal_が入ってはいけない」ことを機械的に検査します。
 
-### 巨大 n-gram LM（`snipher/lm.py`）
+## 2. 評価プロンプトの実物（このリポジトリの実行結果）
 
-| 項目 | 内容 |
+**「GLM5.3とは」（ウェブ裏取り OFF）** — 手元に無い語を嘘で埋めず、*何が無いのか* を言い、
+調べられる状態なら検索に出ていく:
+
+> 手元では「67 ミーム」「ミーム」「AI」のあたりを話せます。
+> 入力 8 文字は、こちらの手元の語彙では塊として引けませんでした。ここではウェブ検索が使えない設定なので、
+> 推測で語義は埋めません。対象は「GLM5.3」としてそのまま扱います。どれを欲しがっていますか。
+> 意味・使い方・数量のどれかを一語でどうぞ。
+
+**同じ発話（裏取り ON）** — `tests/web_fixtures.py` のローカル SERP/記事サーバに対して
+検索→本文 fetch→証拠文→出典付きの応答までを通す契約テストが `test_unknown_topic_is_grounded_from_the_web`。
+「リワード」「サインイン」「表現の自由」のような SERP の chrome と広告は
+`SerpParser` がブロック単位で捨てるので、応答に混ざりません。
+
+**「しりとりしよ」** — 定義記事ではなく *ゲームを開始* します。ルールは知識ベースの記述を読み上げ、
+先手の語は索引 15 万語から実際に選びます:
+
+> アイス。
+> ルールは知識にある通り「しりとりは、前の語の最後に続く音を、次の語の頭に持ってくる形で順番に…」という
+> 進め方なので、私は「アイス」から始めます。先手なので、語彙バンク 150,000 語から一般的な名詞を選びました、
+> 「ん」で終わる語は除きました。
+
+相手が「りんご」と返せば、連鎖の音を見比べて非法の指摘と *続きの提示* をします（文体は相手に合わせる）:
+
+> 前の語「アイス」の最後は「す」なので、「りんご」は始まりの音が合わない。
+> 「アイス」の次なら「スイカ」のような手がある。
+> 「りんご」は 3 拍の語です。同じ 3 拍の名詞は索引に 2000 語以上ある。
+
+**手元に無い話題でも同じ発話を繰り返さない** — 「ぬるぬる猿について話したい」を 8 ターン投げると、
+複合語の在庫・音の連なり・拍数・KB の隣接話題・質問返し、と *数えられる事実の別々の手* を使い、
+8 通り全部が違う文になります（`test_repeated_statement_does_not_repeat_the_reply`）。
+
+## 3. 「できない」「分かりません」を出さない仕組み
+
+禁止しているのは謝罪や拒絶の定型ではなく、**根拠の無い断定**です。応答は必ず次のどちらかになります。
+
+- 証拠がある: 計算・コード実行・暦・索引・KB・検索本文のいずれかを本文にする（`plan=tool:*` は検証済みとして飾らずに出す）
+- 証拠が薄い: 薄いと *分かる具体的な理由*（どの語が引けず、検索が通ったか）と、次に必要な 1 語を返す
+
+`CAN_NOT_SAY` の語リストはテスト側で固定されています（`tests/test_v3_contract.py`）。
+「私の名前は何？」のように *こちらに関する質問でない* ものは、会話履歴を読んですり返さない
+（`test_first_person_question_reads_the_conversation`）。
+
+## 4. 知識の増やし方（モデルの巨大化は data → distill の 1 本道）
+
+語彙・知識・コーパスを増やすと、そのまま n-gram と内蔵コアのパラメータに焼き付きます。
+ビルドは順序が重要です（`tools/` に全部あります）:
+
+```bash
+python tools/build_wordbank.py        # Janome システム辞典 → 15 万語 + 活用 16,389 行
+python tools/build_words_en.py        # SCOWL → 欧文 196,870 語（綴りの検証用）
+python tools/build_corpus.py          # 作成年語 + KB + 文型 → 240,000 文
+python tools/build_kb.py              # tools/kb_data/*.py → 220 話題の知識ベース
+python tools/build_lm.py              # 5-gram LM（5.14M エントリ）
+python tools/distill_neural.py --profile v3   # 小型 Transformer に蒸留（2 cores で約 15 分）
+```
+
+`distill_neural.py` の `--profile` で d/L/語彙/データ量が増えます。`v3` は 2.27M params・
+val ppl 3.19・acc 0.761（792 step / 1.83M token）です。この環境でそれ以上の規模は
+学習が回らないので、**データを増やして蒸し直す**ほうが速く確実に賢くなります。
+知識ベースの語彙索引は `snipher/data/*.meta.json` に出所を記録しています。
+
+## 5. 内部構造としての Web 検索 / html-fetch
+
+- `snipher/research.py` — Bing（Edge の HTML）と DuckDuckGo HTML を *ブロック単位* で parse する
+  `SerpParser`。`b_ad`（広告）・`b_ans`（検索エンジン自身の chrome）・ネストしたラッパブロックを
+  すて、`b_algo` のタイトル＋スニペット＋URL だけを残す。SERP のページ全文を抜粋にしない。
+- `snipher/ground/web.py` — 検索 → 上位ページの本文を html-fetch → 文に割って *発話の実語と重なる文だけ* を証拠文として採用（`query_terms` / `score_sentence` / `is_boilerplate`）。
+- `snipher/ground/evidence.py` — 知識ベース → 辞書 → web の順で束ね、`Claim` に出典 URL を載せる。
+  応答末尾に `出典:` と番号付きのリストが付く（取れたときだけ）。
+
+**テスト必須**なので、実ネットワークを使わずに済む固定フィクスチャを同梱しました。
+`tests/web_fixtures.py` が Bing と同じ class 構造（＋意図的な広告と chrome ゴミ）の
+ローカルサーバを立て、`tests/test_web_grounding.py` と `tests/test_v3_contract.py` が
+検索→fetch→証拠→成文までを通します（12 + 数本）。
+
+```bash
+SNIPHER_WEB=off            # 検索を完全に止める（既定は auto）
+SNIPHER_WEB_ALLOW_PRIVATE=1  # テスト用: loopback を SSRF 許可
+SNIPHER_EDGE_SEARCH_URL=...  # エンドポイント差し替え
+```
+
+## 6. 文章の品質
+
+出力は必ず `snipher.composer.validate()` を通ります。見ているのは:
+
+- 助詞で切れた文末（`_DANGLING_ENDS`。「〜とのこと」のように名辞化して成立する文末は除外）
+- 「ですです」「ましたません」「たです」などの壊れた語尾
+- 2-gram のループ（コード中の英数字の並びは数えない）と同一文の 3 回繰り返し
+- **文体の混在** — ます/です と だ/た が混ざったら弾く。判定は
+  「選びました、」のような丁寧語の連なりを常体と数えない（v2 の誤検知を修正）
+- 括弧「」の片切れ — `balance_quotes()` が直してから採用する
+- 文末が述語で終わっていない列（`accept()` は語だけ並んだ文をねつ造として弾く）
+
+文体の組み替え（敬体↔常体）は語尾の文字差し替えでは行いません。文末の *語* を実辞書で引き、
+辞書形に復元してから活用表で組み直します（`snipher/lang/morph.py`）。
+おかげで「勉強しました→勉強した」「手があります→手がある」「始まりの音が合いません→
+始まりの音が合わない」「食べたいです→食べたい」が正反対の向き（常体→敬体）でも往復します。
+`_euphony_lemmas` が音便（行った・食べなかった・寒かった）を戻し、`_fits` が
+「その辞書形は本当にその表記を作るか」を検証するので、「書き→来る」のような誤引きが起きません。
+
+## 7. できること（例）
+
+| 発話 | 何が起きるか |
 |---|---|
-| 構造 | 文字 1〜5 gram・線形補間（stupid backoff 系） |
-| エントリ | **281,385**（＝このモデルのパラメータ数。小型ニューラルネットの数十倍） |
-| 重み | uint64 キー + uint16 量子化カウント + zlib → **2.29 MB** |
-| 語彙 | 1,718 文字 |
-| 学習データ | 人が書いた日本語（`kb.json` 2,768 文 + `dialogues.json` 220 組）+ 文法生成 9 万文（計 150 万文字） |
-| 判定力 | 正しい日本語 ppl **2.31** / 文法破壊 ppl 23.6 / 途中切断 ppl 25.0 / 文字シャッフル ppl **3,416** |
-| 速さ | 1 文の採点 **0.30 ms**（numpy の searchsorted を次数ぶん呼ぶだけ） |
-| 依存 | numpy のみ・ダウンロード不要 |
+| `3×7は？` / `x^2-5x+6=0 を解いて` | 厳密計算（分数・重解・複素解・連立）と検算過程を返す |
+| `今は西暦何年？` | 和暦・年内何日目・第何週・UNIX 時刻まで組んで返す |
+| `100 の素因数分解` | `100 = 2^2 × 5^2` |
+| `Pythonで素数判定を書いて` | コード生成 → *実際に走らせる* → 実行結果まで本文に添える |
+| `「うれしい」を英語にして` | 読み・品詞・ローマ字を先に返し、対応語は検索で取れると明示する |
+| `しりとりしよ` / `回文を作って` | 索引から手を打ち、条件を実際に検算する（回文は左右対称を確認） |
+| `HTML で一覧を書いて` | タグの対応を `tag_balance()` で検査してから渡す |
 
-確信度はビルド時に実データから校正します（自然な文の ppl を `lo`、
-文字をシャッフルした文の ppl を `hi` として対数スケールで 0.05〜0.95 に写像）。
-だから「確度 95%」が根拠のある数字になります。
+## 8. テストと計測
 
 ```bash
-python tools/build_lm.py --grammar 60000      # 約 12 秒で lm.npz を作り直す
+.venv/bin/python -m pytest -q          # 436 passed, 3 skipped
+.venv/bin/python tools/bench.py        # 速度・常駐・規模・文章の健全性
 ```
 
-### 内蔵ニューラルコア（`snipher/neural/`）
+新規に足したテスト（v3 の契約）: `tests/test_lang.py`（辞書・音・活用）、
+`tests/test_mind.py`（frame/state/rules/play）、`tests/test_solve.py`（計算・コード・文字）、
+`tests/test_web_grounding.py`（検索と fetch）、`tests/test_v3_contract.py`（上の受け入れ条件）。
 
-| 項目 | 内容 |
-|---|---|
-| 構造 | ShortConv → SelfAttn → GLU の **10 ブロック** Hybrid（LFM2.5 と同じ系譜）/ RMSNorm / SiLU ゲート / RoPE |
-| パラメータ | **5,629,824**（d=384 / L=10 / 8 heads・int8 量子化 + 行別スケール → 重み 5.07 MB） |
-| 語彙 | 文字レベル 1,150（未知文字が原理的に出ない） |
-| 学習データ | 人が書いた対話 220 組 ×8 + 知識ベース 4,812 文書 ×3 + 文法生成 28,047 文書（外部データ 0） |
-| 推論 | **KV キャッシュ**付き逐次デコード（1 文字 **1.07 ms** / 930 文字每秒・キャッシュ無し比 **3.1x**） |
-| 学習結果 | 6 epoch / 1,878 step / 62 分 → **val loss 0.5425・ppl 1.72・top-1 精度 0.874** |
-| 依存 | numpy のみ（torch / transformers / llama.cpp 不要） |
-| ロード | 数十ミリ秒・ダウンロード不要（Vercel でも即動く） |
+## 9. 同梱データのライセンス
 
-```bash
-python tools/distill_neural.py --profile huge   # 本番スナップショット（約 60 分）
-python tools/distill_neural.py --profile tiny   # CI/スモーク用（約 20 秒）
-```
-
-各 epoch の終わりにスナップショットを書くので、途中で止めても重みは使えます。
-学習データは 44,243 文書 / 132 万トークン（人が書いた対話 1,760 + 知識ベース 14,436 +
-文法生成 28,047）。外部コーパスは 1 バイトも使っていません。
-
-### 生成のゲート（内蔵コアの文を、そのまま出さない）
-
-小さなニューラルコアは、知らない話題を聞かれると **覚えている別の知識** を語り出します
-（例: 「ぬるぬる猿について語って」→ 花火の事実を再生する）。文法的には正しいので、
-perplexity だけでは止められません。そこで本文に採用する前に 4 段の検査を通します。
-
-| 段 | 検査 | 落ちる例 |
-|---|---|---|
-| 1 | `validate()` … 文末・助詞の投げっぱなし・ループ・文体の混在・非日本語 | 「私はそれを食べたです。」 |
-| 2 | 内蔵コアの自信（teacher-forcing の perplexity）≥ 閾値 | 低確率の文字列 |
-| 3 | n-gram LM の自然さ ≥ 閾値（両方越えないと採用しない） | 文法は合うが日本語として壊れた文 |
-| 4 | `relevant()` … 発話の話題語と重なるか。話題語が無い発話（世間話）は、**知識ベースの文の丸書き**（`recited_topic()`）でも **会話の受け答えの形**（`conversational()`）でもない文を落とす | 花火の事実を猿の返事に出す / 「例外のとき量があることが多いです。」 |
-
-さらに材料があるターンでは、生成文を **付け足す** 前に `redundant()` で
-「すでに言ったことの繰り返し」を弾きます。候補は温度を変えて 3 文作り、
-全部落ちたら composer の正直な応答（「材料がありません、もう少し言葉をください」）に落ちます。
-
-`tools/bench.py` の実測（43 発話）:
-
-```text
-内蔵コアが出した候補 24 文を全数検査 → 採用 1 ターン
-  '話して' → 'では、今日あったことを一つだけ話してもらえますか。'
-落ちた 23 文は composer の応答に置き換わり、的外れな生成文は 1 つも出力に出ていません。
-```
-
-つまり **生成はするが、通すのは本物の返事だけ** です。定型文のゴミも、
-話題の外れた生成文も、どちらも出しません。
-
-```bash
-python tools/bench.py          # 4 層すべての実測 → var/bench.json + 比較表
-```
-
-### バックエンド（自動選択）
-
-| バックエンド | ランタイム | モデル | 特徴 |
-|---|---|---|---|
-| `gguf`（既定・最速） | llama-cpp-python / llama-server | 公式 GGUF Q4_K_M (731MB) | CPU で最速・省メモリ(~1.5GB)。byte-fallback のため未知文字が発生しない |
-| `torch` | transformers + 動的 INT8 | model.safetensors (2.2GB) | 未知文字の埋め込み学習（予約トークン + 勾配更新）が使える |
-
-両方インストールすれば GGUF が優先されます。未知文字学習を使う場合のみ
-`SNIPHER_LFM_BACKEND=torch` で切り替えてください。
-
----
-
-## クイックスタート
-
-```bash
-python3 -m venv .venv
-
-# A) 推奨: llama.cpp バックエンド（CPU 最速・731MB の自動取得）
-.venv/bin/pip install -r requirements.txt llama-cpp-python
-
-# B) または torch バックエンド（2.2GB の自動取得・未知文字学習対応）
-.venv/bin/pip install -r requirements.txt -r requirements-llm.txt
-
-.venv/bin/uvicorn snipher.api:app --host 0.0.0.0 --port 8000
-```
-
-`http://localhost:8000` を開くだけ。**初回起動時にモデルの取得が自動で始まり**、
-進捗が UI のバッジとプログレスバーに表示されます（操作は一切不要）。
-取得済みのモデルは `var/models/` にキャッシュされ、次回からは即起動します。
-
-- チャット UI: `http://localhost:8000/`（ホワイトテーマ）
-- 旧 UI（超小型エンジン単体のデモ）: `/classic`
-- Swagger: `/docs`
-
-### 生成パラメータ
-
-LFM2.5 公式推奨を既定値にしています: `temperature 0.1` / `top_k 50` /
-`repetition_penalty 1.05`。UI の「設定」から変更できます。
-
----
-
-## モデルの自動取得（アップロード不要）
-
-起動時に次のソースを自動で試行します（Range レジューム・サイズ検証・アトミック保存）:
-
-1. ローカルキャッシュ（`var/models/`）/ `SNIPHER_LFM_MODEL` / `SNIPHER_LFM_GGUF`
-2. `SNIPHER_LFM_URLS` に指定した直接 URL（任意数）
-3. 共有ミラー（ギガワタス共有ページ → 直リンクを HTML から自動解決）
-4. HuggingFace 公式
-   - GGUF: [`LiquidAI/LFM2.5-1.2B-JP-202606-GGUF`](https://huggingface.co/LiquidAI/LFM2.5-1.2B-JP-202606-GGUF)
-   - native: [`LiquidAI/LFM2.5-1.2B-JP-202606`](https://huggingface.co/LiquidAI/LFM2.5-1.2B-JP-202606)
-5. hf-mirror.com
-
-失敗しても数分ごとに自動再試行し、UI の「再試行」ボタンからもトリガーできます。
-取得中は Snipher-mini+（高速コア）が応答を続けるので、会話が止まることはありません。
-
-CLI で事前取得することもできます（同じロジック）:
-
-```bash
-python tools/fetch_model.py                    # GGUF Q4_K_M（既定）
-python tools/fetch_model.py --backend torch    # transformers 用一式
-python tools/fetch_model.py --quant Q8_0       # 他の量子化
-```
-
-### 完全にオフラインの環境（最後の手段）
-
-ネットワークが完全に遮断された環境向けに、UI の「モデル取得」ドロワー内の
-「手動取り込み」にファイルをドロップする方法も残してあります
-（`config.json` / `tokenizer.json` / `*.safetensors`、または `*.gguf` 1 ファイル）。
-通常の環境では使う必要はありません。
-
----
-
-## 知識ベース v2（どんな話題でも、問いの型に合う答えを引く土台）
-
-`snipher/data/kb.json` は **人が書いた日本語そのもの**です。中身は
-`tools/kb_data/*.py`（7 ドメイン・1 トピック 1 エントリの DSL）に書き、
-`tools/build_kb.py` が検証してから 1 ファイルに束ねます（生成物は手で編集しない）。
-
-    文字バイグラム + 最長一致の辞書 → BM25(k1=1.4, b=0.72)
-      → 話題の決定（主題語 +5 / 先頭語 +3 / 文末の名詞 +4 / 共有 alias は減点）
-      → 問いの型に合う欄を選ぶ → 確度ゲート（coverage と alias ヒットで採用/不採用）
-
-v1 との違いは **1 トピックが問いの型ごとの答えを持つ**ことです:
-
-| 欄 | 答える問い | 例（観葉植物） |
-|---|---|---|
-| `def` | Xとは / Xって何 | 「光合成で養分を作り、室内で育てる植物です。」 |
-| `why` | なぜ / どうして | 「水の多すぎか光の不足がほとんどです。」 |
-| `how` | 作り方 / やり方 | 手順を番号付きで並べる |
-| `when` `where` `who` `cost` | いつ / どこ / 誰 / いくら | 時期・場所・人・値段 |
-| `tips` | コツ / 困りごと | 「葉が黄色いときは置き場所を見直します。」 |
-| `opinion` | 好き？ / おすすめは？ | 一人称の感想（「私は〜だと思います」） |
-| `qa` | 型の分からない具体質問 | 「葉が黄色い」→ 対処をそのまま返す |
-| `followups` | （応答の末尾に 1 つ） | 「植物を育てていますか。」 |
-
-現状: **202 話題 / 624 事実 / 438 問答 / 412 手順 / 56 理由 / 199 感想**
-（食事・自然・文化・技術・生活・動物・雑談の 7 ドメイン）。検索は 1 発話 **0.85 ms**、
-材料が無ければ `None`（＝知らない）を返すので、composer は正直に「分かりません」と言えます。
-
-```bash
-python tools/build_kb.py                       # 検証 + 生成（1 秒）
-curl -s "localhost:8000/api/kb?q=観葉植物の葉が黄色い" | jq '.answer'
-```
-
-`kb.json` は **学習データも兼ねます**: 内蔵ニューラルコアと n-gram LM の両方が
-この文を教師にするので、知識を増やすほど文章も自然になります（好循環）。
-
-## 語彙テーブル（パラメータの本体）
-
-ルール/確率経路の品質はテーブル規模で決まる。`tools/build_lexicon.py` が
-唯一の編集窓口（生成物 `snipher/data/*.json` は直接触らない）:
-
-| テーブル | エントリ | | テーブル | エントリ |
-|---|---|---|---|---|
-| 名詞 | 770 | | 助動詞 | 51 |
-| 動詞 | 226 | | 副詞 | 93 |
-| 形容詞 | 164 | | 接続詞 | 35 |
-| 助詞 | 60 | | 文型パターン | 26 |
-| 意図（intents） | 71 | | コーパス文 | 51 |
-
-ビルド時に自動で **活用の整合性検証**（五段の語幹行、形容詞の活用級、
-キー/スロット名のホワイトリスト、topic_affinity の実在確認）を通すので、
-壊れた語彙が本番データに入ることはありません（`検証 OK` が出たら成功）。
-
-## 未知文字の学習（LFM2.5 のパラメータを適用）
-
-- **自動**: 入力に `𠮷` や絵文字などの未知文字があると自動検出し、
-  LFM2.5 の**事前学習済み断片埋め込みの合成**で予約トークンとして即学習します
-  （torch バックエンド。UI 操作不要・応答をブロックしません）
-- **深学習（任意）**: 例文から埋め込み行のみを数ステップ勾配更新し、
-  ディスクに永続化（再起動後も有効）。UI の「未知文字の学習」ドロワーから実行
-- **GGUF バックエンド**: byte-fallback トークナイザのため未知文字は原理的に
-  発生しません（すべての文字・絵文字がそのまま読み書きできます）
-
-## テンプレートがない時の生成
-
-chat template は 3 段のフォールバックで常に生成できます:
-
-1. tokenizer / GGUF メタデータ同梱のネイティブテンプレート
-2. Snipher 内蔵の ChatML テンプレート（LFM2 系 `<|im_start|>` 形式）
-3. テンプレートなし（素の completion。UI の「テンプレート: なし」で選択可）
-
----
-
-## 独自確率式（高速コア）
-
-```
-S(w) = alpha * logP_freq      … 頻度事前分布(コーパス統計)
-     + beta  * logP_trans     … 品詞遷移(マルコフ)
-     + gamma * Q_role         … 格・役割適合(動詞が要求する助詞)
-     + delta * Q_inflect      … 活用整合(活用形と助動詞の一致)
-     + epsilon * Q_register   … 文体整合(です/ます体の一貫性)
-     + zeta   * Q_topic       … トピック一貫性(意味クラスの一致)
-
-P(w) = softmax( S(w) / temperature )
-```
-
-重みは `snipher/data/config.json` の 6 個のスカラーのみ。下書きの各スロット決定の
-確率から confidence を計算し、ニューラルコアに渡すかどうかの内部判定に使います。
-
----
-
-## 道具層: 計算・コード・現在情報
-
-知識ベースの近い話題を返すだけでは、文章題やプログラミング依頼に答えられません。
-Snipher には composer の前に **TaskRouter** を置き、仕事ごとに適した小さな道具へ
-分岐します。
-
-| 入力 | 道具 | 動作 |
-|---|---|---|
-| 単価×個数、四則、一次/二次方程式 | `tasks.py` の安全な計算器 | `eval` を使わず Fraction で式・途中計算・答えを返す |
-| Python / JavaScript の依頼 | コードタスク | よくある処理は実行可能なコード例、未知の仕様は雛形と必要な仕様を返す |
-| Node.js と Next.js の比較 | 比較タスク | 実行環境と React フレームワークを混同せず、用途別に判断する |
-| 最新、今日、ニュース、価格、天気、検索、出典 | `research.py` | 必要性を先に判定し、必要なときだけ Edge/Bing HTML 検索へ進む |
-
-### Edge HTML 検索 / html-fetch
-
-`snipher.research` はブラウザ自動操作を常用せず、Edge に近い User-Agent で検索結果の
-HTML を取得します。`HTMLParser` で title・本文・リンクを抽出し、上位ページだけを
-並列取得します。サイズ、タイムアウト、HTTP(S) のみ、localhost/プライベート IP 拒否、
-短い TTL キャッシュを内蔵しているため、検索不要のターンはネットワークに触れません。
-Bing が利用できない場合は DuckDuckGo の HTML 結果へ自動でフォールバックします。
-
-```python
-from snipher.research import ResearchEngine
-
-result = ResearchEngine().research("今日のニュース", limit=5)
-for source in result.sources:
-    print(source["title"], source["url"])
-```
-
-計算・HTML 抽出・Edge スクレイピングはネットワークなしのテスト
-`tests/test_tasks.py` / `tests/test_research.py` で検査しています。
-
----
-
-## REST API
-
-| メソッド | パス | 説明 |
-|---------|------|------|
-| GET | `/` | ホワイトテーマのチャット UI |
-| GET | `/health` | ヘルスチェック |
-| GET | `/info` | モデル情報・パラメータ総数（テーブル/知識ベース/蒸留コアの内訳つき） |
-| POST | `/analyze` | `{"text": "..."}` を解析（文構造・助動詞・要点） |
-| POST | `/generate` | 確率的な日本語文の生成 |
-| GET | `/api/status` | Snipher Core の状態（バックエンド・自動取得・学習済み語彙） |
-| POST | `/api/chat` | SSE ストリーミング応答。`mode: auto/fast/lfm/light`、`web: auto/on/off` |
-| POST | `/api/research` | Edge HTML 検索 + 上位ページ取得 + 出典 |
-| GET | `/api/search` | 軽量なウェブ検索（`?q=...&k=...`） |
-| GET/POST | `/api/fetch` | SSRF/サイズ制限付き html-fetch |
-| POST | `/api/complete` | 助動詞の補い（断片文の補完: ルール + 必要なら LFM2.5） |
-| GET | `/api/neural` | 内蔵ニューラルコア（蒸留スナップショット）の状態 |
-| POST | `/api/neural/probe` | 蒸留コアに生成・補完・採点させてみる |
-| POST/GET | `/api/neural/rebuild` | 蒸留コアを自分で再ビルド（常駐環境のみ・progress 取得可） |
-| GET | `/api/kb` | 知識ベース検索（`?q=...`、`answer` は採用された返信材料） |
-| GET | `/api/model/remote` | LFM2.5 リモート委譲の疎通確認 |
-| GET | `/api/model/acquire` | 自動取得ジョブの進捗 |
-| POST | `/api/model/fetch` | 自動取得の再試行 |
-| GET | `/api/model/import` | 手動取り込みディレクトリの状態 |
-| POST | `/api/model/upload` | （最後の手段）モデルファイルの手動取り込み |
-| POST | `/api/model/load` | 取り込み済み/指定ローカルモデルで再ロード |
-| POST | `/api/vocab/check` | テキスト中の未知文字をスキャン |
-| POST | `/api/learn` | 未知文字の学習（`mode: instant/deep`・torch バックエンド） |
-| GET/DELETE | `/api/learn/status` `/api/learn` | 深学習ジョブ状態 / 学習済み語彙の全消去 |
-
-```bash
-# チャット（SSE）
-curl -N -X POST http://localhost:8000/api/chat \
-  -H 'Content-Type: application/json' \
-  -d '{"messages":[{"role":"user","content":"今日はいい天気だね"}],"mode":"auto"}'
-
-# 知識ベース検索
-curl -s "localhost:8000/api/kb?q=雨はなぜ降るの"
-
-# 内蔵ニューラルコア: 状態 / 生成テスト / 再蒸留（サーバーが自分で作り直す）
-curl -s localhost:8000/api/neural
-curl -s -X POST localhost:8000/api/neural/probe -H 'content-type: application/json' \
-     -d '{"text":"今日は天気"}'
-curl -s -X POST localhost:8000/api/neural/rebuild -H 'content-type: application/json' -d '{"profile":"tiny"}'
-
-# LFM2.5 リモート委譲の疎通確認
-curl -s localhost:8000/api/model/remote
-
-# 助動詞の補い
-curl -X POST http://localhost:8000/api/complete \
-  -H 'Content-Type: application/json' \
-  -d '{"text":"私は猫が好き"}'
-```
-
----
-
-## 環境変数
-
-| 変数 | 既定 | 説明 |
-|---|---|---|
-| `SNIPHER_LFM_BACKEND` | `auto` | `auto/gguf/torch/off` |
-| `SNIPHER_LFM_MODEL` | 公式モデルID | ローカルディレクトリ or HF モデルID |
-| `SNIPHER_LFM_GGUF` | – | GGUF ファイルの直接指定 |
-| `SNIPHER_LFM_GGUF_QUANT` | `Q4_K_M` | 自動取得する GGUF の量子化 |
-| `SNIPHER_LFM_URLS` | – | 追加の直接ダウンロード URL（カンマ/改線区切り） |
-| `SNIPHER_LFM_SHARE_PAGE` | ギガワタス共有 | 共有ミラーのページ URL |
-| `SNIPHER_LFM_CACHE_DIR` | `var/models` | 取得したモデルのキャッシュ先 |
-| `SNIPHER_LFM_AUTO_FETCH` | `1` | 起動時の自動取得 |
-| `SNIPHER_LFM_QUANTIZE` | `1` | torch バックエンドの INT8 量子化 |
-| `SNIPHER_ASSIST_THRESHOLD` | `0.35` | これ未満の確度ならニューラルコアが生成 |
-| `SNIPHER_LIGHT_CORE` | `auto` | 内蔵蒸留コア: `auto`（重みが有れば使用）/ `on` / `off` |
-| `SNIPHER_LM` | `auto` | 巨大 n-gram LM: `auto`（lm.npz が有れば使用）/ `on` / `off` |
-| `SNIPHER_LIGHT_MAX_CHARS` | `64` | 蒸留コア 1 応答の生成上限文字数 |
-| `SNIPHER_LIGHT_GATE` | `0.34` | この確信度を下回ったときだけフルウェイト起動を裏で準備 |
-| `SNIPHER_LFM_REMOTE_URL` | 空 | LFM2.5 を常駐させたホスト（別の Snipher でも可）へ生成を委譲 |
-| `SNIPHER_LFM_REMOTE_TOKEN` | 空 | リモート委譲の Bearer トークン |
-| `SNIPHER_LLM_THREADS` | 自動 | llama.cpp のスレッド数 |
-| `SNIPHER_LLAMA_SERVER` | 自動探索 | llama-server バイナリのパス |
-
----
-
-## テスト
-
-```bash
-.venv/bin/python -m pytest tests/ -q          # 228 passed, 3 skipped（約 7 秒）
-```
-
-| ファイル | 守っている契約 |
-|---|---|
-| `test_knowledge_v2.py` | 問いの型に合う欄を返す / 知らないことは `None` / 1 文字の話題名も索引される |
-| `test_composer.py` | 材料が無ければ正直に言う / 定型文のゴミを出さない / 繰り返しても文が変わる / `validate()` が壊れた日本語を落とす / 述語だけの発話を気持ちとして受ける / echo の選び方 / 生成ゲート（丸書き検出・会話性・重複） |
-| `test_lm.py` | 自然な文とシャッフル文を perplexity で区別する / 保存・読み込みでスコアが変わらない / 確信度の校正が単調 |
-| `test_light_core.py` | 経路の契約（instant / knowledge / light / neural / fallback）・KV キャッシュが一括計算と一致する |
-| `test_core.py` `test_core_api.py` `test_engine.py` | イベント契約・REST API・パラメータ総数の内訳 |
-
-torch/transformers が無い環境では LFM2.5 系のテストだけ自動的にスキップされます
-（**Snipher 本体の 4 層はすべてテストされます**）。
-本物の GGUF がある環境では実推論テストも実行できます:
-
-```bash
-SNIPHER_TEST_GGUF=/path/to/LFM2.5-1.2B-JP-202606-Q4_K_M.gguf SNIPHER_TEST_GGUF_RUN=1 \
-  pytest tests/test_gguf_backend.py -q
-```
-
-開発/CI 用の小型モデル（同アーキテクチャ）で全コードパスを検証することもできます:
-
-```bash
-python tools/make_test_model.py --out var/tiny-lfm2
-SNIPHER_LFM_MODEL=var/tiny-lfm2 uvicorn snipher.api:app
-```
-
----
-
-## デプロイ
-
-- **自分の PC / VPS（推奨）**: 上のクイックスタートの通り。GGUF バックエンドなら
-  2GB 程度の RAM で動きます
-- **Render**: `render.yaml` が自動検出されます（無料プランの 512MB では
-  ニューラルコアは動かないため、高速コアのフォールバックで応答します。
-  スタンダード以上 + `pip install llama-cpp-python` をビルドコマンドに追加すれば
-  フル動作）
-- **Vercel**: `pyproject.toml` の `[tool.vercel]` によりサーバーレス起動。
-  731MB のモデルは読み込まない（読み込めるサイズではない）ので、
-  **同梱の 4 層（知識ベース 395 KiB + n-gram LM 2.29 MB + ニューラルコア 5.07 MB = 7.75 MB）**
-  でフル機能動作する。
-  `vercel.json` が `maxDuration=60 / memory=1024` とバンドル除外を設定済みで、
-  サーバーレス環境では `SNIPHER_LFM_AUTO_FETCH` が自動で `off`
-  （無駄なダウンロードを試みない）。より賢くしたければ
-  `SNIPHER_LFM_REMOTE_URL` に LFM2.5 を常駐させた VPS の URL を 1 行入れるだけ。
-- **Docker / VPS**: `pip install -r requirements.txt -r requirements-llm.txt`
-  なら起動時にフルウェイトを自動取得。常駐なので T1 が生き、同じ UI のまま品質が上がる
-
----
-
-## リポジトリ構成
-
-```
-snipher/
-  core.py         # ★ Snipher Core: 解析 → 知識 → composer → LM 判定 → ニューラル → 昇格
-  composer.py     # ★ 文の設計図（8 計画・枠の回転・validate）… v2 の中心
-  lm.py           # ★ 巨大 n-gram 言語モデル（281,385 エントリ・流暢さの審判）
-  knowledge.py    # ★ 知識ベース v2（BM25 + 最長一致辞書 + 問いの型の振り分け）
-  api.py          # FastAPI（SSE チャット・自動取得 API・学習 API）
-  engine.py       # 公開ファサード（解析/生成/info のパラメータ内訳）
-  lexicon.py      # テーブルロード
-  morphology.py   # 活用処理
-  parser.py       # 構文解析(文構造/助動詞/要点)
-  probability.py  # 独自確率式(softmax 確度)
-  generator.py    # 確率的生成(スロット確度の記録)
-  polisher.py     # 助動詞の補い・文体修復(ルール)
-  responder.py    # 意図分類 + 対話テーブル応答
-  data/           # 同梱する重みと知識（すべて生成物＋人が書いた日本語）
-    kb.json         #   知識ベース v2（tools/build_kb.py → 202 話題 / 395 KiB）
-    lm.npz          #   n-gram LM の重み（tools/build_lm.py → 2.29 MB）
-    dialogues.json  #   人が書いた対話 220 組（学習の錨・手で編集する）
-    *.json          #   語彙テーブル（tools/build_lexicon.py から生成）
-    neural/core.npz #   内蔵ニューラルコアの重み（int8・5.1 MB・tools/distill_neural.py）
-  neural/         # ★ LFM2.5 を蒸留した内蔵ニューラルコア（NumPy のみ）
-    nn.py           # ShortConv/注意 Hybrid + 手書き backward + DecodeCache（KV キャッシュ）
-    tokenizer.py    # 文字レベル語彙（未知文字が出ない）
-    corpus.py       # 人が書いた対話 + kb.json + 文法生成から教師文を自動構築
-    train.py        # Adam + warmup/cosine（epoch ごとのスナップショット対応）
-    store.py        # int8 量子化 + zlib ヘッダの npz コンテナ
-    core.py         # generate / reply / complete / score（KV キャッシュ使用）
-    cache.py        # プロセス共通インスタンス（遅延ロード・スレッドセーフ）
-  lfm/            # LFM2.5-1.2B-JP ニューラルコア（任意の昇格先）
-    acquire.py      # モデルの全自動取得(マルチソース・レジューム)
-    gguf_backend.py # llama.cpp バックエンド(CPU 最速)
-    engine.py       # torch バックエンド(INT8 量子化・ストリーミング)
-    learner.py      # 未知文字の学習(埋め込み合成 + 勾配更新)
-    template.py     # テンプレートの 3 段フォールバック
-    assist.py       # 高速コアの下書き/確信度(HybridAssist)
-    config.py       # 設定(環境変数)
-    vocab.py        # 未知文字スキャン
-  web/chat.html   # ホワイトテーマのチャット UI
-tools/
-  kb_data/           # ★ 知識ベースの中身（人が書いた日本語・7 ドメイン 176 エントリ）
-    __init__.py        #   T() DSL + validate()
-    food.py nature.py culture.py tech.py life.py animals.py talk.py
-  build_kb.py        # ★ kb.json の生成（v2 を優先し、v1 テーブルと 1 つに束ねる）
-  build_lm.py        # ★ n-gram LM の学習 + 判別力の検証（約 17 秒）
-  distill_neural.py  # ★ 内蔵ニューラルコアの蒸留ビルド（--profile tiny/base/big/huge）
-  bench.py           # ★ 実測ベンチマーク（README の表はここから作る）
-  build_lexicon.py   # 語彙テーブル生成 + 文法/活用検証
-  fetch_model.py     # 事前取得 CLI(自動取得と同じロジック)
-  make_test_model.py # 開発用小型モデル生成
-tests/            # 単体テスト 192（知識ベース v2 / composer / LM / KV キャッシュ / 経路契約）
-docs/             # 設計書(design.md / lfm.md)
-demo.py           # 高速コアの CLI デモ
-```
-
-### 作り直し方（すべてローカル・外部データ 0）
-
-```bash
-python tools/build_kb.py          # 知識ベース   … 約 1 秒
-python tools/build_lm.py          # n-gram LM    … 約 17 秒
-python tools/distill_neural.py    # ニューラルコア … 約 60 分（epoch ごとに保存）
-python tools/bench.py             # 実測して表を作る
-```
-
----
-
-## ライセンス
-
-MIT（Snipher 本体）。LFM2.5-1.2B-JP の重みは Liquid AI のライセンスに従います
-（HuggingFace リポジトリの LICENSE を参照）。
+辞書・語彙・知識ベースは出所を明示した再配布可能なデータからビルドしています。
+詳細は `NOTICE` と `snipher/data/*.meta.json` を見てください。

@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import base64
 import html
+import json
 import ipaddress
 from concurrent.futures import ThreadPoolExecutor
 import logging
@@ -177,11 +178,13 @@ class FetchResult:
     error: str | None = None
     # 末尾に置いて旧 positional 初期化 (url,status,title,text,links,...) を壊さない。
     description: str = ""
+    raw_html: str = ""            # 検索結果 HTML を構造で読むための原文（上限あり）
 
     def as_dict(self) -> dict:
         return {
             "url": self.url,
             "status": self.status,
+            "raw_chars": len(self.raw_html),
             "title": self.title,
             "text": self.text,
             "description": self.description,
@@ -362,13 +365,16 @@ class HtmlFetcher:
 
     def __init__(self, *, timeout: float | None = None, max_bytes: int | None = None,
                  max_text: int | None = None, opener: Callable | None = None,
-                 allow_private: bool | None = None):
+                 allow_private: bool | None = None, max_raw_bytes: int | None = None):
         # ネットワークが無い環境でもチャットを長く止めない。必要なら環境変数で延長可能。
         self.timeout = timeout if timeout is not None else _env_float("SNIPHER_WEB_TIMEOUT", 1.5)
         self.max_bytes = max_bytes if max_bytes is not None else _env_int("SNIPHER_WEB_MAX_BYTES", 1_500_000)
         self.max_text = max_text if max_text is not None else _env_int("SNIPHER_WEB_MAX_TEXT", 12_000)
         self.opener = opener or urlopen
         self.allow_private = bool(allow_private) if allow_private is not None else os.environ.get("SNIPHER_WEB_ALLOW_PRIVATE") == "1"
+        # 検索結果ページを *構造で* 解析するための原文バッファ（既定 360 KB）。
+        self.max_raw_bytes = max_raw_bytes if max_raw_bytes is not None else _env_int(
+            "SNIPHER_WEB_MAX_RAW", 360_000)
 
     def fetch(self, url: str, *, base_url: str | None = None) -> FetchResult:
         if base_url:
@@ -421,6 +427,7 @@ class HtmlFetcher:
             if m:
                 charset = m.group(1)
             text = body.decode(charset, "replace")
+            raw = text[: self.max_raw_bytes] if self.max_raw_bytes else ""
             parser = _PageParser()
             parser.feed(text)
             parser.close()
@@ -434,7 +441,7 @@ class HtmlFetcher:
                 url=str(url), status=status, title=_clean_text(" ".join(parser.title), 300),
                 text=page_text,
                 description=_clean_text(parser.meta.get("description") or parser.meta.get("og:description", ""), 600),
-                links=links, content_type=ctype,
+                links=links, content_type=ctype, raw_html=raw,
                 elapsed_ms=(time.perf_counter() - started) * 1000,
             )
         except HTTPError as exc:
@@ -452,8 +459,119 @@ class HtmlFetcher:
     html_fetch = fetch
 
 
+_RESULT_CLS = ("b_algo", "result__body", "e algo", "algo", "result results_links",
+               "titledLink", "result", "b_results")
+_AD_CLS = ("b_ad", "b_ps", "adsbygoogle", "sponsored", "b_topAl", "b_adt", "b_ans",
+           "b_vTPay", "ppc", "promo", "organic-ad", "b_slidebar")
+_NAV_HOSTS = {"bing.com", "www.bing.com", "microsoft.com", "www.microsoft.com",
+              "go.microsoft.com", "duckduckgo.com", "duck.co", "yahoo.co.jp"}
+
+
+class SerpParser(HTMLParser):
+    """検索結果 HTML を「1 件 = 1 ブロック」として読む。
+
+    v2 まではページ全体のリンクと説明を拾っていたため、Bing 自身の案内文
+    （リワード・サインイン等）が *回答の本文* として混ざりました。ここからは
+    li/div のクラスで結果ブロックを決め、ブロック内の h2/h3 アンカーと
+    p の説明文だけに対応づけます。広告・計算回答ブロックは捨てます。
+    """
+
+    def __init__(self, *, limit: int = 10):
+        super().__init__(convert_charrefs=True)
+        self.items: list[SearchResult] = []
+        self._limit = limit
+        self._stack: list[dict] = []
+
+    @staticmethod
+    def _cls(attrs: list[tuple[str, str | None]]) -> str:
+        d = {str(k).lower(): str(v or "") for k, v in attrs}
+        return (d.get("class", "") + " " + d.get("id", "")).lower()
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        cls = self._cls(attrs)
+        if tag in {"li", "div", "ol", "section", "article"} and any(c in cls for c in _RESULT_CLS):
+            block = {"tag": tag, "ad": any(a in cls for a in _AD_CLS), "title": "",
+                     "href": "", "tbuf": None, "pbuf": [], "snippet": [],
+                     "in_title": False, "skip": 0, "nested": 0}
+            if self._stack:
+                # 内側に結果ブロックを持つ外枠（ol.b_results 等）は、自分では出力しない。
+                # さもないと広告ブロックの語が外枠の題目として漏れます（v2 のバグ）。
+                self._stack[-1]["nested"] = int(self._stack[-1].get("nested", 0)) + 1
+            self._stack.append(block)
+        if not self._stack:
+            return
+        top = self._stack[-1]
+        d = {str(k).lower(): str(v or "") for k, v in attrs}
+        if tag in {"h1", "h2", "h3"} and not top["title"]:
+            top["in_title"] = True
+        if tag == "a" and top["in_title"] and not top["href"]:
+            top["href"] = d.get("href", "")
+            top["tbuf"] = []
+        if tag == "p":
+            top["pbuf"].append([])
+        if tag in {"script", "style", "noscript"}:
+            top["skip"] += 1
+
+    def handle_endtag(self, tag: str) -> None:
+        if not self._stack:
+            return
+        top = self._stack[-1]
+        if tag in {"h1", "h2", "h3"}:
+            top["in_title"] = False
+        if tag == "a" and top["tbuf"] is not None:
+            top["title"] = _clean_text("".join(top["tbuf"]), 260)
+            top["tbuf"] = None
+        if tag == "p" and top["pbuf"]:
+            buf = top["pbuf"].pop()
+            text = _clean_text("".join(buf), 600)
+            if text and len(text) >= 12:
+                top["snippet"].append(text)
+        if tag in {"script", "style", "noscript"}:
+            top["skip"] = max(0, top["skip"] - 1)
+        if tag == top["tag"]:
+            self._pop_block()
+
+    def handle_data(self, data: str) -> None:
+        if not self._stack:
+            return
+        top = self._stack[-1]
+        if top["skip"]:
+            return
+        if top["tbuf"] is not None:
+            top["tbuf"].append(data)
+        if top["pbuf"]:
+            top["pbuf"][-1].append(data)
+
+    def _pop_block(self) -> None:
+        top = self._stack.pop()
+        if top["ad"] or int(top.get("nested", 0) or 0) > 0:
+            return
+        title = top.get("title", "")
+        href = html.unescape(top.get("href", "") or "")
+        if not title or not href:
+            return
+        url = _unwrap_search_url(href)
+        if not url.startswith(("http://", "https://")):
+            return
+        host = (urlparse(url).hostname or "").lower()
+        if host in _NAV_HOSTS:
+            return
+        snippet = _clean_text(" ".join(top["snippet"])[:600], 600)
+        self.items.append(SearchResult(title=title[:240], url=url, snippet=snippet,
+                                       rank=len(self.items) + 1))
+        if len(self.items) >= self._limit:
+            self._stack.clear()
+
+    def finalize(self, provider: str) -> list[SearchResult]:
+        for i, item in enumerate(self.items, 1):
+            item.source = provider
+            item.rank = i
+        return self.items
+
+
+
 class EdgeSearchProvider:
-    """Edge/Bing HTML 検索を行う軽量プロバイダ。"""
+    """Edge/Bing の検索 HTML を取り、*結果ブロック単位*で読む軽量プロバイダ。"""
 
     name = "edge-bing-html"
 
@@ -461,33 +579,48 @@ class EdgeSearchProvider:
         self.fetcher = fetcher or HtmlFetcher()
         self.endpoint = endpoint or os.environ.get("SNIPHER_EDGE_SEARCH_URL", _DEFAULT_SEARCH_URL)
 
+    def _parse(self, page: FetchResult, limit: int) -> list[SearchResult]:
+        out: list[SearchResult] = []
+        raw = getattr(page, "raw_html", "") or ""
+        if raw:
+            parser = SerpParser(limit=limit)
+            try:
+                parser.feed(raw)
+                parser.close()
+                out = parser.finalize(self.name)
+            except Exception:  # noqa: BLE001
+                log.debug("SERP の構造解析に失敗", exc_info=True)
+                out = []
+        if out:
+            return out[:limit]
+        # 縮退: アンカーの羅列から見出し候補だけ拾う。スニペットは空のままにし、
+        # ページ全体の文字列を「根拠」として流し込むことは絶対にしない。
+        skip = {"画像", "動画", "ニュース", "地図", "ショッピング", "検索", "サインイン",
+                "images", "videos", "maps", "more", "menu"}
+        for link in page.links[: limit * 8]:
+            title = _clean_text(str(link.get("text", "")), 240)
+            url = _unwrap_search_url(str(link.get("url", "")))
+            host = (urlparse(url).hostname or "").lower()
+            if not title or title.casefold() in {x.casefold() for x in skip}:
+                continue
+            if host in _NAV_HOSTS or not url.startswith(("http://", "https://")):
+                continue
+            if len(title) < 8 or not re.search(r"[ぁ-んァ-ヶ一-龯A-Za-z]{3,}", title):
+                continue
+            if any(url.startswith(x) for x in ("#", "javascript:")):
+                continue
+            out.append(SearchResult(title=title, url=url, snippet="", source=self.name,
+                                    rank=len(out) + 1))
+            if len(out) >= limit:
+                break
+        return out
+
     def search(self, query: str, *, limit: int = 5) -> list[SearchResult]:
         url = self.endpoint.format(query=quote_plus(str(query)), count=max(1, min(10, limit)))
         page = self.fetcher.fetch(url)
-        if page.error or not page.text and not page.title:
+        if page.error and not (getattr(page, "raw_html", "") or ""):
             return []
-        # _PageParser の text だけでは class 情報が失われるので、リンクを記事候補として
-        # ラベル順に使う。検索 HTML の anchor は fetcher.links に残る。
-        parser = _SearchParser()
-        # fetcher は安全性と decode を担当済みだが、テスト可能性のため page.text だけでなく
-        # links も利用する。Bing の parser は raw HTML opener を差し替えた時に下記を通る。
-        skip_labels = {"画像", "動画", "ニュース", "地図", "ショッピング", "検索", "サインイン", "images", "videos"}
-        for link in page.links:
-            title = _clean_text(link.get("text", ""), 240)
-            url = _unwrap_search_url(str(link.get("url", "")))
-            host = (urlparse(url).hostname or "").lower()
-            if title and title.casefold() not in {x.casefold() for x in skip_labels} \
-                    and host not in {"bing.com", "www.bing.com", "microsoft.com", "www.microsoft.com"}:
-                parser.items.append(SearchResult(title=title, url=url))
-        out = parser.finalize(self.name, limit)
-        if not out:
-            # FetchResult のリンクがナビゲーションだけの場合でも title/text を材料に返す。
-            return []
-        for i, item in enumerate(out):
-            item.rank = i + 1
-            item.source = self.name
-            item.snippet = page.description or page.text[:360]
-        return out
+        return self._parse(page, max(1, min(10, limit)))
 
 
 class DuckDuckGoProvider(EdgeSearchProvider):
@@ -499,6 +632,39 @@ class DuckDuckGoProvider(EdgeSearchProvider):
         super().__init__(fetcher, endpoint=_FALLBACK_SEARCH_URL)
 
 
+class WikipediaApiProvider:
+    """日本語 Wikipedia の opensearch/summary API（HTML スクレイピングより速く正確）。"""
+
+    name = "wikipedia-api"
+    API = "https://ja.wikipedia.org/w/api.php"
+
+    def __init__(self, fetcher: HtmlFetcher | None = None):
+        self.fetcher = fetcher or HtmlFetcher()
+
+    def search(self, query: str, *, limit: int = 5) -> list[SearchResult]:
+        url = (f"{self.API}?action=query&list=search&srsearch={quote_plus(str(query))}"
+               f"&srlimit={max(1, min(10, limit))}&format=json&srprop=snippet|words&utf8=1")
+        page = self.fetcher.fetch(url)
+        if page.error or not page.text:
+            return []
+        try:
+            data = json.loads(page.text)
+        except Exception:  # noqa: BLE001
+            return []
+        out: list[SearchResult] = []
+        for hit in (data.get("query", {}) or {}).get("search", []) or []:
+            title = _clean_text(str(hit.get("title", "")), 200)
+            snippet = re.sub(r"<[^>]+>", "", str(hit.get("snippet", "")))
+            snippet = _clean_text(snippet, 480)
+            if not title:
+                continue
+            out.append(SearchResult(title=title,
+                                    url="https://ja.wikipedia.org/wiki/" + quote_plus(title),
+                                    snippet=snippet, source=self.name, rank=len(out) + 1))
+        return out[:limit]
+
+
+
 class ResearchEngine:
     """検索 → 上位 HTML fetch → 引用可能な材料、を束ねる内部ツール。"""
 
@@ -507,7 +673,14 @@ class ResearchEngine:
                  cache_ttl: float | None = None, cache_size: int | None = None):
         self.fetcher = fetcher or HtmlFetcher()
         self.policy = policy or ResearchPolicy()
-        self.providers = list(providers) if providers is not None else [EdgeSearchProvider(self.fetcher), DuckDuckGoProvider(self.fetcher)]
+        if providers is not None:
+            self.providers = list(providers)
+        else:
+            self.providers = [EdgeSearchProvider(self.fetcher), DuckDuckGoProvider(self.fetcher)]
+            if os.environ.get("SNIPHER_WEB_WIKIPEDIA", "1") != "0":
+                from .research import WikipediaApiProvider
+
+                self.providers.append(WikipediaApiProvider(self.fetcher))
         self.cache_ttl = cache_ttl if cache_ttl is not None else _env_float("SNIPHER_WEB_CACHE_TTL", 90.0)
         self.cache_size = cache_size if cache_size is not None else _env_int("SNIPHER_WEB_CACHE_SIZE", 64)
         self._cache: OrderedDict[str, tuple[float, ResearchResult]] = OrderedDict()

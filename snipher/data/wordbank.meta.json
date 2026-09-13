@@ -1,0 +1,14 @@
+{
+  "words": 150000,
+  "game_words": 63800,
+  "conjugations": 16389,
+  "bytes": 1771810,
+  "game_bytes": 574975,
+  "conjugation_bytes": 595874,
+  "params_estimate": 794912,
+  "stats": {
+    "source": "janome",
+    "rows": 392127
+  },
+  "attribution": "word forms and readings derived from Janome's system dictionary (Apache-2.0); underlying dictionary data: IPADIC family"
+}
