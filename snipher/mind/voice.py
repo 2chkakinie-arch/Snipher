@@ -78,7 +78,12 @@ def _overlap(a: str, b: str, n: int = 6) -> float:
 
 def _tidy(sentence: str) -> str:
     s = normalize(sentence)
-    s = re.sub(r"\s+", "", s) if re.search(r"[ぁ-んァ-ヶ一-龯]", s) else s
+    if re.search(r"[ぁ-んァ-ヶ一-龯]", s):
+        # 和文は隙間を詰めますが、*半角どうしの空白* は「git init」のように語の区切りなので
+        # 消せません（v4 で手順を 1 行ずつに並べたらここが消えて「gitinit」になりました）。
+        s = re.sub(r"(?<=[\u3000-\u9fff、。・：；！？「」『』（）\-])[ \t]+", "", s)
+        s = re.sub(r"[ \t]+(?=[\u3000-\u9fff、。・：；！？「」『』（）])", "", s)
+        s = re.sub(r"[ \t]{2,}", " ", s).strip()
     s = re.sub(r"[。]+$", "", s)
     s = re.sub(r"、{2,}", "、", s)
     s = re.sub(r"(です|ます)(です|ます)$", r"\1", s)
@@ -139,7 +144,12 @@ def followup(frame, dossier, *, turn: int) -> str:
     if frame.ask in ("yesno", "opinion") and not topic:
         return "どんな場面で使う予定か、一言だけ添えてもらえますか。"
     if frame.ask in ("procedure",) and dossier.claims:
-        return "手順は環境で変わる部分があるので、OS とバージョンを教えてください。"
+        # 手順の詰まりは *手順が環境に依存するとき* しか起きないので、その場合成ります。
+        blob = f"{topic} {getattr(frame, 'raw', '') or ''}"
+        if re.search(r"(OS|サーバー|サーバ|パソコン|PC|環境|インストール|設定|デプロイ|アプリ|"
+                     r"ソフト|バージョン|python|node|docker|ブラウザ|ウェブ|ライブラリ|端末|mac|"
+                     r"windows|linux)", blob, re.IGNORECASE):
+            return "手順は環境で変わる部分があるので、OS とバージョンを教えてください。"
     if frame.is_followup and not dossier.claims:
         return "どの部分を続ければよいか、言葉を一語だけ足してもらえますか。"
     return ""

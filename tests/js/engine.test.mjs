@@ -15,6 +15,22 @@ const index = new Index(kb);
 
 const LEXICON = /拍|索引|品詞|U\+|読みは/;
 
+test("知らない語の質問は *問いの形* から方針を返す（辞書引きも不在も言わない）", () => {
+  const r = answer("申年休假を申請する手順を教えて。", { index, turn: 1 });
+  assert.match(r.text, /手続き|手順/);
+  assert.match(r.text, /いつまでに|誰に出すか/);
+  for (const banned of ["拍", "索引", "品詞", "読みは", "U+", "できません", "分かりません", "無い"]) {
+    assert.ok(!r.text.includes(banned), `${banned} が混ざっている: ${r.text}`);
+  }
+});
+
+test("読めない短文でも受け取り口を置いて会話を止めない", () => {
+  const r = answer("は？", { index, turn: 3 });
+  assert.ok(r.text.length >= 8, r.text);
+  assert.ok(!/索引|拍|品詞/.test(r.text), r.text);
+  assert.ok(!/できません|分かりません|ありません/.test(r.text), r.text);
+});
+
 test("索引が載っている語の定義を引ける", () => {
   const r = answer("WebAssembly とは何ですか？", { index });
   assert.match(r.text, /WebAssembly/);

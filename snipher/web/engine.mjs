@@ -304,7 +304,10 @@ export function answer(text, { index, turn = 1, history = [], style = {}, kb } =
   // 話題が引けないとき: 内容語で反応し、抜けている枠を 1 つだけ聞く（辞書引きはしない）
   const nouns = tokens(raw).filter((w) => /[\u4e00-\u9fff\u30a1-\u30fa]/.test(w) && w.length >= 2);
   const lead = nouns.find((w) => !/^(今日|明日|昨日|一緒)$/.test(w)) || topic || "";
-  if (!claims.length && lead) {
+  if (!claims.length && lead && !best && /[？?]|教えて|知りたい|ほしい|できますか|どうやって/.test(raw)) {
+    // 知らない語を *聞かれた* ときは、相槌ではなく問いの形から方針を返します。
+    claims.push([shapeLine(normalize(raw)), "answer"]);
+  } else if (!claims.length && lead) {
     const act = /たい$|よう$|予定|行こ|しよ/.test(normalize(raw)) ? "plan"
       : /た$|終わ|できた/.test(normalize(raw)) ? "report"
       : /痛|辛|困|嫌|最悪|疲/.test(raw) ? "trouble"
@@ -315,7 +318,12 @@ export function answer(text, { index, turn = 1, history = [], style = {}, kb } =
     claims.push([done(pool[Math.abs(turn) % pool.length].replace(/\{n\}/g, lead)), "answer"]);
   }
   if (!claims.length) {
-    claims.push(["その語については、いま読めている形から組み立てます。", "answer"]);
+    // 語が引けないときも *問いの形* から当面の方針を立てる（辞書引きも「無い」も言わない）
+    const shape = shapeLine(normalize(raw));
+    claims.push([shape, "answer"]);
+    if (lead && !/^(何|どれ|いつ)/.test(normalize(raw))) {
+      claims.push([`「${lead}」について、意味・使い方・数量のどれを欲しがっていますか。`, "ask"]);
+    }
   }
   if (!best && lead) {
     const slot = SLOTS.find(([re]) => re.test(normalize(raw)));
@@ -390,6 +398,26 @@ function pickValue(src, key) {
   const labeled = src.match(new RegExp(`${k.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\s*[:：]?\\s*([^\\n、,。;；]{1,40})`, "i"));
   if (labeled) return labeled[1].trim();
   return null;
+}
+
+const SHAPES = [
+  [/(手順|申請|手続き|やり方|使い方|方法|how\s*to)/i,
+   "手続きを尋ねる形として組みます。決めるのは、いつまでに・誰に出すか・どの形で残すか、の三つです。"],
+  [/(値段|いくらか|費用|コスト|料金)/,
+   "費用の話として組みます。材料代と手間時間のどちらを先に押さえるかで答えの形が変わります。"],
+  [/(違い|比較|vs|どっち)/i,
+   "比較の形にします。速さ・手間・あとから拡張できるかの三本で揃えて比べるのが安全です。"],
+  [/(おすすめ|選び方|向いて|どれがいい|価値|コスパ)/,
+   "向きの話として組みます。扱う量と、壊れたときに立て直す時間を基準にすると迷いません。"],
+  [/(エラー|動かない|失敗|直したい|bug)/i,
+   "詰まっている話として受け取ります。最後に変わった一点を切り分けると早く減ります。"],
+  [/(いくつ|何個|数量|どれくらい)/,
+   "量の話を聞いている形にします。単位と、数える対象が決まれば答えられます。"],
+];
+
+export function shapeLine(text) {
+  for (const [re, msg] of SHAPES) if (re.test(text)) return msg;
+  return "どんな場面で使う語かを一言もらえれば、その場で同じ形に組みます。";
 }
 
 export function respond(messages = [], { index, style = {}, turn = 0 } = {}) {

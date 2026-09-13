@@ -295,6 +295,29 @@ def kb_claims(query: str, *, kb, frame) -> tuple[list[Claim], dict]:
                 text = defin + " " + text
         except Exception:  # noqa: BLE001
             pass
+    if field_name == "how":
+        # 手順は *並べる* ものなので、KB の一覧をそのまま 1 行ずつにします。
+        #読点で繋いだ 1 文は段取りが読めず、手順の答えになりません。
+        item = None
+        try:
+            item = next((it for it in kb.items if str(it.get("topic")) == topic), None)
+        except Exception:  # noqa: BLE001
+            item = None
+        steps = [str(x).strip() for x in ((item or {}).get("how") or []) if str(x or "").strip()]
+        steps = [s if s.endswith(("。", "！", "？")) else s + "。" for s in steps if 6 <= len(s) <= 90]
+        if len(steps) >= 2:
+            defin = str((item or {}).get("def") or "").strip()
+            if defin and 10 <= len(defin) <= 90:
+                hits.append(Claim(kind="definition", content=defin, subject=topic,
+                                  source="local:kb", slot="def", weight=0.7))
+            for s in steps[:4]:
+                hits.append(Claim(kind="step", content=s, subject=topic, source="local:kb",
+                                  slot="how", weight=0.78,
+                                  extra={"coverage": material.get("coverage"),
+                                         "score": material.get("score"),
+                                         "qtype": material.get("qtype"),
+                                         "via": material.get("via")}))
+            return hits, meta
     hits.append(Claim(kind=_kind_for_field(field_name), content=text, subject=topic,
                       source="local:kb", slot=field_name,
                       weight=float(material.get("confidence") or 0.62),
@@ -303,14 +326,16 @@ def kb_claims(query: str, *, kb, frame) -> tuple[list[Claim], dict]:
     if kind == "exact" and tok and normalize(topic) != normalize(tok) \
             and normalize(tok) not in normalize(text) and len(tok) <= 6 \
             and not re.search(r"[?？!！]", tok) and lex.bank().has(tok):
+        # 「〜なので検索に掛かりません」型の自己説明は出さない *言い換え*。
+        # 何を根拠にしているかは一行で分かります。
         hits.append(Claim(kind="note",
-                          content=f"「{tok}」は単独の項目に無いので、近い話題「{topic}」の知識として出します。",
+                          content=f"「{tok}」は近い話題「{topic}」として読みます。",
                           subject=topic, source="local:kb", weight=0.5, extra={"related": True}))
     hy = meta.get("hypernym") or {}
     if hy.get("surface"):
         hits.insert(0, Claim(kind="note",
-                             content=f"「{hy['surface']}」は単独の項目を持っていないので、"
-                                     f"上位の語「{hy.get('topic') or topic}」の知識で答えます。",
+                             content=f"「{hy['surface']}」は上位の語「{hy.get('topic') or topic}」"
+                                     f"で読みます。",
                              subject=hy["surface"], source="local:kb", weight=0.55,
                              extra={"hypernym": True}))
     follow = str(material.get("followup") or "").strip()

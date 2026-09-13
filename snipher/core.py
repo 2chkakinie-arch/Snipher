@@ -1297,8 +1297,16 @@ class SnipherCore:
             except Exception:  # noqa: BLE001
                 comp = {}
             if comp.get("changed") and float(comp.get("confidence", 0) or 0) >= 0.25:
-                added = comp.get("added") or ""
-                text = comp.get("text") or text
+                cand = str(comp.get("added") or "")
+                # 補いは *語尾まで* に限ります。1 文ぶん足し始めると、モデルは覚えている
+                # 別の知識をここに混ぜてきます（実測で「もう少し自然言語処理の話を…」が
+                # 混ざりました）。新しい語を持ち込む補いも同じ理由で捨てます。
+                words = [w for w in re.findall(r"[\u30a1-\u30fa]{2,}|[\u4e00-\u9fff]{2,}|[A-Za-z]{3,}", cand)]
+                src = f"{text} {last_user}"
+                if (cand and len(cand) <= 14 and "。" not in cand
+                        and all(w in src for w in words)):
+                    added = cand
+                    text = comp.get("text") or text
 
         # ---- 3.5) どの経路でも最終文は必ず判定する --------------------------- #
         # 昇格（フルウェイト起動）の判定は「内蔵コアの自信」で行う。知識ベースや

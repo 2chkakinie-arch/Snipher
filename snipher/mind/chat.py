@@ -466,7 +466,7 @@ def repair_claims(obs: dict, *, last_topic: str = "", items: list[dict] | None =
                              subject=topic, source="local:kb", weight=0.7,
                              extra={"topic": topic}))
     ask = _rot(salt=obs["text"] + "|ask",
-               pool=("どの欄が欲しかったですか。", "何を先に決めたいですか。",
+               pool=("どの話の部分を見せてほしかったですか。", "何を先に決めたいですか。",
                      "数字・手順・比較のどれが必要ですか。"), turn=turn)
     out.append(Claim(kind="question", content=ask, source="local:meta", weight=0.5))
     return out
