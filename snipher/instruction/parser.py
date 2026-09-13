@@ -39,7 +39,9 @@ PAYLOAD_MARKERS = (
     "抜粋", "要約する文", "内容", "項目", "リスト", "一覧", "候補", "要素", "リスト",
     "次の文", "以下の文", "この文", "次の文章", "以下の文章",
     "以下のテキスト", "下記", "以下", "次", "この文章", "その文章", "問題文", "説明文",
+    "質問", "問い", "単語", "単語リスト", "キー", "数値", "値",
     "text", "input", "content", "passage", "data", "document", "prompt", "output",
+    "question", "query",
 )
 
 _LABELS = "|".join(sorted(PAYLOAD_MARKERS, key=len, reverse=True))
@@ -178,6 +180,7 @@ _SUMMARY_WORDS = re.compile(
     r"(?:要約|まとめ(?:て|る)|要点|サマリ|サマリー|概括|要旨|summar|tl;dr| abstract )", re.IGNORECASE)
 _LIST_WORDS = re.compile(r"(?:列挙|列举|リストアップ|挙げて|あげて|並べて|書き出して|enumerate)", re.IGNORECASE)
 _TRANSLATE_WORDS = re.compile(r"(?:翻訳|訳して|訳し|に翻訳|translate)", re.IGNORECASE)
+_CLASSIFY_WORDS = re.compile(r"(?:分類|仕分け|カテゴリー分け|カテゴリ分け|類別|classify|分類して|仕分けて)", re.IGNORECASE)
 _ANSWER_WORDS = re.compile(
     r"(?:答えて|答えよ|回答して|回答せよ|応えて|解説して|説明して|教えて|述べて|説明せよ|"
     r"answer|explain|describe|define|compare|discuss|elaborate)",
@@ -354,6 +357,15 @@ def schema_fields(template: str) -> list[tuple[str, str]]:
                m.group(3) or m.group(4) or m.group(5) or "").strip()
         if key and key not in [k for k, _ in out]:
             out.append((key, val))
+    for m in re.finditer(r'\"([^\"\n]{1,40})\"\s*:\s*(?=(?:,|\n|}|$))', template):
+        key = m.group(1).strip()
+        if key and key not in [k for k, _ in out]:
+            out.append((key, ""))
+    if len(out) < 2:
+        keys = re.findall(r'\"([A-Za-z_][A-Za-z0-9_]*)\"\s*:', template)
+        for k in keys:
+            if k not in [x for x, _ in out]:
+                out.append((k, ""))
     return out
 
 
@@ -738,6 +750,23 @@ def split_payload(text: str) -> tuple[str, str, list[tuple[int, int]], list[str]
                     marks.append("quote")
             if not any(a <= m.start() and m.end() <= b for a, b in spans):
                 spans.append((m.start(), m.end()))
+    if not payload and re.search(r"続き", t):
+        for m in re.finditer(r"[「『]([^」』]+)[」』]", t):
+            body = m.group(1).strip()
+            if body and len(body) >= 4:
+                payload = body
+                marks.append("continuation-quote")
+                spans.append((m.start(), m.end()))
+                break
+    if not payload:
+        m = re.search(r"(?:してください|して下さい|してください。|お願いします|せよ|しろ)[。！!?]?\s*", t)
+        if m:
+            rest = t[m.end():].strip()
+            if rest and ("\n" in rest or ":" in rest or "・" in rest or re.search(r"[A-Za-z0-9_{}\[]", rest) or len(rest) >= 6):
+                if not re.search(r"\{[^{}]*\"[^{}]*\}", rest) or len(rest) > 30:
+                    payload = rest
+                    marks.append("fallback-tail")
+                    spans.append((m.end(), len(t)))
 
     instruction = _strip_spans(t, spans) if spans else t
     instruction = re.sub(r"[ \t]{2,}", " ", instruction).strip()
@@ -762,6 +791,12 @@ def parse_role(text: str) -> str:
     m = _ROLE.search(t)
     if m:
         return m.group(1).strip("「」『』\"' 、")
+    # fallback for embedded quotes like 語尾に「〜ロボ」をつけるロボット
+    m2 = re.search(r"(?:あなた|君|きみ|お前|そちら|assistant|ai)\s*(?:は|って|として)\s*(.+?)(?:です|である|だよ|だね)\s*[。！？!?]?", t)
+    if m2:
+        cand = m2.group(1).strip("「」『』\"' 、")[:40]
+        if len(cand) >= 4 and not re.search(r"(?:してください|教えて|答えて)", cand):
+            return cand
     m = re.search(r"[「『]([^」』]{2,30})[」』]\s*(?:という|の)?\s*(?:役|役割|ロール|キャラ|キャラクター|設定)", t)
     if m:
         return m.group(1).strip()
@@ -769,8 +804,6 @@ def parse_role(text: str) -> str:
     if m:
         return m.group(1).strip("、。 ")
     return ""
-
-
 #: ラベルの無い問い（「〜とは何ですか？」/ `What is …?`）も行として拾う
 _BARE_QUESTION_LINE = re.compile(r"([^\n]{4,80}?(?:とは何ですか|とはなんで|は何ですか|って何ですか|"
                                  r"とは何ですか|ですか|でしょうか)[？?]?)")
@@ -795,6 +828,12 @@ def parse_question(text: str) -> str:
                 break
             got = cut
         return got.strip("「」『』 　。、:")
+    m_about = re.search(r"([^\n。]{2,30}?)(?:について|に関して|に関しての|についての)\s*(?:詳しく)?\s*(?:教えて|説明して|知りたい|とは)", t)
+    if m_about:
+        got = m_about.group(1).strip("「」『』 　、、。")
+        got = re.sub(r"^(?:指示|以下|上記|次の|この|その).*?[：:]\s*", "", got).strip()
+        if got and len(got) >= 1 and not re.search(r"(?:してください|指示)", got):
+            return got.strip("「」『』 　。、:") + "について教えて"
     # 指示文の中に *問いの形* の 1 文があれば、それが答え的对象
     for line in [x.strip() for x in t.split("\n") if x.strip()]:
         m2 = _BARE_QUESTION_LINE.search(line)
@@ -844,6 +883,36 @@ def function_spec(text: str) -> tuple[str, list[str]]:
 # タスク判定
 # --------------------------------------------------------------------------- #
 def classify_task(instruction: str, fmt: FormatSpec, *, payload: str = "", question: str = "") -> str:
+    # 高次元分類器を最優先で試す（全文脈で判定し、単一キーワードに引っ張られない）
+    try:
+        from .highdim_classifier import classify_full as _hd_classify
+        task_hd, conf_hd, scores_hd = _hd_classify("", instruction=instruction, payload=payload, question=question)
+        # 高い確信度で、かつ構造との整合が取れればそれを採用
+        if task_hd and conf_hd >= 0.62:
+            # 構造化データ（JSON等）があるときは extract を優先する整合チェック
+            structured_hd = fmt.kind in ("json", "csv", "table", "keyvalue")
+            if task_hd == "extract" and not (structured_hd or fmt.schema_fields):
+                # 構造が無ければ extract の高確信は疑う（単語「抽出」だけで決めない）
+                pass
+            elif task_hd == "code" and not str(instruction or "").strip():
+                pass
+            else:
+                return task_hd
+        # 中確信度でも、キーワードだけの判定より全文脈の判定を優先（偏り防止）
+        if task_hd and conf_hd >= 0.55:
+            # extract は構造（JSON/CSV等）が無ければ採用しない（単語「抽出」だけで決めない）
+            if task_hd == "extract" and not (fmt.kind in ("json", "csv", "table", "keyvalue") or fmt.schema_fields):
+                pass
+            elif task_hd in ("classify", "list") and "分類" in str(instruction or "") and payload:
+                return task_hd
+            elif task_hd not in ("", "answer") or conf_hd >= 0.60:
+                # ただし extract のように構造が必要なものは除外済み
+                if task_hd != "extract":
+                    return task_hd
+                # extract は上ですでに除外したのでここには来ない
+                return task_hd
+    except Exception:
+        pass
     t = str(instruction or "")
     structured = fmt.kind in ("json", "csv", "table", "keyvalue")
 
@@ -889,11 +958,19 @@ def classify_task(instruction: str, fmt: FormatSpec, *, payload: str = "", quest
         return "summarize"
     if _WRITE_WORDS.search(t):
         return "write"
+    if _CLASSIFY_WORDS.search(t):
+        return "classify"
+    if re.search(r"続きを(?:書いて|作成して|作って)", t):
+        return "write"
     if payload and re.search(r"(?:変換|変えて|直して|置き換え|整形|逆順|逆から|並び替|大文字|小文字|"
                              r"ローマ字|カタカナ|ひらがな|全角|半角|frequency|頻度|文字数|重複|取り除|"
                              r"ソート|format|convert|reverse|uppercase|lowercase|dedupe|uniq|sort)",
                              t, re.IGNORECASE):
         return "transform"
+    if re.search(r"(?:一言|一語|ひとこと)で", t):
+        return "answer"
+    if re.search(r"(?:挨拶|あいさつ|自己紹介)", t):
+        return "answer"
     return ""
 
 
@@ -917,6 +994,8 @@ def _imperatives(text: str) -> list[str]:
 
 # 「仕事を名指しする動詞」。これがある 1 通は *依頼* であって感想ではない。
 _TASK_VERBS = ("要約", "まとめ", "抽出", "出力", "書いて", "作成", "作って", "実装", "答えて",
+               "挨拶", "あいさつ",
+               "分類", "仕分け",
                "答えよ", "列挙", "変換", "翻訳", "整形", "比較し", "説明し", "解説し", "直して",
                "逆順", "並び替", "大文字", "小文字", "ローマ字", "カタカナ", "ひらがな",
                "取り除", "除い", "置き換え", "整形",
@@ -955,6 +1034,9 @@ def parse(text: str, *, min_score: float = 0.55) -> Directive | None:
     role = parse_role(raw)
     verbs = _imperatives(instruction or raw)
     task = classify_task(instruction, fmt, payload=payload, question=question)
+    if not task and role:
+        # role-specified greeting like 「語尾に〜ロボをつけるロボットです。挨拶を」
+        task = "answer"
     if not task:
         return None
 
@@ -992,8 +1074,14 @@ def parse(text: str, *, min_score: float = 0.55) -> Directive | None:
     if fmt.target_chars or fmt.max_chars:
         score += 0.12
         signals.append(f"length:{fmt.target_chars or fmt.max_chars}")
+    if fmt.brief:
+        score += 0.10
+        signals.append("brief")
+    if fmt.no_greeting or fmt.no_explanation:
+        score += 0.10
+        signals.append("no_extra")
     if (fmt.target_chars or fmt.max_chars or fmt.bullets or fmt.lines or fmt.tone
-            or fmt.register) and (question or payload):
+            or fmt.register or fmt.brief or fmt.no_greeting) and (question or payload or _ANSWER_WORDS.search(instruction or raw) or _TASK_VERBS):
         # 出力の形を *数字や口調で指定している* のが指示の本質です。問いだけの場合より
         # 強くします（v3 はここで閾値に届かず、知識ベースの引き当てに流れていました）。
         score += 0.24
@@ -1009,6 +1097,9 @@ def parse(text: str, *, min_score: float = 0.55) -> Directive | None:
     if role:
         score += 0.12
         signals.append(f"role:{role}")
+        if verbs:
+            score += 0.20
+            signals.append("role+imperative")
     if _ARTIFACT.search(instruction or raw):
         score += 0.12
         signals.append("artifact")
