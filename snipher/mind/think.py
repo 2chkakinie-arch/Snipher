@@ -816,12 +816,22 @@ def _topic_moves(frame, text: str, *, kb=None, turn: int = 0,
                     if m.get("role") == "assistant")
     menu: list[list[Claim]] = []
 
+    # v3 は語彙の数を *どんな質問にも* 混ぜて「辞書引きボット」に見えていました。
+    # 索引・音・拍の話は、発話がそれそのものを尋ねているときだけ通します。
+    ask_lex = bool(re.search(r"(拍|モーラ|音数|読み|ふりがな|を含む語|同类|品詞|活用|何文字|画数)",
+                             normalize(text)))
+    if not ask_lex:
+        menu = menu        # (ア)(イ)(ウ) は作らず、(エ) の隣接話題だけ数える
+        lexical_only = False
+    else:
+        lexical_only = True
+
     # (ア) 複合語の在庫 ── 語彙索引が実際に持っている数を言う
     try:
         comps = [x.surface for x in b.containing(w, limit=12) if x.surface != w]
     except Exception:  # noqa: BLE001
         comps = []
-    if comps:
+    if comps and lexical_only:
         menu.append([Claim(
             kind="note",
             content=f"「{w}」を含む語は手元の語彙に {len(comps)} 語見えて、"
@@ -835,7 +845,7 @@ def _topic_moves(frame, text: str, *, kb=None, turn: int = 0,
                if x.surface != w]
     except Exception:  # noqa: BLE001
         kin = []
-    if len(read) >= 2 and kin:
+    if len(read) >= 2 and kin and lexical_only:
         menu.append([Claim(
             kind="note",
             content=f"読み「{read}」で始まる語なら {'、'.join(kin[:3])} があります。",
@@ -843,7 +853,7 @@ def _topic_moves(frame, text: str, *, kb=None, turn: int = 0,
 
     # (ウ) 拍の数 ── 音拍索引で数えた実数
     n = mora_count(w)
-    if n >= 1:
+    if n >= 1 and lexical_only:
         try:
             same = len(b.by_morae(int(n), limit=2000))
         except Exception:  # noqa: BLE001

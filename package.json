@@ -1,0 +1,17 @@
+{
+  "name": "snipher-pages",
+  "version": "4.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Snipher の Cloudflare Pages 用アセット（静的 UI + Pages Function）",
+  "scripts": {
+    "build": "python3 tools/build_public.py",
+    "check": "python3 tools/build_public.py --check",
+    "test:js": "node --test tests/js/engine.test.mjs",
+    "preview": "npx --yes wrangler@3 pages dev public --proxy 8787",
+    "deploy": "npx --yes wrangler@3 pages deploy public --project-name=snipher --branch=main"
+  },
+  "devDependencies": {
+    "wrangler": "^3.100.0"
+  }
+}
