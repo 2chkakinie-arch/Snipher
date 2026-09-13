@@ -412,6 +412,87 @@ class CorpusBuilder:
             docs.append(f"<user>{u}\n<asst>{a}")
         return docs * max(1, int(repeat))
 
+    def sft_docs(self) -> list[str]:
+        """指示追従の教師データ（SFT）を *手元の素材* から組み立てる。
+
+        「指定された形だけで返す」は文型生成では学べないので、知識ベースの本文を
+        材料に (1) 質問→答え (2) 口調指定 (3) 文字数指定 (4) 箇条書き (5) JSON 抽出
+        (6) 読めない語への聞き返し を対にして作ります。出力の形そのものが教師です。
+        """
+        from .. import knowledge
+
+        kb = knowledge.KnowledgeBase()
+        docs: list[str] = []
+        seen: set[str] = set()
+
+        def _add(s: str) -> None:
+            s = str(s or "").strip()
+            if s and s not in seen:
+                seen.add(s)
+                docs.append(s)
+
+        def _plain(s: str) -> str:
+            return (str(s).replace("です。", "だ。").replace("ます。", "る。")
+                    .replace("ですね", "だね").replace("ました", "た"))
+
+        items = [it for it in kb.items if str(it.get("def") or "").strip()]
+        for it in items:
+            topic = str(it.get("topic") or "").strip()
+            d = str(it.get("def") or "").strip()
+            facts = [str(x).strip() for x in (it.get("facts") or []) if str(x).strip()]
+            why = [str(x).strip() for x in (it.get("why") or []) if str(x).strip()]
+            how = [str(x).strip() for x in (it.get("how") or []) if str(x).strip()]
+            tips = [str(x).strip() for x in (it.get("tips") or []) if str(x).strip()]
+            op = str(it.get("opinion") or "").strip()
+            qa = [list(p) for p in (it.get("qa") or []) if len(list(p)) >= 2]
+
+            _add(f"<user>{topic}とは？\n<asst>{d}")
+            if why:
+                _add(f"<user>{topic}はどうしてそうなるの？\n<asst>{d}\n{why[0]}")
+            if facts:
+                _add(f"<user>{topic}について教えて\n<asst>{d}\n{facts[0]}")
+            if how:
+                steps = " ".join(f"{i + 1}. {s}" for i, s in enumerate(how[:4]))
+                _add(f"<user>{topic}の手順を numbered で\n<asst>{steps}")
+            if tips and op:
+                _add(f"<user>{topic}のコツは？\n<asst>{tips[0]}\n{op}")
+
+            # 口調指定（だよ・だね）/ だ・である調
+            _add(f"<user>{topic}を、〜だよ・〜だねの口調で説明して\n<asst>{_plain(d)}")
+            _add(f"<user>{topic}についてだ・である調で教えて\n<asst>{_plain(d)}")
+
+            # 文字数指定（短い指示には短く返す型を教える）
+            for lim in (60, 120, 200):
+                short = d if len(d) <= lim else d[: max(20, lim - 6)].rstrip(" 　、,") + "。"
+                _add(f"<user>{topic}を{lim}文字程度で簡潔に答えて\n<asst>{short}")
+
+            # 箇条書きの個数指定
+            pool = [x for x in [d] + facts[:3] if x]
+            for n in (2, 3, 5):
+                if len(pool) >= n:
+                    bullets = "\n".join(f"・{x.rstrip('。')}" for x in pool[:n])
+                    _add(f"<user>{topic}を{n}つの箇条書きでまとめて\n<asst>{bullets}")
+
+            # JSON 抽出・形式厳守（余計な文を付けない型）
+            for q, a in qa[:3]:
+                q, a = str(q).strip(), str(a).strip()
+                if len(a) > 150 or len(q) < 4:
+                    continue
+                _add(f'<user>次のテキストから情報を抽出し、必ず指定のJSON形式のみで出力してください。'
+                     f'{{"question": "...", "answer": "..."}}\nテキスト: {q} {a}\n'
+                     f'<asst>{{\n  "question": "{q}",\n  "answer": "{a}"\n}}')
+
+        # 読めない語・短い発話に対する聞き返し（辞書引きはしない）
+        unknown = ["ゾルタクス＝ゼッカ", "プルントゥーラ", "みみずくの会", "ひらパー"]
+        for w in unknown:
+            _add(f"<user>{w}とは？\n<asst>その語について、いま手元で確かめられる範囲からお答えします。"
+                 f"{w}がどんな場面の語か、一言もらえればそこに絞って組み立てます。")
+            _add(f"<user>{w}\n<asst>{w}の話ですね。どこで出会った語か、短く教えてもらえますか。")
+        for u in ("は？", "え？", "う", "??"):
+            _add(f"<user>昨日の話をまとめて\n<asst>昨日の話は、要点を 3 つに絞ると伝えやすいですね。"
+                 f"<user>{u}\n<asst>どの部分を、別の角度から言い直しましょうか。")
+        return docs
+
     # ------------------------------------------------------------------ #
     def kb_docs(self, pairs_only: bool = False) -> list[str]:
         """知識ベース v2 を教師に使う（事実文 + 質問/答え + 手順 + 意見 + 雑談）。"""

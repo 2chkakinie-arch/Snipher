@@ -49,6 +49,9 @@ _FALLBACK_SEARCH_URL = "https://html.duckduckgo.com/html/?q={query}"
 
 # HTML の検索結果や記事に混じるノイズ。本文はさらに空白を正規化する。
 _NOISE_TAGS = frozenset({"script", "style", "noscript", "template", "svg", "canvas", "nav", "footer"})
+# 本文中で *文が切れる* 要素（段落・見出し・列表現）。ここを改行にすると抽出が素直になります。
+_BLOCK_TAGS = frozenset({"p", "div", "section", "article", "li", "h1", "h2", "h3", "h4", "h5",
+                         "br", "tr", "blockquote", "figcaption", "pre"})
 
 
 def _env_float(name: str, default: float) -> float:
@@ -133,6 +136,8 @@ class _PageParser(HTMLParser):
             content = attr.get("content", "")
             if key and content and key in {"description", "og:description", "twitter:description"}:
                 self.meta[key] = content
+        if tag in _BLOCK_TAGS:
+            self.text.append("\n")        # 開始側も切る（見出し → 本文 の接着対策）
         if tag == "a" and len(self.links) < self._max_links:
             href = attr.get("href", "").strip()
             if href:
@@ -144,6 +149,10 @@ class _PageParser(HTMLParser):
         if tag in _NOISE_TAGS:
             self._skip = max(0, self._skip - 1)
             return
+        if tag in _BLOCK_TAGS:
+            # .block をまたいで見出しと本文が 1 文に接着されると、証拠文が化けます
+            # （「GLM5.3 GLM5.3 は 2026 年…」）。段落の切れ目では改行を入れます。
+            self.text.append("\n")
         if tag == "title" and self._title_depth:
             self._title_depth -= 1
         if tag == "a" and self._link_href:
@@ -367,7 +376,9 @@ class HtmlFetcher:
                  max_text: int | None = None, opener: Callable | None = None,
                  allow_private: bool | None = None, max_raw_bytes: int | None = None):
         # ネットワークが無い環境でもチャットを長く止めない。必要なら環境変数で延長可能。
-        self.timeout = timeout if timeout is not None else _env_float("SNIPHER_WEB_TIMEOUT", 1.5)
+        # 1.5 秒では検索と本文取得の両方が終わらず、未知語のときに答えが薄くなった。
+        # 「速い-but-答えない」より「少し待って-答える」を正所以内に寄せる。
+        self.timeout = timeout if timeout is not None else _env_float("SNIPHER_WEB_TIMEOUT", 4.5)
         self.max_bytes = max_bytes if max_bytes is not None else _env_int("SNIPHER_WEB_MAX_BYTES", 1_500_000)
         self.max_text = max_text if max_text is not None else _env_int("SNIPHER_WEB_MAX_TEXT", 12_000)
         self.opener = opener or urlopen
@@ -436,7 +447,15 @@ class HtmlFetcher:
                 absolute = urljoin(str(url), href)
                 if absolute.startswith(("http://", "https://")):
                     links.append({"url": absolute, "text": label})
-            page_text = _clean_text(" ".join(parser.text), self.max_text)
+            # 段落・見出しの切れ目（_PageParser が入れる改行）を保ってから掃除する。
+            # 改行を空白に潰すと「GLM5.3」見出しと 1 文目が同一文になり、証拠文が化けます。
+            page_raw = html.unescape("".join(parser.text))
+            page_raw = re.sub(r"[ \t\r\f\v]+", " ", page_raw)
+            page_raw = re.sub(r"\s*\n\s*", "\n", page_raw)
+            page_raw = re.sub(r"\n{2,}", "\n", page_raw)
+            page_raw = re.sub(r"\s+([。、！？!?：:，,）】』])", r"\1", page_raw)
+            page_raw = re.sub(r"([（【『])\s+", r"\1", page_raw)
+            page_text = page_raw.strip()[: self.max_text]
             return FetchResult(
                 url=str(url), status=status, title=_clean_text(" ".join(parser.title), 300),
                 text=page_text,
@@ -681,7 +700,9 @@ class ResearchEngine:
                 from .research import WikipediaApiProvider
 
                 self.providers.append(WikipediaApiProvider(self.fetcher))
-        self.cache_ttl = cache_ttl if cache_ttl is not None else _env_float("SNIPHER_WEB_CACHE_TTL", 90.0)
+        self.cache_ttl = cache_ttl if cache_ttl is not None else _env_float("SNIPHER_WEB_CACHE_TTL", 900.0)
+        # 失敗は短く覚える（同じ語で毎回 4.5 秒待たないため）
+        self.cache_ttl_fail = _env_float("SNIPHER_WEB_CACHE_TTL_FAIL", 25.0)
         self.cache_size = cache_size if cache_size is not None else _env_int("SNIPHER_WEB_CACHE_SIZE", 64)
         self._cache: OrderedDict[str, tuple[float, ResearchResult]] = OrderedDict()
         self._lock = threading.RLock()
@@ -786,8 +807,9 @@ class ResearchEngine:
                                 sources=sources, fetched=fetched,
                                 elapsed_ms=(time.perf_counter() - started) * 1000,
                                 error=None if results or fetched else "no_search_results")
+        ttl = self.cache_ttl if not result.error else min(self.cache_ttl, self.cache_ttl_fail)
         with self._lock:
-            self._cache[key] = (time.time(), result)
+            self._cache[key] = (time.time() - (self.cache_ttl - ttl), result)
             self._cache.move_to_end(key)
             while len(self._cache) > self.cache_size:
                 self._cache.popitem(last=False)

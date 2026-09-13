@@ -95,6 +95,16 @@ def collect(grammar: int, seed: int = 20250912,
 
     cb = CorpusBuilder(seed=seed)
     docs = cb.build(max(1000, grammar)) if grammar else []
+    # 指示追従（SFT）の形も審判に読ませる。JSON・箇条書き・短い聞き返しを
+    # 「ありえない日本語」として減点すると、応答の組み立てが型から逃げます。
+    sft_lines: list[str] = []
+    try:
+        for doc in cb.sft_docs():
+            for line in strip_markers(doc):
+                if 4 <= len(line) <= 200:
+                    sft_lines.append(line)
+    except Exception:  # noqa: BLE001
+        sft_lines = []
     gen: list[str] = []
     for doc in docs:
         for line in strip_markers(doc):
@@ -105,7 +115,7 @@ def collect(grammar: int, seed: int = 20250912,
     rng.shuffle(gen)
 
     # 人が書いた日本語は 3 倍に重み付け（分布の中心に置く）
-    texts = authored * 3 + kb_train * 2 + gen
+    texts = authored * 3 + kb_train * 2 + sft_lines * 2 + gen
     rng.shuffle(texts)
     # 語彙は学習文すべて（保持文も含む）から作る
     return texts, held, authored + kb_sents + gen

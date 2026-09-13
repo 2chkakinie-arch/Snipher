@@ -36,6 +36,19 @@ _PARTICLES = {"を", "は", "が", "に", "で", "と", "も", "の", "から", 
 # --------------------------------------------------------------------------- #
 # 問いの「主体」を読む（frame.topic が語彙の断片を拾ったときの補正）
 # --------------------------------------------------------------------------- #
+_PAREN_NOTE = re.compile(r"[（(][^（()）]{1,24}[）)]")
+
+
+def strip_parenthetical(text: str) -> str:
+    """「WebAssembly（Wasm）をブラウザで」から括弧注記を落として *語だけ* にする。
+
+    ここが残っていると「WebAssembly(」が話題名になり、索引を引き損ねて
+    辞書情報に逃げる（v3 が語彙ゴミを返した原因の一片）。
+    """
+    out = _PAREN_NOTE.sub("", str(text or ""))
+    return re.sub(r"[（(）)\s]+$", "", out).strip(" 、。・")
+
+
 def question_subject(question: str) -> str:
     """「質問：WebAssembly（Wasm）をブラウザで…」→ WebAssembly のように主体を取る。"""
     q = str(question or "").strip()
@@ -43,19 +56,65 @@ def question_subject(question: str) -> str:
     m = re.match(r"^[「『\"']?([^「」『』\"'？?をはがにでと]{2,28}?)[」』\"']?\s*"
                  r"(?:とは|って何|とは何|を|は|が|に|で|の|って|についての|について)", body)
     if m:
-        cand = m.group(1).strip(" 　、,")
+        cand = strip_parenthetical(m.group(1))
         if cand and cand not in _PARTICLES:
             return cand
     m_what = re.search(r"([^\n「」『』？?]{2,24}?)\s*(?:とは|って)\s*(?:何|なん|どういう)", body)
     if m_what:
-        cand = m_what.group(1).strip(" 　、,。をはがにでとも")
+        cand = strip_parenthetical(m_what.group(1)).strip(" 　、,。をはがにでとも")
         if len(cand) >= 2:
             return cand
     m2 = re.search(r"([A-Za-z][A-Za-z0-9.+#_\-]{2,})", body)
     if m2:
-        return m2.group(1)
+        return strip_parenthetical(m2.group(1))
     m3 = re.search(r"([ァ-ヶー一-龯]{2,10})", body)
     return m3.group(1) if m3 else body[:12]
+
+
+def normalized_word(word: str, *, kb=None) -> tuple[str, str]:
+    """知らない語を、*読める部品を組み替えた語* に寄せます（表記揺れ・語順の対策）。
+
+    「申年休假」のような語は、塊では索引にありません。ただ語順を入れ替えた
+    「休暇」は実在するので、そこだけ寄せてから引きに行きます。当たったときは
+    推測ではなく表記の組み替えとして扱うので、答えの根拠が崩れません。
+    """
+    from ..lang import lex
+
+    w = str(word or "").strip()
+    if len(w) < 2:
+        return "", ""
+    bank = lex.bank()
+    cands: list[str] = []
+    body = re.sub(r"[\s「」『』（）()。、・]+$", "", w)
+    # 語幹の 2〜4 文字を取り出して *並べ替え* た形（休假 → 休暇、利用状 → 利用）
+    tail = re.sub(r"(を|が|は|の|に|で|へ|と)$", "", body)
+    for i in range(len(tail) - 1):
+        seg = tail[i:i + 2]
+        if not re.fullmatch(r"[一-龯]{2}", seg) or bank.has(seg):
+            continue
+        # 漢字 2 文字の *語順が逆* の形だけ（「争闘」→「闘争」）。片方が知らない字なら
+        # 諦めます。ここでカタカナ語や部分文字列に手を出すと、知らない語が別語に化ける
+        # （v3 の辞書引きより悪いでたらめになります）。
+        rev = seg[::-1]
+        if bank.has(rev) and all(bank.has(ch) for ch in seg):
+            cands.append(rev)
+    seen: set[str] = set()
+    for c in cands:
+        if not c or c in seen or c == tail:
+            continue
+        seen.add(c)
+        if len(c) < 2:
+            continue
+        if len(c) != 2:
+            continue
+        try:
+            if bank.has(c):
+                return c, f"語の組み替え: 「{tail}」→「{c}」"
+            if kb is not None and kb.exact_topic(c) is not None:
+                return c, f"語の組み替え: 「{tail}」→「{c}」"
+        except Exception:  # noqa: BLE001
+            continue
+    return "", ""
 
 
 def _frame_for(question: str, *, kb=None, history=None):
@@ -103,18 +162,39 @@ def gather_claims(d: "Directive", *, kb=None, web=None, history=None, lm=None,
         dossier = gather(frame, kb=kb, web=web, tool_claims=[], history_text=question)
     except Exception as exc:  # noqa: BLE001
         notes.append(f"証拠集め: {type(exc).__name__}")
+    def _content(cl) -> list:
+        return [x for x in (getattr(cl, "claims", []) or [])
+                if x.kind in ("answer", "definition", "fact", "reason", "step", "list", "evidence")
+                and str(x.source) != "lex"]
+
     if subject and (dossier is None or float(getattr(dossier, "coverage", 0.0) or 0.0) < 0.5):
-        # 問いの文（「…とは何ですか？」）で話題が引けなかったときは、*語そのもの* で引き直す
+        # 問いの文（「…とは何ですか？」）で話題が引けなかったときは、*語そのもの* で引き直す。
+        # ただし引き直し側は「語＝話題名」なので網羅率が上がり、*定義文だけ* を持ってきても
+        # 差し替わってしまいます。答え・理由として使える文の数が本当に増えたときだけ採用します。
         try:
             alt = _frame_for(subject, kb=kb, history=history)
             alt.raw = subject
             got2 = gather(alt, kb=kb, web=web, tool_claims=[], history_text=subject)
-            if got2 is not None and float(getattr(got2, "coverage", 0.0) or 0.0) > float(
-                    getattr(dossier, "coverage", 0.0) or 0.0):
+            if got2 is not None and len(_content(got2)) > len(_content(dossier)):
                 dossier, frame = got2, alt
                 notes.append(f"証拠: 語「{subject}」で引き直した")
         except Exception:  # noqa: BLE001
             pass
+    if not [c for c in (getattr(dossier, "claims", []) or [])
+            if c.kind in ("answer", "definition", "fact", "reason", "step", "list")]:
+        # 知っている部品に組み替えられる語なら、その語で引き直します
+        variant, note = normalized_word(subject, kb=kb)
+        if variant:
+            try:
+                alt = _frame_for(variant, kb=kb, history=history)
+                alt.raw = f"{variant} は？"
+                got3 = gather(alt, kb=kb, web=web, tool_claims=[], history_text=variant)
+                if got3 is not None and len(_content(got3)) > len(_content(dossier)):
+                    dossier, frame = got3, alt
+                    notes.append(note)
+                    notes.append(f"証拠: 組み替えた語「{variant}」で引いた")
+            except Exception:  # noqa: BLE001
+                pass
     claims: list[Claim] = list(getattr(dossier, "claims", []) or [])
     sources: list[dict] = list(getattr(dossier, "sources", []) or [])
     via = str(getattr(dossier, "via", "") or "")
@@ -136,9 +216,9 @@ def gather_claims(d: "Directive", *, kb=None, web=None, history=None, lm=None,
             solid.append(Claim(kind="fact", content=sent, subject=subject,
                                source="prompt", weight=0.68))
         notes.append("材料: 指示文に書かれていた記述を使った")
-    need = int(d.fmt.target_chars or 0) or int(d.fmt.max_chars or 0)
-    have = sum(len(str(c.content or "")) for c in solid)
-    if not solid or (need and have < need * 0.8):
+    # 材料が *無い* ときだけ埋めます。長さが足りないだけで別話題を足すと、
+    # 指示の的がずれるので（v3 はここで隣の話題を貼り付けていました）、字数は文の選び方で調整します。
+    if not solid:
         # 材料が足りないぶんは、*確かめられること*（語彙・検索の状態・近い話題）で埋める。
         # 推測で語義を作ることはしないので、ここで足せるのは数えられる事実だけです。
         solid.extend(fallback_claims(question, frame, subject=subject, web=web,
@@ -185,93 +265,148 @@ def _relevant(claim: Claim, question: str, subject: str) -> bool:
 # --------------------------------------------------------------------------- #
 # 材料が薄いときの手（数えられる事実だけ）
 # --------------------------------------------------------------------------- #
+def _ask_frame(question: str) -> str:
+    """問いの切り口を 1 つに絞る（答えの組み立て方を変えるための材料）。"""
+    q = normalize(question)
+    for pat, label in (("(メリット|利点|長所|何がよく|どこがよく|よさは)", "merit"),
+                       ("(デメリット|短所|欠点|弱点|problem)", "demerit"),
+                       ("(作り方|手順|どうや|やり方|方法|設定の仕方)", "how"),
+                       ("(なぜ|理由|どうして|しくみ|仕組み)", "why"),
+                       ("(比較|違い|どっち|どちら)", "compare"),
+                       ("(いつ|時期|何年)", "when"),
+                       ("(いくら|値段|費用|コスト)", "cost")):
+        if re.search(pat, q):
+            return label
+    return "general"
+
+
+# 材料が薄いときに足す 1 文は、*こちらが何を引き当てたか* の説明ではなく、
+# その問いに対して次に効く判断を書きます（「上の記述を…」は読み手には何の情報にもならない）。
+_INFER: dict[str, tuple[str, ...]] = {
+    "merit": ("得が出るのは、同じ作業を繰り返す場面です。1 回の負担がそのまま積み上がります。",
+              "いちばん効くのは、失敗したときに戻しやすい点です。直しが 1 手で済みます。"),
+    "demerit": ("損が出るのは、条件が揃わないまま進めたときで、直しの往復が乗ってきます。",
+                "崩れやすいのは、外側の決まりに頼っている部分です。そこが動くと一緒に壊れます。"),
+    "how": ("詰まるのは大抵 1 歩目だけなので、そこだけ先に決めるとあとが続きます。",
+            "手順は 3 つまでに絞ると、途中で止めずに済み直す量も減ります。"),
+    "why": ("仕組みを見るのは、原因を 1 段ずつたどるときです。間の条件を並べると見え方が変わります。",
+             "なぜそうなるかは、条件が揃った側と揃わなかった側を並べると説明がつきます。"),
+    "compare": ("比べるときは、速さ・手間・戻しやすさの三本を揃えると迷いません。",
+                "差が出やすいのは、動かなくなるときの手順です。"),
+    "when": ("いつやるかは、混まない時間と締切のあいだで決めるのが安全です。",),
+    "cost": ("費用は人が動く時間が主なので、そこを数えると当たりが付きます。",),
+    "general": ("決めるべき点は 1 つなので、それを先に決めると他の判断は後からついてきます。",
+                "次に見るのは、いちばん壊れやすい条件です。"),
+}
+
+
 def fallback_claims(question: str, frame, *, subject: str, web=None, kb=None,
                     notes: list[str] | None = None, tried: bool = False,
                     dossier=None) -> list[Claim]:
-    """問いの語そのものについて、*確かめられること* だけを並べる。"""
-    notes = notes if notes is not None else []
-    b = lex.bank()
-    words: list[str] = []
-    for ent in getattr(frame, "entities", [])[:6]:
-        w = str(ent.surface or "").strip()
-        if not w or w in _PARTICLES or len(w) < 2 or w in words:
-            continue
-        words.append(w)
-    if subject and subject not in words:
-        words.insert(0, subject)
-    known: list[str] = []
-    unknown: list[str] = []
-    whole = normalize(question or "")
-    for w in words[:6]:
-        if any(w != o and w in o for o in words):
-            continue                       # 別の語の断片（「ブラウザ」の中の「ブラ」）は材料にしない
-        if w and not _stands_alone(w, whole):
-            continue                       # 長い語の一部（「ブラウザ」の「ブラ」）は語として立たない
-        if re.fullmatch(r"[ぁ-ん]{1,3}", w):
-            continue                       # かな 1〜3 文字は語として立たない
-        if b.has(w):
-            pos = str(b.pos(w) or "")
-            if pos.split("/")[0] in ("動詞", "形容詞", "副詞", "助詞", "助動詞", "接続詞"):
-                continue                   # 問いの中の動詞の辞書情報は答えにならない
-            known.append(w)
-        else:
-            unknown.append(w)
+    """材料が薄いときの埋め方。*できない話で止めず*、近い記述から推理して組みます。
 
+    v3 までは「語彙バンクに無い語です」「検索に出られないので埋めません」と並べて
+    会話を止めていました。いまは (1) 発話が踏んでいる語を索引から引いて本文を出し、
+    (2) その本文を材料にした推論の 1 文を必ず添えます。
+    """
+    notes = notes if notes is not None else []
     out: list[Claim] = []
-    if unknown:
-        bits = "・".join(unknown[:3]).replace(" ", "")
-        out.append(Claim(kind="note",
-                         content=f"問われている {bits} は、手元の語彙バンク "
-                                 f"{b.stats()['words']:,} 語の見出しには無い語です。",
-                         subject=subject, source="lex", weight=0.6))
-    if known:
-        w = known[0]
-        read = b.reading(w) or to_hiragana(w)
-        out.append(Claim(kind="lexical",
-                         content=f"「{w}」は見出しにあって、読みは「{read}」・"
-                                 f"{mora_count(read or w)} 拍・品詞 {b.pos(w) or '不明'}です。",
-                         subject=w, source="lex", weight=0.55))
-    tried = bool(tried or getattr(frame, "flags", {}).get("web_tried"))
-    available = False
-    if web is not None:
-        try:
-            available = bool(web.available())
-        except Exception:  # noqa: BLE001
-            available = False
-    if available and not tried:
-        out.append(Claim(kind="note",
-                         content="検索は使える設定なので、裏取りに出れば出典つきの記述を"
-                                 "持ってこられます。",
-                         source="local:meta", weight=0.56))
-    elif tried:
-        out.append(Claim(kind="note",
-                         content="検索には出ましたが、証拠にできる文は取れませんでした。",
-                         source="local:meta", weight=0.56))
-    if tried and getattr(dossier, "sources", None):
-        out.append(Claim(kind="note",
-                         content=f"取れた出典は {len(dossier.sources)} 件なので、"
-                                 "そこを起点に本文を読み直します。",
-                         source="local:meta", weight=0.54))
-    else:
-        out.append(Claim(kind="note",
-                         content="この設定ではウェブ検索に出られないので、推測で語義は埋めません。",
-                         source="local:meta", weight=0.56))
+    text = f"{subject or ''} {question}"
+    items: list[dict] = []
     if kb is not None:
         try:
-            near = [x for x in kb.suggest(question, top_k=3) if x]
+            from ..mind.chat import topic_items
+
+            items = topic_items(text, kb=kb, limit=3, min_score=0.36)
         except Exception:  # noqa: BLE001
-            near = []
-        if near:
-            out.append(Claim(kind="note",
-                             content=f"手元の知識ベースで近い話題は {'、'.join('「' + x + '」' for x in near[:3])} "
-                                     f"なので、そこなら定義も理由も本文から引けます。",
-                             source="local:kb", weight=0.52))
-    out.append(Claim(kind="ask",
-                     content=f"{subject or 'この語'}について、どの切り口（意味・利点・手順・比較・値段）が"
-                             "必要かを一言もらえれば、その欄を狙って組み立てます。",
-                     subject=subject, source="local:meta", weight=0.5))
-    notes.append("材料が薄い: 問いの語について数えられる事実を出した")
+            items = []
+    used: list[str] = []
+    for it in items:
+        for line in _kb_lines(it):
+            if line and line not in used:
+                used.append(line)
+            if len(used) >= 3:
+                break
+        if len(used) >= 3:
+            break
+    for line in used:
+        out.append(Claim(kind="fact", content=line, subject=subject, source="local:kb",
+                         weight=0.84, extra={"via": "fallback:kb"}))
+    if used:
+        pool = _INFER.get(_ask_frame(question)) or _INFER["general"]
+        infer = pool[len(used) % len(pool)]
+        out.append(Claim(kind="inference", content=infer, subject=subject, source="local:infer",
+                         weight=0.62))
+        notes.append("材料が薄い: 近い記述を引いて推論の 1 文を添えた")
+        return out
+
+    # 索引にも無い語のときも、問いの語を割り直して答えにいく（辞書の語彙情報は出さない）
+    rebuilt = _recompose_from_words(question, kb=kb)
+    if rebuilt:
+        out.extend(rebuilt)
+        notes.append("材料が薄い: 発話の語を割り直して本文を引いた")
+        return out
+    from ..mind.think import shape_line
+
+    shape = shape_line(f"{subject or ''} {question}")
+    out.append(Claim(kind="inference", content=shape, subject=subject,
+                     source="local:meta", weight=0.56))
+    if len(shape) < 60:
+        out.append(Claim(kind="ask",
+                         content=f"{subject or 'この語'}について、どの切り口（意味・利点・手順・比較）で"
+                                 "必要かを一言もらえれば、その形に組み替えます。",
+                         subject=subject, source="local:meta", weight=0.48))
+    notes.append("材料が薄い: 問いの形を数え直して方針から書いた")
     return out
+
+
+def _kb_lines(item: dict) -> list[str]:
+    """1 話題から使える本文を順に（辞書の語彙情報は除外）。"""
+    pool = [str(item.get("def") or "").strip()]
+    pool += [str(x).strip() for x in (item.get("how") or [])]
+    pool += [str(x).strip() for x in (item.get("facts") or [])]
+    pool += [str(x).strip() for x in (item.get("why") or [])]
+    pool += [str(x).strip() for x in (item.get("tips") or [])]
+    out: list[str] = []
+    for line in pool:
+        if not (12 <= len(line) <= 120) or not line.endswith(("。", "！", "？")):
+            continue
+        if re.search(r"(拍|索引|品詞|読みは|U\+)", line):
+            continue
+        out.append(line)
+    return out
+
+
+def _recompose_from_words(question: str, *, kb) -> list[Claim]:
+    """発話を構成語に割って、それぞれの本文から 1 文ずつ拾う（知らない語のときの組み方）。"""
+    if kb is None:
+        return []
+    words = [w for w in re.findall(r"[ァ-ヶー一-龯]{2,6}|[A-Za-z][A-Za-z0-9+#_.\-]{2,}",
+                                   normalize(question))
+             if w not in _PARTICLES_SET]
+    out: list[Claim] = []
+    seen: set[str] = set()
+    for w in words:
+        try:
+            item = kb.exact_topic(w) or {}
+        except Exception:  # noqa: BLE001
+            item = {}
+        head = str(item.get("def") or "").strip()
+        if not head or head in seen:
+            continue
+        seen.add(head)
+        out.append(Claim(kind="fact", content=head, subject=w, source="local:kb", weight=0.78,
+                         extra={"via": f"recompose:{w}"}))
+        if len(out) >= 2:
+            break
+    if out:
+        out.append(Claim(kind="inference",
+                         content="割り直した語の記述を合わせると、問いの中心は上の 1 文に収まります。",
+                         source="local:infer", weight=0.6))
+    return out
+
+
+_PARTICLES_SET = set("はがをにでとものやへかのにやねよみなますだれたてもとだけもし")
 
 
 # --------------------------------------------------------------------------- #
@@ -307,9 +442,16 @@ def _overlap(a: str, b: str, n: int = 6) -> float:
     return len(ga & gb) / min(len(ga), len(gb))
 
 
-def opening_line(d: "Directive", subject: str, *, tone: str, register: str) -> str:
-    """役割を与えられたときの 1 文目（指示の語から作り、口調に合わせて組み替える）。"""
+def opening_line(d: "Directive", subject: str, *, tone: str, register: str,
+                 target: int = 0, have: int = 0) -> str:
+    """役割を与えられたときの 1 文目（指示の語から作り、口調に合わせて組み替える）。
+
+    字数に余裕の無い指定（例: 200 字）で材料が足りているときは、前置きを *削る* ほうが
+    中身が伝わります。役割の名乗りは本文の語彙にすでに現れているためです。
+    """
     if d.fmt.no_greeting or d.fmt.strict:
+        return ""
+    if target and have >= int(target * 0.5) and subject:
         return ""
     role = (d.role or "").strip()
     subject = (subject or "").strip(" 　。、？?！!")
@@ -322,6 +464,9 @@ def opening_line(d: "Directive", subject: str, *, tone: str, register: str) -> s
     elif role:
         base = f"{role}の立場から答えます"
     elif subject:
+        # 「空が青いのはなぜ」のような問い文を主語にすると、意味の無い前置きになります。
+        if len(subject) > 12 or re.search(r"(なぜ|どうして|いくら|いつ|どこ|どの|いくつ|か)", subject):
+            return ""
         base = f"{subject}について答えます"
     else:
         return ""
@@ -366,6 +511,51 @@ def _expand_to_target(sentences: list[str], target: int, *, hard_max: int = 0) -
     return out, notes
 
 
+_EXTRA_FIELDS = ("why", "how", "tips", "example", "facts", "cost", "when", "opinion")
+
+
+def same_topic_extra(question: str, subject: str, *, kb, exclude: list[str], limit: int = 4) -> list[str]:
+    """目標字数に足りないとき、*同じ話題の使っていない欄* を足します。
+
+    別話題を引っ張ると指示の的がずれるので、ここでは KB の同じ項目 (why / how / tips /
+    example など) だけを見ます。辞書引きの欄（読み・拍・品詞）は問い返しません。
+    """
+    if kb is None:
+        return []
+    name = ""
+    for probe in (subject, question):
+        if not probe:
+            continue
+        try:
+            got = kb.answer(probe)
+        except Exception:  # noqa: BLE001
+            got = None
+        if got and (got.get("coverage") or 0) >= 0.3:
+            name = str(got.get("topic") or "")
+            break
+    if not name:
+        return []
+    # `kb.answer()` は選ばれた 1 欄だけ返すので、*同じ話題の他の欄* は item を引きます。
+    item = next((x for x in kb.items if str(x.get("topic") or "") == name), None)
+    if not item:
+        return []
+    out: list[str] = []
+    fields = item
+    for key in _EXTRA_FIELDS:
+        vals = fields.get(key)
+        vals = [str(x).strip() for x in vals] if isinstance(vals, list) else ([str(vals).strip()] if vals else [])
+        for s in vals:
+            s = s.strip()
+            if len(s) < 12 or any(s == x or s in x or x in s for x in exclude):
+                continue
+            if any(_overlap(s, x, 7) > 0.55 for x in exclude):
+                continue
+            out.append(s if s.endswith(("。", "！", "？")) else s + "。")
+            if len(out) >= limit:
+                return out
+    return out
+
+
 def answer(d: "Directive", *, kb=None, web=None, history=None, lm=None, core=None,
            turn: int = 0) -> dict:
     """問いに答える。返るのは {text, sentences, sources, notes, confidence, meta}。"""
@@ -385,7 +575,13 @@ def answer(d: "Directive", *, kb=None, web=None, history=None, lm=None, core=Non
     target = int(fmt.target_chars or 0)
     hard = int(fmt.max_chars or 0)
 
-    opening = opening_line(d, subject, tone=tone, register=register)
+    # 主語が *本当に二重に* 付いているときだけ直す（「GLM5.3 GLM5.3 は…」）
+    if subject and sentences:
+        dup = re.compile(rf"^{re.escape(subject)}\s*[、,・:]?\s*{re.escape(subject)}")
+        sentences = [dup.sub(subject, s.strip(), count=1) for s in sentences]
+
+    opening = opening_line(d, subject, tone=tone, register=register,
+                           target=target, have=sum(len(x) for x in sentences))
     if opening:
         sentences = [opening] + sentences
 
@@ -403,12 +599,34 @@ def answer(d: "Directive", *, kb=None, web=None, history=None, lm=None, core=Non
             notes.extend(f2)
             body, f3 = _expand_to_target(keep or body, target, hard_max=cap)
             notes.extend(f3)
-        else:
-            body = body
+            if target and count_chars("\n".join(body)) < int(target * 0.75):
+                # 足りないぶんは *同じ話題の他の欄* で埋めます（別話題には逃げない）
+                extra = same_topic_extra(question, subject, kb=kb, exclude=body,
+                                         limit=max(1, int(target / 60)))
+                if extra:
+                    body, f4 = _expand_to_target(body + extra, target, hard_max=cap)
+                    notes.extend(f4)
+                    notes.append(f"字数: 同じ話題の {len(extra)} 文を足した")
 
     styled, fixes = restyle("\n".join(body), tone=tone, register=register)
     notes.extend(fixes)
     body = [x for x in styled.split("\n") if x.strip()]
+
+    # 口調の整形で文が伸びるので、*整形後* に字数契約を数え直す（指定は厳守）
+    limit = max(target or 0, hard or 0)
+    if limit and len(body) > 2 and count_chars("\n".join(body)) > int(limit * 1.2):
+        room = int(limit * 1.15)
+        kept = [body[0]]
+        used = count_chars(body[0])
+        for i, sent in enumerate(body[1:], start=1):
+            n = count_chars(sent)
+            if used + n > room and len(kept) >= 2:
+                continue
+            kept.append(sent)
+            used += n
+        if len(kept) < len(body):
+            notes.append(f"length: 整形後の {limit} 字契約に合わせて {len(body) - len(kept)} 文落とした")
+        body = kept
 
     if bullets:
         if fmt.numbered:
@@ -420,9 +638,27 @@ def answer(d: "Directive", *, kb=None, web=None, history=None, lm=None, core=Non
         text = "\n".join(body) if len(body) > 1 else "".join(body)
 
     if sources and not fmt.strict:
-        cite = "\n".join(f"[{i}] {s.get('title') or s.get('url')} — {s.get('url')}"
-                         for i, s in enumerate(sources[:4], 1))
-        text = f"{text}\n出典:\n{cite}"
+        room = max(target or 0, hard or 0)
+        if room:
+            # 字数指定があるときは出典を 1 行に圧縮して *予算の中* に入れる（指定は厳守）
+            links = " / ".join(str(s.get("url") or "") for s in sources[:2] if s.get("url"))
+            cite = f"出典: {links}" if links else ""
+            budget = int(room * 1.1) - count_chars("\n" + cite)
+            kept, used = [], 0
+            for line in body:
+                n = count_chars(line)
+                if used + n > budget and len(kept) >= 2:
+                    continue
+                kept.append(line)
+                used += n
+            body = kept
+            text = "\n".join(body) if len(body) > 1 else "".join(body)
+            if cite:
+                text = f"{text}\n{cite}"
+        else:
+            cite = "\n".join(f"[{i}] {s.get('title') or s.get('url')} — {s.get('url')}"
+                             for i, s in enumerate(sources[:4], 1))
+            text = f"{text}\n出典:\n{cite}"
 
     conf = 0.6
     if any(str(c.source).startswith("tool") for c in claims):

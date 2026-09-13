@@ -241,15 +241,31 @@ def test_answer_uses_the_material_given_in_the_prompt() -> None:
 
 
 def test_answer_on_a_topic_outside_the_kb_counts_facts_instead_of_refusing() -> None:
+    """索引に無い語でも「調べられない」話で止めず、問いの形を数え直して先に進む。"""
     d = parse(ANSWER_PROMPT)
     assert d is not None
     claims = fallback_claims(d.question, None, subject="WebAssembly", web=None, kb=None,
                              notes=[])
     body = " ".join(c.content for c in claims)
     assert "WebAssembly" in body
-    assert "語彙バンク" in body or "検索" in body
-    for banned in CAN_NOT_SAY:
-        assert banned not in body
+    # 辞書の規模・検索可否の報告は答えにならない（v3 ではここで会話が止まっていた）
+    for banned in ("語彙バンク", "索引", "検索", "拍", "品詞", *CAN_NOT_SAY):
+        assert banned not in body, (banned, body)
+    assert any(c.kind in ("ask", "note", "fact", "inference") for c in claims)
+
+
+def test_answer_fallback_pulls_kb_text_and_an_inference() -> None:
+    """近い記述が引けるなら、本文 + 推論の 1 文までを応答にする（案内だけで止めない）。"""
+    from snipher.knowledge import KnowledgeBase
+
+    d = parse(ANSWER_PROMPT)
+    assert d is not None
+    claims = fallback_claims(d.question, None, subject="WebAssembly", web=None,
+                             kb=KnowledgeBase.shared(), notes=[])
+    body = " ".join(c.content for c in claims)
+    assert any(c.source == "local:kb" for c in claims), body
+    assert any(c.kind == "inference" for c in claims), body
+    assert "WebAssembly" in body or "バイトコード" in body
 
 
 def test_question_subject_reads_the_asked_word_not_a_fragment() -> None:

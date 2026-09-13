@@ -839,8 +839,22 @@ def merge() -> tuple[list[dict], list[str]]:
 
 
 def check_quality(rows: list[dict]) -> list[str]:
-    """書き出し前の最終チェック（日本語として壊れている項目を弾く）。"""
+    """書き出し前の最終チェック（日本語として壊れている項目を弾く）。
+
+    用字・欧文混入・文末の検査は `tools/kb_lint.py` が本体です。ここでも通すのは、
+    「ビルドは通るのに文章が壊れている」状態を作らないため（v3 の語彙ゴミの再発防止）。
+    """
     bad: list[str] = []
+    try:
+        from kb_lint import lint_item as _lint_item
+    except Exception:  # noqa: BLE001
+        try:
+            from tools.kb_lint import lint_item as _lint_item   # 型: ignore
+        except Exception:  # noqa: BLE001
+            _lint_item = None
+    if _lint_item is not None:
+        for r in rows:
+            bad.extend(f"文章検査: {msg}" for msg in _lint_item(r))
     latin = re.compile(r"[a-zA-Z]{12,}")
     for r in rows:
         if not r["def"]:

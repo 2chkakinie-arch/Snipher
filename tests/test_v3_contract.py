@@ -233,7 +233,8 @@ def test_safety_net_is_content_derived_too(composer) -> None:
 def test_capability_answer_uses_measured_numbers(composer) -> None:
     r = _compose(composer, "なにができますか", web=False)
     assert re.search(r"\d", r.text), r.text                  # 実測の語彙数・項目数など
-    assert "語" in r.text or "件" in r.text
+    # 数を *何の個数か* 付きで言うこと（語彙の語数を自慢する形は v4 で禁止しました）
+    assert re.search(r"\d+[,,\d]*\s*(語|件|話題|問答|事実|エントリ)", r.text), r.text
 
 
 # --------------------------------------------------------------------------- #
@@ -282,9 +283,11 @@ def test_repeated_statement_does_not_repeat_the_reply(composer) -> None:
     texts = [_compose(composer, "ぬるぬる猿について話したい", turn=i, web=False).text
              for i in range(1, 9)]
     assert len(set(texts)) >= 5, texts
-    # どれも語彙索引・拍数・知識ベースのいずれかを指している（空虚な相槌だけにならない）
+    # 手元に無い話題では、相手の文をそのまま返さない・辞書引き応答もしない
     for t in set(texts):
-        assert re.search(r"[\d「]", t), t
+        assert "ぬるぬる猿について話したい" not in t, t
+        assert not re.search(r"(拍|索引|品詞は|読みは|U\+)", t), t
+        assert len(t) >= 12, t
 
 
 def test_thin_topic_moves_are_verifiable_facts(composer) -> None:

@@ -298,8 +298,10 @@ def dictionary_query(text: str) -> Solution | None:
     if ent is None:
         return None
     if any(k in low for k in ("読み", "ふりがな", "何と読む", "なんて読む", "よみ")):
-        return Solution(answer=f"「{ent.surface}」は「{ent.reading or to_hiragana(t)}」と読みます",
-                        steps=[f"品詞 {ent.pos or '不明'}・{mora_count(ent.reading or t)} 拍"],
+        # 読みを聞かれたら読みだけを返します。拍数や品詞を *おまけ* で並べると、
+        # 辞書を引いただけの答えに見えるので、detail 側に留めます。
+        return Solution(answer=f"「{ent.surface}」は「{ent.reading or to_hiragana(t)}」と読みます。",
+                        steps=[],
                         kind="lexicon", detail={"reading": ent.reading, "pos": ent.pos})
     if any(k in low for k in ("何文字", "何音", "拍", "文字数", "morae")):
         rd = ent.reading or to_hiragana(ent.surface)

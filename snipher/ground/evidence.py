@@ -295,6 +295,29 @@ def kb_claims(query: str, *, kb, frame) -> tuple[list[Claim], dict]:
                 text = defin + " " + text
         except Exception:  # noqa: BLE001
             pass
+    if field_name == "how":
+        # 手順は *並べる* ものなので、KB の一覧をそのまま 1 行ずつにします。
+        #読点で繋いだ 1 文は段取りが読めず、手順の答えになりません。
+        item = None
+        try:
+            item = next((it for it in kb.items if str(it.get("topic")) == topic), None)
+        except Exception:  # noqa: BLE001
+            item = None
+        steps = [str(x).strip() for x in ((item or {}).get("how") or []) if str(x or "").strip()]
+        steps = [s if s.endswith(("。", "！", "？")) else s + "。" for s in steps if 6 <= len(s) <= 90]
+        if len(steps) >= 2:
+            defin = str((item or {}).get("def") or "").strip()
+            if defin and 10 <= len(defin) <= 90:
+                hits.append(Claim(kind="definition", content=defin, subject=topic,
+                                  source="local:kb", slot="def", weight=0.7))
+            for s in steps[:4]:
+                hits.append(Claim(kind="step", content=s, subject=topic, source="local:kb",
+                                  slot="how", weight=0.78,
+                                  extra={"coverage": material.get("coverage"),
+                                         "score": material.get("score"),
+                                         "qtype": material.get("qtype"),
+                                         "via": material.get("via")}))
+            return hits, meta
     hits.append(Claim(kind=_kind_for_field(field_name), content=text, subject=topic,
                       source="local:kb", slot=field_name,
                       weight=float(material.get("confidence") or 0.62),
@@ -303,14 +326,16 @@ def kb_claims(query: str, *, kb, frame) -> tuple[list[Claim], dict]:
     if kind == "exact" and tok and normalize(topic) != normalize(tok) \
             and normalize(tok) not in normalize(text) and len(tok) <= 6 \
             and not re.search(r"[?？!！]", tok) and lex.bank().has(tok):
+        # 「〜なので検索に掛かりません」型の自己説明は出さない *言い換え*。
+        # 何を根拠にしているかは一行で分かります。
         hits.append(Claim(kind="note",
-                          content=f"「{tok}」は単独の項目に無いので、近い話題「{topic}」の知識として出します。",
+                          content=f"「{tok}」は近い話題「{topic}」として読みます。",
                           subject=topic, source="local:kb", weight=0.5, extra={"related": True}))
     hy = meta.get("hypernym") or {}
     if hy.get("surface"):
         hits.insert(0, Claim(kind="note",
-                             content=f"「{hy['surface']}」は単独の項目を持っていないので、"
-                                     f"上位の語「{hy.get('topic') or topic}」の知識で答えます。",
+                             content=f"「{hy['surface']}」は上位の語「{hy.get('topic') or topic}」"
+                                     f"で読みます。",
                              subject=hy["surface"], source="local:kb", weight=0.55,
                              extra={"hypernym": True}))
     follow = str(material.get("followup") or "").strip()
@@ -384,6 +409,30 @@ def _strip_ask_words(query: str) -> str:
     return t[:12]
 
 
+def _shares_run(name: str, runs: set, query: str) -> bool:
+    """発話と語名が *意味を持つ並び* を共有しているか。
+
+    漢字を含む 2 文字、または 3 文字以上の連続を要求します。カタカナ一音節
+    （「クラ」「ター」）は語数が少ないので 2 文字だと別語に当たります。
+    「クラスター」と「クラウド」のような偶然の重なりを、答えの取り違えに
+    使わないための線引きです。
+    """
+    if not name:
+        return False
+    if len(name) <= 1:
+        return "一" <= name <= "鿿" and name in query
+    for r in runs:
+        if r not in name:
+            continue
+        if any("一" <= ch <= "鿿" for ch in r):
+            return True
+        if r.isascii() and (len(r) >= 3 or not r.isalpha()):
+            return True
+        if len(r) >= 3:
+            return True
+    return False
+
+
 def suggestion_claims(text: str, *, kb) -> list[Claim]:
     """手元に近い話題があれば、*名前を挙げて* 提案する（索引が言う事実で、推測ではない）。"""
     out: list[Claim] = []
@@ -393,10 +442,33 @@ def suggestion_claims(text: str, *, kb) -> list[Claim]:
         names = [str(x) for x in (kb.suggest(text, top_k=3) or []) if x]
     except Exception:  # noqa: BLE001
         names = []
-    if names:
+    # 提案を通すのは、*問いと語名が 2 文字以上の並びを共有している* ときだけ。
+    # 一文字ずつの重ね合わせ（旧実装）だと「プルントゥーラ・クラスタ」と
+    # 「ターミナル操作」がタ・ー・ルで通ってしまい、無関係の定義が答えになります。
+    # 漢字の無い発話（「ゾルタクス＝ゼッカって？」）でも同じなので省略しません。
+    q = re.sub(r"[、。？?！!\s]", "", _strip_ask_words(normalize(text)))
+    runs = {q[i:j] for i in range(len(q)) for j in range(i + 2, min(i + 7, len(q) + 1))}
+    names = [n for n in names if _shares_run(normalize(n), runs, q)]
+    if not names:
+        return out
+    # 話題名の羅列（「〜のあたりを話せます」）は *何も答えていない* ので、
+    # 近い話題の本文を 1 文引いて返します。本文が無いときだけ名前を添えます。
+    for name in names[:3]:
+        try:
+            item = kb.exact_topic(name) or {}
+        except Exception:  # noqa: BLE001
+            item = {}
+        body = str(item.get("def") or "").strip()
+        if len(body) < 10:
+            continue
+        out.append(Claim(kind="fact", content=body if body.endswith("。") else body + "。",
+                         subject=name, source="local:kb", weight=0.6,
+                         extra={"suggest": name, "coverage": 0.5}))
+        break
+    if not out:
         out.append(Claim(kind="note",
-                         content=f"手元では「{'」「'.join(names[:3])}」のあたりを話せます。",
-                         source="local:kb", weight=0.62, extra={"suggest": names[:3]}))
+                         content=f"手元の索引には {'・'.join(names[:3])} の記述があります。",
+                         source="local:kb", weight=0.5, extra={"suggest": names[:3]}))
     return out
 
 
@@ -435,10 +507,14 @@ def _compound_claims(head: str, *, kb, frame) -> tuple[list[Claim], dict]:
         field, body = "def", str(item.get("def")).strip()
     if not body:
         return out, meta
-    out.append(Claim(kind="note",
-                     content=f"「{head}」は単独の項目を持っていないので、構成語「{topic}」の知識で答えます。",
-                     subject=head, source="local:kb", weight=0.52,
-                     extra={"hypernym": topic, "surface": head}))
+    if head == topic:
+        return out, meta
+    _is_japanese_word = bool(re.search(r"[ぁ-ん一-龯]", head))
+    if _is_japanese_word:      # 複合語を借りた事実だけを明示する（欧文語では発火させない）
+        out.append(Claim(kind="note",
+                         content=f"「{head}」は単独の項目を持っていないので、構成語「{topic}」の知識で答えます。",
+                         subject=head, source="local:kb", weight=0.52,
+                         extra={"hypernym": topic, "surface": head}))
     out.append(Claim(kind=_kind_for_field(field), content=body if body.endswith("。") else body + "。",
                      subject=topic, source="local:kb", slot=field, weight=0.66,
                      extra={"coverage": 0.5, "via": f"compound:{matched}"}))
@@ -541,7 +617,11 @@ def gather(frame, *, kb=None, web: WebGrounding | None = None,
             if not any(k.content == c.content for k in d.claims):
                 d.claims.append(c)
 
-    lex_claims = [] if d.coverage >= 0.5 else lexical_claims(frame)
+    # 辞書情報（表記・読み・拍・品詞）は、語そのものを尋ねる発話にだけ使います。
+    # 話題の質問に辞書引きで答えるのが v3 の最大の欠点だったので、ここで門番を通します。
+    from ..mind.parse import wants_word_info
+
+    lex_claims = [] if d.coverage >= 0.5 or not wants_word_info(q, frame) else lexical_claims(frame)
     if lex_claims:
         d.claims.extend(lex_claims)
         if d.via == "none":
@@ -568,7 +648,7 @@ def gather(frame, *, kb=None, web: WebGrounding | None = None,
             d.coverage = max(d.coverage, 0.72)
             d.notes.append(f"ウェブ裏取り: {len(evidence)} 文 / 出典 {len(sources)} 件")
         else:
-            d.notes.append("ウェブは繋がったが使える文が無かった（または未接続）")
+            d.notes.append("ウェブは開けたが、問いに答える本文は見つからなかった")
     elif need_web:
         d.notes.append("web 無効")
     return d

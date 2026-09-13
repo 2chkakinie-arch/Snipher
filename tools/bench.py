@@ -2,7 +2,7 @@
 """Snipher v3 の実測 — 速い・軽い・壊れない、を数字で残す。
 
     python tools/bench.py            # 表で要約
-    python tools/bench.py --json     # mechanically 読める形
+    python tools/bench.py --json     # 機械が読める JSON で
     python tools/bench.py --turns 5  # 1 発話あたり何回繰り返して数えるか
 
 測るのは次の 4 種類だけ。

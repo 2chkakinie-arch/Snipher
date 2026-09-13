@@ -30,10 +30,14 @@ BOILERPLATE: tuple[str, ...] = (
     "リワード", "reward", "サインイン", "アカウントを選択", "インテリジェント検索",
     "すばやく見つけ", "見つけられるよう", "Cookie", "クッキー", "利用規約", "プライバシー",
     "ログイン", "会員登録", "ログアウト", "広告", "スポンサー", "pr", "All rights reserved",
-    "copyright", "検索結果", "JavaScript", "ジャバスクリプト", "ブラウザ", "シェア", "フォロー",
+    "copyright", "検索結果", "ジャバスクリプトを有効", "シェア", "フォロー",
     "注目記事", "関連記事", "関連リンク", "メニュー", "トップへ", "お問い合わせ",
     "個人情報保護方針", "terms of use", "privacy policy", "ニュースレター", "アプリをダウンロード",
+    # 「ブラウザ」自体は正常な語なので除外しない（ブラウザについて検索する質問が壊れる）。
+    # 落とすのは *ブラウザを有効にしろ* 系の案内文だけです。
+    "ブラウザが有効", "ブラウザでJavaScript", "ブラウザの設定を変更", "キャッシュを削除",
     "表示できません", "ページが見つかりません", "アクセスが集中", "認証してください",
+    "このドメイン", "利用できません", "このページは", "このサイトは", "固定フィクスチャ",
     "別のアカウント", "公平でバランス", "表現の自由", "基本的権利", "情報への自由",
 )
 
@@ -89,9 +93,13 @@ def is_boilerplate(sent: str) -> bool:
 
 def split_sentences(text: str, *, lo: int = 12, hi: int = 230) -> list[str]:
     out: list[str] = []
-    t = _WS.sub(" ", str(text or "")).strip()
+    t = str(text or "").strip()
     if not t:
         return out
+    # 抽出器が段落の切れ目に入れた改行は、句点の無い見出しと本文の境界です。
+    # 改行を空白に潰すと「GLM5.3」見出しと 1 文目が同じ文になってしまうので、そこで切ります。
+    t = re.sub(r"\s*\n+\s*", "。", t)
+    t = _WS.sub(" ", t).strip("。")
     for raw in _SENT.split(t):
         s = raw.strip()
         if not s:
@@ -144,16 +152,35 @@ class WebGrounding:
     """`ResearchEngine` を使って証拠文の集合を作る（Snipher がインターネットに出る唯一の口）。"""
 
     def __init__(self, engine: ResearchEngine | None = None, *,
-                 enabled: bool | None = None, fetch_pages: int = 3, limit: int = 6):
+                 enabled: bool | None = None, fetch_pages: int = 3, limit: int = 6,
+                 backoff: float | None = None):
         self.engine = engine or ResearchEngine()
         self.enabled = (os.environ.get("SNIPHER_WEB", "auto") != "off") if enabled is None else enabled
         self.fetch_pages = fetch_pages
         self.limit = limit
         self.last: Grounding | None = None
+        # 通らないネットワークで毎回 4.5 秒待たないための冷却（失敗を数えて休む）
+        self.backoff = (backoff if backoff is not None
+                        else float(os.environ.get("SNIPHER_WEB_BACKOFF", "30")))
+        self._fails = 0
+        self._cool_until = 0.0
 
     # ------------------------------------------------------------------ #
     def available(self) -> bool:
-        return bool(self.enabled)
+        if not self.enabled:
+            return False
+        return time.time() >= self._cool_until
+
+    def _note(self, out: "Grounding") -> None:
+        """裏取りの結果を数えて、通らない時間帯は少し休む（返事は止めない）。"""
+        net_fail = bool(out.error) and not out.evidence and "no_evidence" not in str(out.error)
+        if net_fail:
+            self._fails += 1
+        else:
+            self._fails = 0
+        if self._fails >= 3 and self.backoff > 0:
+            self._cool_until = time.time() + self.backoff
+            self._fails = 0
 
     def gather(self, query: str, *, explicit: bool | None = None, want: int | None = None,
                extra_queries: tuple[str, ...] = (), read_pages: int | None = None) -> Grounding:
@@ -200,17 +227,30 @@ class WebGrounding:
                 if body and body != snippet:
                     pool += [(s, True, i) for i, s in enumerate(split_sentences(body)[:60])]
                 pool += [(s, False, i) for i, s in enumerate(split_sentences(snippet)[:6])]
-                if title:
-                    pool.append((title, False, 0))
+                # タイトルだけ（「X とは - 例示事典」）は *記事の題名* で、検証できる文ではない。
+                # v2 はこれを証拠として貼って「検索結果の案内文」をそのまま返していた。
+                # ページ自体が問いの語を踏んでいる（タイトル・URL）なら、本文の文は
+                # 同じ語を繰り返していなくても *その話題の記述* です（記事 2 文目を落とさない）。
+                page_on_topic = any(
+                    len(normalize(t0)) >= 2 and normalize(t0).lower() in f"{title} {url}".lower()
+                    for t0 in terms_all)
+                def _score(sent: str, from_body: bool, pos: int) -> float:
+                    sc = score_sentence(sent, terms_all, pos=pos, rank=rank, from_body=from_body)
+                    # 記事そのものが問いの語を踏んでいるなら、本文の続きの文も
+                    # 「同じ話題の記述」です（語を繰り返さないだけ）。先の方ほど信用します。
+                    if from_body and page_on_topic and sc <= 0 and pos < 8:
+                        sc = 1.2 - pos * 0.1
+                    return sc
+
                 scored = sorted(
-                    ((score_sentence(sent, terms_all, pos=pos, rank=rank, from_body=from_body),
-                      sent, from_body) for sent, from_body, pos in pool),
+                    ((_score(sent, from_body, pos), sent, from_body)
+                     for sent, from_body, pos in pool),
                     key=lambda x: -x[0])
                 picked_here: list[Evidence] = []
                 for sc, sent, from_body in scored:
                     if sc <= 0:
                         continue
-                    if not self._topic_overlap(sent, terms_all):
+                    if not (page_on_topic or self._topic_overlap(sent, terms_all)):
                         continue
                     picked_here.append(Evidence(text=sent, url=url, title=title,
                                                 origin="web", score=sc))
@@ -241,6 +281,7 @@ class WebGrounding:
         out.elapsed_ms = (time.perf_counter() - started) * 1000
         out.error = None if kept else (";".join(errors[:2]) or "no_evidence")
         self.last = out
+        self._note(out)
         return out
 
     # ------------------------------------------------------------------ #

@@ -14,6 +14,8 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
+import re
+
 import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -418,11 +420,14 @@ class TestHonestUnknownAndValidator:
         assert ok, why
 
     def test_unknown_topic_suggests_a_nearby_topic(self):
+        """手元に無い造語でも、近い話題の *本文を引いて* 答える（案内だけで止めない）。"""
         c = _composer()
         r = c.compose("量子饅頭の作り方")
-        assert r.plan == "unknown_topic"
-        assert "量子コンピュータ" in r.text, r.text
-        assert "話せます" in r.text
+        assert "量子コンピュータ" in r.text or "量子" in r.text, r.text
+        assert len(r.text.strip()) >= 20, r.text
+        # 辞書引き（読み・拍・品詞）で誤魔化さない
+        assert not re.search(r"(拍|品詞|索引|語彙バンク)", r.text), r.text
+        assert not any(x in r.text for x in ("できません", "分かりません", "手元に無いので答えられません"))
 
     def test_verb_te_form_is_not_used_as_subject(self):
         u = _composer().analyze("ちょっと聞いて")

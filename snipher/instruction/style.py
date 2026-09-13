@@ -116,6 +116,9 @@ def _plain_sentence(sentence: str) -> str:
         return s
     marks = "".join(re.findall(r"[。！？!?…]+$", s))
     body = s[: len(s) - len(marks)] if marks else s
+    # 語尾を規則で落とすと *疑問の「か」* まで消えて「〜あり。」になります。
+    # 疑問は形として保ち、後で 「？」 に組み替えます。
+    asked = bool(re.search(r"(?:か|のか|かな)$", body))
 
     cand = ""
     for src, dst in _NEG_POLITE:
@@ -142,6 +145,10 @@ def _plain_sentence(sentence: str) -> str:
         if not got or not is_predicate_end(got) or _POLITE_LEFT.search(got):
             got = cand
     got = got or body
+    if asked and not str(got).rstrip("。").endswith(("か", "かな", "ですか", "ますか")):
+        got = str(got).rstrip("。") + "か"
+    if asked and marks in ("。", ""):
+        marks = "？"
     return got + (marks or "")
 
 
@@ -228,20 +235,47 @@ def _polite_sentence(sentence: str) -> str:
     return s if s.endswith("。") else s + "。"
 
 
-def retime(sentence: str, tone: str, *, index: int = 0, tail_override: str = "") -> str:
+def _friendly_tail(body: str, seq: list[str]) -> str | None:
+    """砕いた口調で *付けてはいけない* 語尾だけを弾きます。None なら繰り回しに任せます。
+
+    問い（〜たいですか。）に だよ/だね は乗せられないので、そこだけ空を返します。
+    平文で だよ／だね を交互に置くのは、口調指定（両方を使って、という指示）を守るためです。
+    """
+    probe = str(body or "").rstrip("。！!… ").strip()
+    if not probe:
+        return ""
+    if re.search(r"(?:か|ですか|ますか)\s*$", probe) or re.search(r"[？?]$", probe):
+        return ""
+    return None
+
+
+def retime(sentence: str, tone: str, *, index: int = 0,
+           tail_override: str | None = None) -> str:
     """1 文を指定の口調に組み替える（語尾の文字差し替えではなく活用の組み直し）。"""
     s = _plain_sentence(sentence).strip()
     if not s or _is_protected(s):
         return s
     tails = TAILS.get(tone, TAILS["plain"])
-    tail = tail_override or tails[index % len(tails)]
+    # "" は「語尾を載せない」という指示です。None (未指定) と混ぜると、問いに
+    # 繰り回しで選んだ語尾が乗って「したいんだね」のようになります。
+    tail = tails[index % len(tails)] if tail_override is None else tail_override
     marks = "".join(re.findall(r"[。！？!?…]+$", s))
     body = s[: len(s) - len(marks)] if marks else s
+    asked = bool(re.search(r"(?:か|ますか|ですか|でしょうか)$", body)) or marks in ("？", "?")
     if marks in ("？", "?"):
         return body + "？"
     if marks in ("！", "!"):
         return body + ("！" if tone not in ("friendly", "friendly_professional") else "よ！")
+    if asked and not tail:
+        if tone in ("friendly", "friendly_professional"):
+            return re.sub(r"(?:ますか|ですか|か)\s*$", "", body) + "か？"
     if not tail:
+        if tone in ("friendly", "friendly_professional"):
+            # 問いには だよ/だね を乗せられないので、*疑問の形のまま* 砕きます。
+            # 「〜したいですか。」→「〜したい？」。「〜したい。」と語気を落とすのは別文です。
+            soft = re.sub(r"(?:でしょうか|ですか|ますか)\s*$", "", body)
+            if soft != body and soft:
+                return soft + "？"
         return body + "。"
     if ends_with_tail(body, tails):
         return body + "。"
@@ -284,7 +318,12 @@ def restyle(text: str, *, tone: str = "", register: str = "", tails: list[str] |
         for p in pieces:
             if tone in ("friendly", "friendly_professional"):
                 seq = tails or list(TAILS[tone])
-                got = retime(p, tone, index=idx, tail_override=seq[idx % len(seq)])
+                if re.search(r"(?:か|ですか|ますか)\s*[。？?]?$", p.strip()):
+                    got = retime(p, tone, index=idx, tail_override="")
+                    rebuilt.append(got.strip())
+                    continue
+                # 語尾は *その文の形* で決めるので、繰り回し（idx）で壊れません。
+                got = retime(p, tone, index=idx, tail_override=_friendly_tail(p, seq))
                 idx += 1
             elif bullets and not is_predicate_end(p.rstrip("。！？!?")):
                 got = p                            # 名詞止めの箇条書きはそのまま
