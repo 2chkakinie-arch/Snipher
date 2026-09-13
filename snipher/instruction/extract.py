@@ -52,7 +52,14 @@ CONCEPTS: dict[str, tuple[str, ...]] = {
     "percent": ("percent", "percentage", "ratio", "rate", "share", "割合", "率", "パーセント",
                 "割", "占有率", "確率"),
     "person": ("person", "name", "who", "author", "owner", "user", "customer", "contact",
-               "人物", "名前", "氏名", "名", "作者", "著者", "所有者", "担当者", "客", "誰"),
+               "client", "fullname", "username", "人物", "名前", "氏名", "名", "作者", "著者",
+               "所有者", "担当者", "客", "顧客", "顧客名", "取引先", "クライアント", "誰", "人名"),
+    "id": ("id", "orderid", "order_id", "code", "number", "serial", "sku", "reference",
+           "注文番号", "番号", "識別子", "管理番号", "会員番号", "伝票番号", "コード"),
+    "occupation": ("job", "occupation", "profession", "role", "position", "work", "title",
+                   "職業", "職種", "仕事", "役職", "勤務先", "担当"),
+    "product": ("product", "item", "goods", "merchandise", "商品", "商品名", "品名", "製品",
+                "製品名", "品目", "アイテム"),
     "org": ("org", "organization", "company", "brand", "team", "school", "店", "会社", "組織",
             "団体", "チーム", "学校", "メーカー", "ブランド", "企業"),
     "transport": ("transport", "vehicle", "means", "mode", "train", "線", "交通手段", "手段",
@@ -97,7 +104,10 @@ KIND2CONCEPT: dict[str, tuple[str, ...]] = {
     "url": ("url", "contact"),
     "contact": ("contact", "url"),
     "title": ("title",),
-    "product": ("org", "title", "genre"),
+    "product": ("product", "org", "title", "genre"),
+    "person": ("person", "org"),
+    "id": ("id", "count"),
+    "occupation": ("occupation", "org", "title"),
     "lang": ("lang", "title"),
 }
 
@@ -162,6 +172,14 @@ PATTERNS: tuple[tuple[str, re.Pattern], ...] = (
     ("contact", re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}|"
                            rf"0\d{{1,4}}-\d{{1,4}}-\d{{3,4}}")),
     ("transport", re.compile(rf"(?:{_TRANSPORT_RE})(?:号|線|便)?")),
+    ("place", re.compile(r"[一-龯ァ-ヶー]{2,8}(?:市|区|町|村|県|都|府)")),
+    ("id", re.compile(r"(?<![A-Za-z0-9])[A-Za-z]{1,4}[-_][0-9]{2,8}(?![0-9])")),
+    ("id", re.compile(r"(?:注文番号|番号|伝票番号|管理番号|会員番号)\s*[:：]?\s*([A-Za-z0-9\-]{3,16})")),
+    ("occupation", re.compile(r"([一-龯ァ-ヶーA-Za-z]{2,12})(?:です|であり|をして|として|で、|"
+                              r"で働い|に勤め|をしている)")),
+    ("product", re.compile(r"(?:商品|製品|品名|品目)\s*(?:は|:|：)?\s*"
+                           r"([一-龯ァ-ヶーA-Za-z0-9]{2,20})")),
+    ("person", re.compile(r"([一-龯]{2,6})(?:さん|氏|様)?は\s*(?:[0-9０-９]+\s*[歳才]|.{0,8}(?:の|である))")),
     ("place", re.compile(rf"(?:{_PLACE_RE})")),
     ("place", re.compile(r"[一-龯ァ-ヶーA-Za-z0-9]{2,10}駅")),
 )
@@ -198,10 +216,14 @@ def candidates(text: str) -> list[dict]:
     raw: list[dict] = []
     for kind, pat in PATTERNS:
         for m in pat.finditer(src):
-            surface = _clean(m.group(0))
+            # 取り出し用の括弧があれば *その中身* が値（`注文番号 A-102` の A-102）
+            if m.groups() and m.group(1):
+                surface, (a, b) = _clean(m.group(1)), m.span(1)
+            else:
+                surface, (a, b) = _clean(m.group(0)), m.span()
             if not surface:
                 continue
-            raw.append({"kind": kind, "surface": surface, "start": m.start(), "end": m.end()})
+            raw.append({"kind": kind, "surface": surface, "start": a, "end": b})
     # 地名（東京駅 ⊃ 東京）や金額（14,000円 ⊃ 000円）の入れ子を整理する
     kept: list[dict] = []
     for c in sorted(raw, key=lambda x: (-(x["end"] - x["start"]), x["start"])):
@@ -362,6 +384,25 @@ def render_table(values: dict[str, str], schema: list[tuple[str, str]], kind: st
     return json.dumps({k: values.get(k, "") for k in keys}, ensure_ascii=False, indent=indent)
 
 
+def flatten_json(obj) -> dict:
+    """入れ子の JSON を葉の欄（key → 値）に畳む。配列は *埋まっている値* を優先する。"""
+    out: dict = {}
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            if isinstance(v, (dict, list)):
+                for k2, v2 in flatten_json(v).items():
+                    if k2 not in out or (not str(out[k2]).strip() and str(v2).strip()):
+                        out[k2] = v2
+            elif k not in out:
+                out[k] = v
+    elif isinstance(obj, list):
+        for it in obj:
+            for k, v in flatten_json(it).items():
+                if k not in out or (not str(out[k]).strip() and str(v).strip()):
+                    out[k] = v
+    return out
+
+
 def verify_json(text: str, schema: list[tuple[str, str]]) -> tuple[bool, str, dict | None]:
     """出力が *指定のスキーマ通りの JSON* かを検査する（指示追従の機械判定）。"""
     body = text.strip()
@@ -375,6 +416,9 @@ def verify_json(text: str, schema: list[tuple[str, str]]) -> tuple[bool, str, di
     if not isinstance(got, dict):
         return False, "JSON のトップがオブジェクトではありません", None
     keys = [k for k, _ in schema]
+    if keys and any(k not in got for k in keys) and any(isinstance(v, (dict, list))
+                                                        for v in got.values()):
+        got = flatten_json(got)              # 入れ子のテンプレート → 葉で照合
     if keys:
         missing = [k for k in keys if k not in got]
         extra = [k for k in got if k not in keys]
@@ -392,6 +436,22 @@ def verify_json(text: str, schema: list[tuple[str, str]]) -> tuple[bool, str, di
 # --------------------------------------------------------------------------- #
 # ラベル付きの値（`氏名: 山田太郎`）と、文ごとの記録（`りんごは1個120円`）
 # --------------------------------------------------------------------------- #
+#: 材料の中で *ラベルとして立つ* 語（コロンが無くても値が続く）
+_LABEL_WORDS = (
+    "注文番号", "注文日", "出荷日", "配送日", "納期", "顧客名", "顧客", "取引先", "氏名", "名前",
+    "商品名", "商品", "製品名", "製品", "数量", "合計金額", "合計", "金額", "単価", "価格",
+    "日付", "日時", "開始", "終了", "年齢", "住所", "都市", "職業", "職種", "電話番号", "電話",
+    "メール", "件名", "宛先", "担当者", "部署", "備考", "状態", "会員番号", "伝票番号",
+    "管理番号", "住所", "行き先", "出発地", "目的地", "所要時間", "料金",
+    "配送", "発送", "発送日", "支払", "支払日", "支払い", "請求", "請求額", "宛名",
+    "連絡先", "予定", "期限", "締切", "時間", "場所", "内容", "本文", "タイトル",
+    "出発", "到着", "便名", "座席", "席", "人数", "型式", "型番", "色", "サイズ",
+)
+_LABEL_PHRASE = re.compile(
+    "(" + "|".join(re.escape(w) for w in sorted(set(_LABEL_WORDS), key=len, reverse=True)) + ")"
+    r"\s*(?:は|が|:|：)?\s*([^、。\n]{1,30})")
+_TRAILING_QTY = re.compile(r"\s*([0-9０-９][0-9０-９,]*\s*(?:台|個|件|枚|本|足|人|組|杯|点|泊))$")
+
 _LABEL_KEY = re.compile(r"([一-龯ァ-ヶーぁ-んA-Za-z][一-龯ァ-ヶーぁ-んA-Za-z0-9_ ()（）]{0,14})"
                         r"\s*[:：]")
 _SUBJECT_VALUE = re.compile(r"^([一-龯ァ-ヶーぁ-んA-Za-z][一-龯ァ-ヶーぁ-んA-Za-z0-9_]{1,14})"
@@ -414,6 +474,15 @@ def label_values(text: str) -> dict[str, str]:
         val = src[start:end].strip(" 　、。,，\n「」\"'")
         # 直後の文（別の材料）まで飲み込まない
         val = re.split(r"[。\n]", val)[0].strip(" 　、。,，")
+        if key and val and key not in out:
+            out[key] = val
+    # コロンの無いラベル（`注文番号 A-102` / `顧客は佐藤花子`）も読む
+    for m in _LABEL_PHRASE.finditer(src):
+        key = m.group(1).strip()
+        val = _clean(m.group(2))
+        mq = _TRAILING_QTY.search(val)
+        if mq and len(val[:mq.start()].strip()) >= 2 and not re.search(r"数量|個数", key):
+            val = val[:mq.start()].strip()      # `ノートPC 2台` → 商品名は ノートPC
         if key and val and key not in out:
             out[key] = val
     return out
@@ -517,7 +586,13 @@ def _same_field(label: str, key: str, hint: str) -> bool:
     concept = concept_of(key, hint)
     if concept and concept_of(label, label) == concept:
         return True
-    pairs = (("氏名", "name"), ("名前", "name"), ("名称", "name"), ("年齢", "age"),
+    pairs = (("顧客", "customer"), ("顧客名", "name"), ("取引先", "customer"),
+             ("注文番号", "order_id"), ("注文番号", "id"), ("商品", "product"),
+             ("商品名", "product"), ("製品", "product"), ("数量", "qty"), ("数量", "count"),
+             ("合計", "total"), ("合計金額", "total"), ("配送", "ship_date"),
+             ("配送日", "ship_date"), ("納期", "date"), ("職業", "job"), ("職種", "job"),
+             ("職業", "occupation"), ("都市", "city"), ("住所", "address"),
+             ("氏名", "name"), ("名前", "name"), ("名称", "name"), ("年齢", "age"),
              ("住所", "city"), ("住所", "address"), ("都道府県", "city"), ("値段", "price"),
              ("価格", "price"), ("金額", "price"), ("料金", "fare"), ("所要", "duration"),
              ("時間", "time"), ("開始", "start"), ("終了", "end"), ("行き先", "destination"),
@@ -556,6 +631,42 @@ def render_rows(rows: list[dict[str, str]], schema: list[tuple[str, str]], kind:
                       indent=indent)
 
 
+def fill_template(template_text: str, values: dict, *, rows: list[dict] | None = None,
+                  indent: int = 2) -> str | None:
+    """JSON テンプレートの *形そのもの* に値を埋める（入れ子・配列も保つ）。
+
+    文字列の葉（`"customer": {"name": "顧客名"}` の `顧客名`）がヒントなので、
+    欄名（`name`）で値を引いて差し替えます。材料に無ければ空文字のまま＝ねつ造しません。
+    """
+    try:
+        tmpl = json.loads(str(template_text or ""))
+    except Exception:  # noqa: BLE001
+        return None
+
+    def fill(node, row: dict):
+        if isinstance(node, dict):
+            out = {}
+            for k, v in node.items():
+                if isinstance(v, str):
+                    out[k] = str(row.get(k) or values.get(k) or "")
+                elif isinstance(v, (dict, list)):
+                    out[k] = fill(v, row)
+                else:
+                    out[k] = v
+            return out
+        if isinstance(node, list):
+            if node and isinstance(node[0], (dict, list)):
+                srcs = [r for r in (rows or []) if r] or [dict(values)]
+                return [fill(node[0], r) for r in srcs]
+            return list(node)
+        return node
+
+    try:
+        return json.dumps(fill(tmpl, dict(values or {})), ensure_ascii=False, indent=indent)
+    except Exception:  # noqa: BLE001
+        return None
+
+
 __all__ = ["extract_fields", "candidates", "concept_of", "render_table", "verify_json",
            "sentences", "CONCEPTS", "PATTERNS", "label_values", "subject_values",
-           "extract_records", "render_rows"]
+           "extract_records", "render_rows", "fill_template"]

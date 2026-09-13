@@ -119,13 +119,37 @@ def _do_extract(d: Directive) -> dict:
                         missing.remove(key)
                     trace.setdefault("labels", {})[key] = lab
                     break
-    text = _extract.render_table(values, schema, kind, indent=d.fmt.indent)
+    text = ""
+    if kind == "json" and d.fmt.schema_template:
+        # 指示に JSON テンプレートが書いてあれば、*その形*（入れ子・配列）で返す
+        recs = _extract.extract_records(payload, schema)
+        text = _extract.fill_template(d.fmt.schema_template, values,
+                                      rows=recs if len(recs) >= 2 else None,
+                                      indent=d.fmt.indent) or ""
+    if not text:
+        text = _extract.render_table(values, schema, kind, indent=d.fmt.indent)
     return {"text": text, "values": values, "rows": [values], "missing": missing, "trace": trace,
             "kind": kind, "confidence": 0.96 if not missing else 0.86}
 
 
-def _do_summarize(d: Directive, *, room_bonus: int = 0) -> dict:
-    payload = d.payload or d.question or d.raw
+def _do_summarize(d: Directive, *, room_bonus: int = 0, kb=None, web=None, history=None,
+                  lm=None, core=None, turn: int = 0) -> dict:
+    payload = (d.payload or d.question or "").strip()
+    if not payload:
+        # 材料が差し出されていない「〜を3つの箇条書きにまとめて」で *指示文そのもの* を
+        # 要約すると、依頼の読み上げ（「あなたは編集者だよ。」）になります。
+        # ここでは知識ベースから根拠を集めて、指定の形（本数・口調・長さ）で組みます。
+        topic = topic_from_instruction(d.instruction or d.raw)
+        src = d
+        if topic and not d.question:
+            from dataclasses import replace as _replace
+            src = _replace(d, question=topic)          # 依頼文ではなく話題を答えの対象にする
+        got = _do_answer(src, kb=kb, web=web, history=history, lm=lm, core=core, turn=turn)
+        got["notes"] = list(got.get("notes") or []) + \
+            ["要約: 材料が差し出されていないので、知識から指定の本数で組みました"]
+        got["coverage"] = float(got.get("coverage") or 0.0)
+        got["bullets"] = d.fmt.bullets or d.fmt.lines or 3
+        return got
     n = d.fmt.bullets or d.fmt.lines or 3
     brief = bool(d.fmt.brief) or bool(re.search(r"短く|簡潔", d.instruction or d.raw))
     got = _summarize.summarize(
@@ -147,9 +171,143 @@ def _do_code(d: Directive) -> dict:
     return got
 
 
+_TOPIC_OBJ = re.compile(r"([^\s、。「」『』:：\n]{2,24}?)\s*(?:について|に関する|の件|を|の話題を)")
+_TOPIC_STOP = re.compile(r"^(?:以下|上記|次の?|この|その|それ|これ|全部|全て|すべて|要点|ポイント|"
+                         r"箇条書き|箇条書|表|グラフ|図|リスト|番号付き|英語|日本語|日本語訳|英訳|和訳|"
+                         r"CSV|csv|JSON|json|key|value|テキスト|文章|本文|資料|材料|情報|データ|"
+                         r"[0-9０-９]+(?:つ|個|本|行|文字|字|文|件|点)|[一二三四五六七八九十]+(?:つ|個|本|行|文))$")
+
+
+def topic_from_instruction(text: str) -> str:
+    """指示文から *話題* を読む（`AIニュースを3つの箇条書きにまとめて` → `AIニュース`）。
+
+    材料が差し出されていない指示で、依頼文そのものを答えの中身にしないための手がかりです。
+    形式の語（箇条書き／100文字／英語）は話題ではありません。
+    """
+    for m in _TOPIC_OBJ.finditer(str(text or "")):
+        cand = m.group(1).strip(" 　はがもとへでにと")
+        # 受け手の前置（`取引先に納期延期` → `納期延期`）は話題から外す
+        cand = re.sub(r"^(?:取引先|顧客|お客様|クライアント|社内|社外|チーム|全員|担当者|関係者|"
+                      r"上司|部下|先生|先輩|後輩|友人|家族|会員|ユーザー|読者)"
+                      r"(?:チーム|メンバー|各位|全員|担当者|向け)?(?:に|へ|向け|宛て|に対する)", "", cand)
+        if cand and not _TOPIC_STOP.match(cand) and len(cand) >= 2:
+            return cand
+    return ""
+
+
+def _is_english(text: str) -> bool:
+    body = str(text or "")
+    ascii_letters = len(re.findall(r"[A-Za-z]", body))
+    jp = len(re.findall(r"[ぁ-んァ-ヶー一-龯]", body))
+    return ascii_letters >= 4 and ascii_letters > jp * 3
+
+
+def split_sentences(text: str) -> list[str]:
+    """文に割る（日本語の「。」も英語の `.` も同じ目に扱う）。"""
+    body = str(text or "")
+    pat = r"(?<=[.!?])\s+" if _is_english(body) else r"(?<=[。！？!?])\s*"
+    return [x.strip() for x in re.split(pat, body) if x.strip()]
+
+
+def _limit_sentences(text: str, n: int) -> str:
+    """文数を指定に合わせる（材料は増やさない＝前の文を残す）。"""
+    parts = split_sentences(text)
+    if n <= 0 or len(parts) <= n:
+        return str(text or "")
+    sep = " " if _is_english(str(text or "")) else ""
+    return sep.join(parts[:n])
+
+
+_EN_ASK = re.compile(r"^(?:what|why|how|who|when|where|which)\s+"
+                     r"(?:is|are|was|were|does|do|did|will|would|can|could|should\s+be)?\s*"
+                     r"(.+?)\s*\??$", re.IGNORECASE)
+_EN_TELL = re.compile(r"^(?:please\s+)?(?:explain|describe|summarize|summarise|list|write|"
+                      r"tell me about|talk about|define|compare)\s+(.+)$", re.IGNORECASE)
+_EN_TAIL = re.compile(r"(?:\s*(?:in\s+(?:english|japanese|spanish|french|german|chinese|"
+                      r"korean|\d+\s+sentences?|\d+\s+bullets?|\d+\s+words?|detail|brief|"
+                      r"simple terms|a nutshell)|using\s+\d+\s+sentences?|with\s+\d+\s+bullets?|"
+                      r"please)\s*)+[.]?\s*$", re.IGNORECASE)
+
+
+def english_subject(text: str) -> str:
+    """英語の問い／命令から *話題* を取り出す（`What is photosynthesis?` → photosynthesis）。"""
+    src = str(text or "").strip()
+    for line in [x.strip() for x in re.split(r"(?<=[.!?])\s+", src) if x.strip()]:
+        m = _EN_ASK.match(line.strip("?！! "))
+        if m:
+            topic = _EN_TAIL.sub("", m.group(1)).strip(" .,!?")
+            if topic and len(topic) >= 2:
+                return topic
+        m2 = _EN_TELL.match(line)
+        if m2:
+            topic = _EN_TAIL.sub("", m2.group(1)).strip(" .,!?")
+            topic = re.sub(r"^(?:the|a|an|about|on)\s+", "", topic, flags=re.IGNORECASE)
+            if topic and len(topic) >= 2:
+                return topic
+    return ""
+
+
+def _english_fallback(d: Directive, jp_text: str, got: dict) -> str:
+    """英語指定＋材料なしのときの英語の答え（数えられる事実は日本語側から引き継ぐ）。"""
+    topic = (english_subject(d.question or d.raw) or english_subject(d.raw)
+             or topic_from_instruction(d.raw) or "that topic").strip().rstrip("?？.")
+    src = str(jp_text or "")
+    m = re.search(r"([0-9０-９][0-9０-９,]*(?:万)?)\s*語", src)
+    bank = m.group(1) if m else ""
+    web_off = bool(re.search(r"ウェブ検索|web", src, re.IGNORECASE))
+    lines = [f'I could not find grounded material for "{topic}" in my knowledge base.']
+    if bank:
+        lines.append(f"My word bank holds {bank} headwords and has no entry for it"
+                     + (", and web lookup is off in this run." if web_off else "."))
+    else:
+        lines.append("I have no grounded material for it in this run.")
+    lines.append("Tell me which angle you need - meaning, steps, comparison, or cost - "
+                 "and I will build the answer around it.")
+    return " ".join(x.strip() for x in lines if x.strip())
+
+
 def _do_answer(d: Directive, *, kb=None, web=None, history=None, lm=None, core=None,
                turn: int = 0) -> dict:
-    return _answer.answer(d, kb=kb, web=web, history=history, lm=lm, core=core, turn=turn)
+    src = d
+    if not d.question and not d.payload:
+        topic = topic_from_instruction(d.instruction or d.raw)
+        if topic:
+            from dataclasses import replace as _replace
+            src = _replace(d, question=topic)
+    got = _answer.answer(src, kb=kb, web=web, history=history, lm=lm, core=core, turn=turn)
+    body = str(got.get("text") or "").strip()
+    lang = str(d.fmt.language or "")
+    if body and lang:
+        want_en = bool(re.search(r"英語|english", lang, re.IGNORECASE))
+        want_ja = bool(re.search(r"日本語|japanese", lang, re.IGNORECASE))
+        if want_en and not _is_english(body):
+            from . import translate as _tr
+            grounded = bool(got.get("sources")) or bool(got.get("claims"))
+            if not grounded:
+                # 材料が無い答えを機械翻訳すると砕けた英文になるので、英語で組み直す
+                body = _limit_sentences(_english_fallback(d, body, got),
+                                        d.fmt.sentences or 3)
+                got["text"] = body
+                got["notes"] = list(got.get("notes") or []) + \
+                    ["出力言語: 英語（材料が無いので数えられる事実を英語で返しました）"]
+                return got
+            en, notes = _tr.to_english(body)
+            if en.strip():
+                got["text"] = en
+                got["notes"] = list(got.get("notes") or []) + notes + ["出力言語: 英語"]
+                got["translated"] = True
+                body = en
+        elif want_ja and _is_english(body):
+            from . import translate as _tr
+            ja, notes = _tr.to_japanese(body)
+            if ja.strip():
+                got["text"] = ja
+                got["notes"] = list(got.get("notes") or []) + notes + ["出力言語: 日本語"]
+                got["translated"] = True
+                body = ja
+    if body and d.fmt.sentences and not d.fmt.bullets:
+        got["text"] = _limit_sentences(body, d.fmt.sentences)
+    return got
 
 
 #: 指示の語 → solve 層が実際に持っている手の語（ここが違うと「手が見つからない」になる）
@@ -214,6 +372,23 @@ def _do_list(d: Directive, *, kb=None, web=None, history=None) -> dict:
     """列挙（材料があればそこから、無ければ索引と知識から数えて出す）。"""
     n = d.fmt.bullets or d.fmt.lines or 5
     src = d.payload or d.question or d.raw
+
+    # 「都市名を抽出し、箇条書きで列挙して」→ 文ではなく *名前の種類*（東京/大阪）を並べる
+    want = topic_from_instruction(d.instruction or d.raw)
+    if want and (d.payload or "").strip():
+        concept = _extract.concept_of(want, want)
+        kinds = _extract.KIND2CONCEPT.get(concept, ()) if concept else ()
+        if kinds:
+            names = [c["surface"] for c in _extract.candidates(d.payload) if c["kind"] in kinds]
+            names = list(dict.fromkeys(names))[:n]
+            if names:
+                if d.fmt.numbered:
+                    text = "\n".join(f"{i}. {x}" for i, x in enumerate(names, 1))
+                else:
+                    text = "\n".join(f"・{x}" for x in names)
+                return {"text": text, "items": names, "confidence": 0.9,
+                        "notes": [f"列挙: 材料から{want}を {len(names)} 件拾いました"]}
+
     units = _summarize.split_units(src)
     if len(units) >= 2:
         items = units[:n]
@@ -229,11 +404,155 @@ def _do_list(d: Directive, *, kb=None, web=None, history=None) -> dict:
     return {"text": text, "items": items, "confidence": 0.82 if items else 0.4}
 
 
-def _do_write(d: Directive, *, history=None) -> dict:
+_FICTION_WORD = re.compile(r"小説|物語|ストーリー|短編|詩|ポエム|短歌|俳句|フィクション|"
+                           r"novel|story|poem|fiction", re.IGNORECASE)
+_DOC_ARTIFACT = re.compile(r"メール|電子メール|記事|レポート|報告書|案内文|お詫び|謝罪|文案|コピー|"
+                           r"手紙|議事録|スピーチ|説明文|提案書|企画書|お知らせ|挨拶文|謝罪文|"
+                           r"email|article|report|memo|announcement|apology", re.IGNORECASE)
+_AUDIENCE = re.compile(r"(取引先|顧客|お客様|クライアント|社内|チーム|全員|担当者|関係者|"
+                       r"上司|先生|先輩|後輩|友人|家族)")
+_PURPOSES = (
+    ("apology", re.compile(r"詫び|詫びる|謝罪|お詫び|申し訳|apolog", re.IGNORECASE)),
+    ("announcement", re.compile(r"案内|お知らせ|通知|告知|announce", re.IGNORECASE)),
+    ("report", re.compile(r"報告|レポート|report", re.IGNORECASE)),
+    ("request", re.compile(r"依頼|お願い|要請|request", re.IGNORECASE)),
+    ("thanks", re.compile(r"御礼|お礼|感謝|thank", re.IGNORECASE)),
+    ("proposal", re.compile(r"提案|企画|proposal", re.IGNORECASE)),
+)
+#: 用途ごとの文（{topic} は指示から読んだ話題、【 】は *材料が無いので空欄* の印）
+_DOC_LINES = {
+    "apology": [
+        "この度は、{topic}の件でご迷惑をおかけし、誠に申し訳ございません。",
+        "経過と現時点の状況を、以下にお伝えします。",
+        "原因は【原因】で、影響範囲は【影響範囲】です。",
+        "対応として、【対応内容】を進めています。",
+        "今後の予定は【日程】で、進捗はその都度ご報告します。",
+        "ご不明な点がございましたら、ご連絡ください。",
+        "何卒ご理解を賜りますようお願い申し上げます。",
+    ],
+    "announcement": [
+        "{topic}について、お知らせします。",
+        "内容は【内容】で、対象は【対象】です。",
+        "日時は【日時】、場所は【場所】を予定しています。",
+        "ご確認のうえ、必要であれば【締切】までにご返信ください。",
+        "ご不明な点がございましたら、ご連絡ください。",
+    ],
+    "report": [
+        "{topic}の状況を報告します。",
+        "結論から言うと、【結論】です。",
+        "根拠は【数値・事実】で、確認した範囲は【範囲】です。",
+        "課題は【課題】で、次の対応は【対応】を予定しています。",
+        "次回の報告は【日程】に行います。",
+    ],
+    "request": [
+        "{topic}について、お願いがあります。",
+        "ご希望は【依頼内容】で、期限は【期限】です。",
+        "ご対応いただける場合は、【連絡先】までお知らせください。",
+        "お手数をおかけしますが、よろしくお願いいたします。",
+    ],
+    "thanks": [
+        "{topic}の件、ありがとうございました。",
+        "おかげさまで【結果】となりました。",
+        "今後も変わりなくお付き合いいただければ幸いです。",
+        "取り急ぎ、御礼まで。",
+    ],
+    "proposal": [
+        "{topic}について、提案します。",
+        "狙いは【目的】で、想定する効果は【効果】です。",
+        "必要なものは【資源】で、期間は【期間】を見込みます。",
+        "ご検討のほど、よろしくお願いいたします。",
+    ],
+}
+_DOC_EXTRA = [
+    "背景は【背景】で、これまでの経緯は【経緯】のとおりです。",
+    "現状は【現状】で、影響は【影響】と見ています。",
+    "確認済みの事実は【事実】で、未確定の点は【未確定】です。",
+    "体制は【担当】が中心で、連絡先は【連絡先】です。",
+    "次の対応は【次の対応】で、期限は【期限】を予定しています。",
+    "想定されるご質問には、【回答方針】でお答えします。",
+    "参考資料は【資料】をご覧ください。",
+]
+_DOC_CLOSE = {
+    "email": ["{audience} ご担当者様", "いつもお世話になっております。【氏名】です。"],
+    "article": ["{topic}について、要点をまとめます。"],
+}
+
+
+def _compose_document(d: Directive) -> dict:
+    """メール・記事・報告書のような *業務の文書* を、指示の要素から組む。
+
+    材料に無い具体（日付・金額・名前）は **空欄の印【 】** で残します。ここで数字を
+    作ると、それはねつ造になります。口調と長さは指示の仕様を守ります。
+    """
+    raw = str(d.raw or "")
+    target_chars = int(d.fmt.target_chars or 0)
+    purpose = next((name for name, pat in _PURPOSES if pat.search(raw)), "announcement")
+    audience = (_AUDIENCE.search(raw).group(1) if _AUDIENCE.search(raw) else "")
+    topic = topic_from_instruction(d.instruction or raw)
+    if not topic:
+        m = re.search(r"([^\s、。「」]{2,16}?)(?:を|の件|について|する|する内容)?\s*"
+                      r"(?:メール|記事|レポート|報告書|案内文|文案|手紙|説明文|お詫び)", raw)
+        topic = (m.group(1).strip("はがをにでと") if m else "") or "ご依頼の件"
+    kind = "email" if re.search(r"メール|手紙|email|案内文|お詫び", raw, re.IGNORECASE) else "article"
+
+    lines: list[str] = []
+    if kind == "email":
+        head = [x.replace("{audience}", audience or "ご担当").replace("{topic}", topic)
+                for x in _DOC_CLOSE["email"]]
+        lines.append(f"件名: {topic}の件")
+        lines.extend(x for x in head if x.strip())
+    else:
+        lines.append(f"{topic}について")
+        lines.extend(x.replace("{topic}", topic) for x in _DOC_CLOSE["article"])
+    body = [x.replace("{topic}", topic).replace("{audience}", audience or "皆様")
+            for x in _DOC_LINES.get(purpose, _DOC_LINES["announcement"])]
+    if target_chars and sum(len(x) for x in body) < target_chars * 0.5:
+        body.extend(x.replace("{topic}", topic) for x in _DOC_EXTRA)
+    lines.extend(body)
+
+    from . import style as _style
+    target = int(d.fmt.target_chars or 0)
+    hard = int(d.fmt.max_chars or 0)
+    if d.fmt.register == "plain" or d.fmt.tone == "plain":
+        lines = [_style.restyle(x, register="plain") for x in lines]
+    elif d.fmt.tone in ("friendly", "friendly_professional"):
+        lines = [_style.restyle(x, tone=d.fmt.tone) for x in lines]
+    if target or hard:
+        head_n = 3 if kind == "email" else 2
+        head_lines, rest = lines[:head_n], lines[head_n:]
+        weights = [1.6] + [1.0] * (len(rest) - 1) if rest else [1.0] * len(rest)
+        room = max(60, (target or hard) - sum(_style.count_chars(x) for x in head_lines))
+        kept, _fix = _style.fit_length(rest, target=min(target, room) or room,
+                                       hard_max=room, weights=weights)
+        lines = head_lines + (kept or rest[:2])
+        if hard:
+            while _style.count_chars("\n".join(lines)) > hard and len(lines) > head_n + 1:
+                lines.pop()
+    text = "\n".join(x for x in lines if x.strip())
+    return {"text": text, "confidence": 0.88, "genre": f"document:{purpose}",
+            "notes": [f"文書: {purpose} / {kind}",
+                      "具体（日付・金額・名前）は材料に無いので【 】の空欄で残しました"],
+            "meta": {"artifact": kind, "purpose": purpose, "audience": audience or None}}
+
+
+def _do_write(d: Directive, *, history=None, kb=None, web=None, lm=None, core=None,
+              turn: int = 0) -> dict:
+    raw = str(d.raw or "")
+    if _FICTION_WORD.search(raw) and not _DOC_ARTIFACT.search(raw):
+        from ..writer import write as _write
+
+        seed = len(str(history or "")) % 997
+        body, genre, meta = _write(raw, seed=seed)
+        return {"text": body, "confidence": 0.88, "genre": genre, "meta": meta}
+    if _DOC_ARTIFACT.search(raw) or not _FICTION_WORD.search(raw):
+        # 「メールを作って」「記事を書いて」は *業務の文書*（物語生成器には渡さない）
+        got = _compose_document(d)
+        if got.get("text"):
+            return got
     from ..writer import write as _write
 
     seed = len(str(history or "")) % 997
-    body, genre, meta = _write(d.raw, seed=seed)
+    body, genre, meta = _write(raw, seed=seed)
     return {"text": body, "confidence": 0.88, "genre": genre, "meta": meta}
 
 
@@ -243,7 +562,8 @@ def execute(d: Directive, *, kb=None, web=None, history=None, lm=None, core=None
     if task == "extract":
         return _do_extract(d)
     if task == "summarize":
-        return _do_summarize(d, room_bonus=room_bonus)
+        return _do_summarize(d, room_bonus=room_bonus, kb=kb, web=web, history=history,
+                             lm=lm, core=core, turn=turn)
     if task == "code":
         return _do_code(d)
     if task == "answer":
@@ -253,7 +573,7 @@ def execute(d: Directive, *, kb=None, web=None, history=None, lm=None, core=None
     if task == "list":
         return _do_list(d, kb=kb, web=web, history=history)
     if task == "write":
-        return _do_write(d, history=history)
+        return _do_write(d, history=history, kb=kb, web=web, lm=lm, core=core, turn=turn)
     return {"text": "", "confidence": 0.0, "notes": [f"未知のタスク: {task}"]}
 
 
@@ -268,10 +588,18 @@ def check_text(text: str) -> tuple[bool, str]:
     try:
         from ..composer import validate
 
+        first = True
         for line in [x for x in body.split("\n") if x.strip()]:
             s = line.strip()
             if s.startswith(("・", "-", "*", "出典", "[", "|")) or re.match(r"^\d+[.)、]", s):
                 s = re.sub(r"^(?:[・\-*]|\d+[.)、])\s*", "", s)
+            # 文書の見出し行（`件名: …` / `取引先 ご担当者様` / タイトル 1 行）は *文* ではない
+            if re.match(r"^(?:件名|タイトル|宛名|宛先|日付|署名|記|以上)\s*[:：]", s) \
+                    or re.search(r"(?:様|殿|各位)\s*$", s) \
+                    or (first and len(s) <= 30 and not re.search(r"[。！？!?]$", s)):
+                first = False
+                continue
+            first = False
             for piece in [p for p in re.split(r"(?<=[。！？!?])", s) if p.strip()][:4]:
                 ok, why = validate(piece.strip(), max_len=240)
                 if not ok:
@@ -389,12 +717,16 @@ def verify(d: Directive, text: str, got: dict) -> list[dict]:
                         if re.match(r"^\s*(?:[・\-*•●○]|\d+[.)、．])\s*", x)]
         add("bullet_count", len(bullet_lines) == d.fmt.bullets,
             f"{len(bullet_lines)} 行（指定 {d.fmt.bullets}）")
-        for line in bullet_lines:
-            core_text = re.sub(r"^\s*(?:[・\-*•●○]|\d+[.)、．])\s*", "", line).strip().rstrip("。")
-            if core_text and not is_predicate_end(core_text):
-                add("bullet_is_sentence", False, f"述語がありません: {core_text[:18]}…")
-                break
+        if d.task in ("summarize", "answer", "write"):
+            for line in bullet_lines:
+                core_text = re.sub(r"^\s*(?:[・\-*•●○]|\d+[.)、．])\s*", "", line).strip().rstrip("。")
+                if core_text and not is_predicate_end(core_text):
+                    add("bullet_is_sentence", False, f"述語がありません: {core_text[:18]}…")
+                    break
+            else:
+                add("bullet_is_sentence", True)
         else:
+            # 列挙は *材料の行そのもの* を並べる仕事なので、述語の形を求めない
             add("bullet_is_sentence", True)
 
     for r in list(getattr(d, "rules", None) or []):
@@ -410,6 +742,17 @@ def verify(d: Directive, text: str, got: dict) -> list[dict]:
     if d.fmt.lines:
         n_lines = len([x for x in body.split("\n") if x.strip()])
         add("line_count", n_lines == d.fmt.lines, f"{n_lines} 行（指定 {d.fmt.lines}）")
+
+    if d.fmt.sentences and not d.fmt.bullets:
+        n_sent = len(split_sentences(body))
+        add("sentence_count", n_sent == d.fmt.sentences, f"{n_sent} 文（指定 {d.fmt.sentences}）")
+
+    if d.fmt.language and d.task in ("answer", "summarize", "write", "list"):
+        if re.search(r"英語|english", d.fmt.language, re.IGNORECASE):
+            add("output_language", _is_english(body), "英語で書く指定なのに日本語が残っています")
+        elif re.search(r"日本語|japanese", d.fmt.language, re.IGNORECASE):
+            add("output_language", bool(re.search(r"[ぁ-んァ-ヶー一-龯]", body)),
+                "日本語で書く指定なのに日本語がありません")
 
     if d.fmt.no_explanation or d.fmt.only_output:
         outside = re.sub(r"```.*?```", "", body, flags=re.DOTALL).strip()
@@ -445,15 +788,22 @@ def verify(d: Directive, text: str, got: dict) -> list[dict]:
         if name:
             add("function_name", name in body, f"関数名 {name} がありません")
 
-    if d.task == "summarize":
+    if d.task == "summarize" and str(d.payload or "").strip():
         cov = float(got.get("coverage") or 0.0)
         add("coverage", cov >= 0.6, f"材料の語のカバー率 {cov:.2f}")
 
     # 出力が *データ*（JSON・変換結果・コード・箇条書き）のときは文章の検査をかけない。
     # 「HELLO SNIPHER」は述語を持たないのが正解です。
     if d.task in ("answer", "summarize", "write") and not (d.fmt.kind or d.fmt.bullets):
-        ok_fmt, why_fmt = check_text(body)
-        add("well_formed", ok_fmt, why_fmt)
+        if _is_english(body):
+            # 英語の出力に日本語の validate を当てると誤判定するので、形だけ見る
+            sents = [x for x in split_sentences(body) if x.strip()]
+            add("well_formed", bool(sents) and all(
+                re.search(r"[.!?]$", x.strip()) for x in sents) and
+                all(len(x) <= 400 for x in sents), "英語の文の形が壊れています")
+        else:
+            ok_fmt, why_fmt = check_text(body)
+            add("well_formed", ok_fmt, why_fmt)
     else:
         add("shape_ok", bool(body.strip()) and "\x00" not in body, "出力の形が壊れています")
     return checks
@@ -466,6 +816,19 @@ def _all_ok(checks: list[dict]) -> bool:
 # --------------------------------------------------------------------------- #
 # 入口
 # --------------------------------------------------------------------------- #
+def _exec_check(d: Directive, ctx: dict, *, room_bonus: int = 0):
+    """実行 → 規則を当てる → 検証。組み直しでも同じ手順を通す（規則を落とさない）。"""
+    got = execute(d, room_bonus=room_bonus, **ctx)
+    body = str(got.get("text") or "").strip()
+    if body:
+        body, rule_notes = apply_rules(d, body)
+        if rule_notes:
+            got["notes"] = list(got.get("notes") or []) + rule_notes
+            got["text"] = body
+    checks = verify(d, body, got) if body else [{"name": "non_empty", "ok": False, "why": "空"}]
+    return got, body, checks
+
+
 def run(text: str, *, kb=None, web=None, history=None, lm=None, core=None, turn: int = 0,
         min_score: float = 0.55) -> Result | None:
     """1 通を受けて、指示なら実行し、検証を通してから返す。指示でなければ None。"""
@@ -474,20 +837,11 @@ def run(text: str, *, kb=None, web=None, history=None, lm=None, core=None, turn:
         return None
     ctx = {"kb": _default_kb(kb), "web": web, "history": history, "lm": lm, "core": core,
            "turn": turn}
-    got = execute(d, **ctx)
-    body = str(got.get("text") or "").strip()
-    if body:
-        body, rule_notes = apply_rules(d, body)
-        if rule_notes:
-            got["notes"] = list(got.get("notes") or []) + rule_notes
-            got["text"] = body
-    checks = verify(d, body, got) if body else [{"name": "non_empty", "ok": False, "why": "空"}]
+    got, body, checks = _exec_check(d, ctx)
     attempts = 1
     if not _all_ok(checks) and d.task == "summarize":
         # 箇条書きの本数・長さが指定と違う → 予算を緩めて組み直す
-        got = execute(d, room_bonus=48, **ctx)
-        body = str(got.get("text") or "").strip()
-        checks = verify(d, body, got)
+        got, body, checks = _exec_check(d, ctx, room_bonus=48)
         attempts = 2
     if not _all_ok(checks) and d.task == "answer":
         # 文字数・語尾が指定と違う → 節を足して組み直す（材料は増やさない＝ねつ造しない）
@@ -495,9 +849,7 @@ def run(text: str, *, kb=None, web=None, history=None, lm=None, core=None, turn:
         if target and count_chars(body) < target * 0.62:
             d.fmt.target_chars = target
             d.fmt.max_chars = max(d.fmt.max_chars, int(target * 1.35) + 40)
-            got = execute(d, **ctx)
-            body = str(got.get("text") or "").strip()
-            checks = verify(d, body, got)
+            got, body, checks = _exec_check(d, ctx)
             attempts = 2
     if not body:
         return None
@@ -517,14 +869,8 @@ def run(text: str, *, kb=None, web=None, history=None, lm=None, core=None, turn:
 def run_directive(d: Directive, *, kb=None, web=None, history=None, lm=None, core=None,
                   turn: int = 0) -> Result:
     """`Directive` を直接実行する（core / api からの入口）。"""
-    got = execute(d, kb=_default_kb(kb), web=web, history=history, lm=lm, core=core, turn=turn)
-    body = str(got.get("text") or "").strip()
-    if body:
-        body, rule_notes = apply_rules(d, body)
-        if rule_notes:
-            got["notes"] = list(got.get("notes") or []) + rule_notes
-            got["text"] = body
-    checks = verify(d, body, got)
+    got, body, checks = _exec_check(d, {"kb": _default_kb(kb), "web": web, "history": history,
+                                        "lm": lm, "core": core, "turn": turn})
     ok = _all_ok(checks)
     conf = float(got.get("confidence") or 0.7)
     if not ok:

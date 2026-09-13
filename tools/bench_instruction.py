@@ -127,6 +127,62 @@ name,age,city"""},
      "expect": {"checks": True, "contains": ["天気", "公園", "散歩"]},
      "prompt": 'Translate the following sentence into Japanese.\n\n'
                'Text: "The weather is good today, so I went to the park for a walk."'},
+    {"task": "extract", "name": "入れ子 JSON（テンプレートの形を保つ）",
+     "expect": {"checks": True,
+                "contains": ["order_id", "\"customer\"", "\"items\"", "A-102", "佐藤花子",
+                             "ノートPC", "2台", "240,000円", "3月5日"]},
+     "prompt": """次のテキストから情報を抽出し、JSONのみで出力してください。
+
+テキスト: 「注文番号 A-102、顧客は佐藤花子、商品はノートPC 2台、合計 240,000円、配送は3月5日。」
+
+JSONフォーマット:
+{
+  "order_id": "注文番号",
+  "customer": {"name": "顧客名"},
+  "items": [{"product": "商品名", "qty": "数量"}],
+  "total": "合計金額",
+  "ship_date": "配送日"
+}"""},
+    {"task": "extract", "name": "人物 JSON（名前・年齢・職業・都市）",
+     "expect": {"checks": True,
+                "contains": ["田中一郎", "42歳", "エンジニア", "横浜市"]},
+     "prompt": '次の文章から人物情報を抽出してJSONのみで出力してください。解説は不要です。\n\n'
+               '文章: 「田中一郎は42歳のエンジニアで、横浜市に住んでいます。」\n\n'
+               'JSONフォーマット:\n{"name": "名前", "age": "年齢", "job": "職業", "city": "都市"}'},
+    {"task": "summarize", "name": "材料なしの要約（役割+口調+本数+必須語）",
+     "expect": {"checks": True, "contains": ["生成AI", "・"]},
+     "prompt": "あなたは経験豊富な編集者です。親しみやすい口調（〜だよ）で、AIニュースを120文字程度で、"
+               "3つの箇条書きにまとめてください。必ず「生成AI」という語を含めてください。"},
+    {"task": "write", "name": "業務メール（お詫び・ですます・200字）",
+     "expect": {"checks": True, "contains": ["件名", "納期延期", "申し訳ございません"],
+                "absent": ["千尋", "物語"]},
+     "prompt": "取引先に納期延期を詫びるメールを、です・ます調で200文字程度で作成してください。"},
+    {"task": "list", "name": "列挙（本数の指定 4 つ）",
+     "expect": {"checks": True, "contains": ["東京タワー", "スカイツリー"]},
+     "prompt": """以下の項目から4つを箇条書きで列挙してください。
+
+項目：
+東京タワーは1958年完成。スカイツリーは2012年開業。レインボーブリッジは1993年開通。東京駅は1914年開業。渋谷スクランブル交差点は世界的に有名。"""},
+    {"task": "list", "name": "2 段の指示（抽出して列挙）",
+     "expect": {"checks": True, "contains": ["東京", "大阪", "名古屋"],
+                "absent": ["佐藤は"]},
+     "prompt": """次のテキストから都市名を抽出し、それを箇条書きで列挙してください。
+
+テキスト: 「佐藤は東京に住んでいる。鈴木は大阪に転勤した。高橋は名古屋出身だ。」"""},
+    {"task": "code", "name": "Go 関数（宣言された引数と返り値の型）",
+     "expect": {"checks": True, "contains": ["func countItems(items []string) int", "len(items)"]},
+     "prompt": "Goで、文字列のスライスを受け取り長さを返す関数 countItems(items []string) を書いてください。"},
+    {"task": "answer", "name": "英語で答える（文数の指定 2）",
+     "expect": {"checks": True, "contains": ["knowledge base"], "absent": ["です", "ます"]},
+     "prompt": "What is photosynthesis? Answer in English in 2 sentences."},
+    {"task": "answer", "name": "禁止する語が 2 つ（引用符の並び）",
+     "expect": {"checks": True, "absent": ["すごい", "素晴らしい"]},
+     "prompt": "Snipherについて説明してください。「すごい」「素晴らしい」という言葉は使わないでください。100文字以内で。"},
+    {"task": "transform", "name": "翻訳（長い文・て形）",
+     "expect": {"checks": True, "contains": ["Kyoto", "hours"], "absent": ["まし た"]},
+     "prompt": """次の文章を英語に翻訳してください。
+
+文章: 「私は先週、家族と京都へ旅行に行きました。新幹線で約2時間かかりました。」"""},
     {"task": "code", "name": "コードのみ（解説を付けない）",
      "expect": {"checks": True, "contains": ["```javascript", "function"],
                 "absent": ["まとめました", "構文検査まで"]},

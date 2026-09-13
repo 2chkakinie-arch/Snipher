@@ -232,24 +232,29 @@ SNIPHER_EDGE_SEARCH_URL=...  # エンドポイント差し替え
 .venv/bin/python tools/bench_instruction.py # 指示追従率・誤検出・逃げ（合格線で exit code）
 ```
 
-`tools/bench_instruction.py --runs 2` の実測（20 種の指示 × 2 回、`SNIPHER_WEB=off`）:
+`tools/bench_instruction.py --runs 2` の実測（30 種の指示 × 2 回、`SNIPHER_WEB=off`）:
 
 | 指標 | 値 |
 |---|---|
-| 指示追従率 | **100%**（extract / summarize / code / answer / list / transform すべて 1.0） |
-| 1 指示 | 中央値 5.05 ms / p95 35.1 ms / 最大 547 ms（40.2 指示/秒） |
-| タスク別中央値 | extract 0.95 ms・list 1.37 ms・transform 2.04 ms・answer 10.23 ms・summarize 16.8 ms・code 26.68 ms（実行込み） |
-| 誤検出 | **0 / 20**（会話を指示と読まない。読み取り中央値 0.071 ms） |
+| 指示追従率 | **100%**（extract / summarize / code / answer / list / transform / write すべて 1.0） |
+| 1 指示 | 中央値 3.5 ms / p95 33.3 ms / 最大 550 ms（55.9 指示/秒） |
+| タスク別中央値 | list 1.0 ms・write 1.2 ms・transform 1.1 ms・extract 1.6 ms・answer 5.7 ms・summarize 16.8 ms・code 26.6 ms（実行込み） |
+| 誤検出 | **0 / 20**（会話を指示と読まない。読み取り中央値 0.088 ms） |
 | 禁止表現（「できません」系） | **0** |
 
 中身の期待も機械判定します（`expect.contains` / `expect.absent`）: CSV のヘッダ行、
 表の 2 行、`必ず「α-β枝刈り」` の語、`「です・ます」は使わない` の不在、英訳の
 `weather/park/walk`、`コードのみ` のときにコードブロックの外に文字が無いこと。
+さらに **むずかしい形** も: 入れ子 JSON の雛形（`customer.name` / `items[].product`）、
+コロン無しの文からの人物欄（名前・年齢・職業・都市）、材料の無い要約（依頼文を読み上げない）、
+お詫びメール（`write`：件名・ですます・200字・空欄は `【…】`）、`4つ列挙` の本数、
+宣言つきの Go 関数（`func countItems(items []string) int`）、`Answer in English in 2 sentences.`、
+`「すごい」「素晴らしい」は使わない`（2 条の禁止）。
 
 新規に足したテスト（v3 の契約）: `tests/test_lang.py`（辞書・音・活用）、
 `tests/test_mind.py`（frame/state/rules/play）、`tests/test_solve.py`（計算・コード・文字）、
 `tests/test_web_grounding.py`（検索と fetch）、`tests/test_v3_contract.py`（上の受け入れ条件）、
-`tests/test_instruction.py`（指示の読み取り・実行・検証・経路、43 本）。
+`tests/test_instruction.py`（指示の読み取り・実行・検証・経路、56 本）。
 
 ## 10. 同梱データのライセンス
 

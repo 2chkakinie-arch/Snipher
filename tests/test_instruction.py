@@ -565,3 +565,144 @@ def test_code_only_output_has_no_prose() -> None:
     outside = re.sub(r"```.*?```", "", res.text, flags=re.DOTALL).strip()
     assert not outside, f"コードの外に文字がある: {outside[:60]}"
     assert "function" in res.text and "reduce" in res.text
+
+
+# --------------------------------------------------------------------------- #
+# さらに難しい指示の形（入れ子 JSON・業務文書・英語・複数の禁止語）
+# --------------------------------------------------------------------------- #
+NESTED_JSON_PROMPT = """次のテキストから情報を抽出し、JSONのみで出力してください。
+
+テキスト: 「注文番号 A-102、顧客は佐藤花子、商品はノートPC 2台、合計 240,000円、配送は3月5日。」
+
+JSONフォーマット:
+{
+  "order_id": "注文番号",
+  "customer": {"name": "顧客名"},
+  "items": [{"product": "商品名", "qty": "数量"}],
+  "total": "合計金額",
+  "ship_date": "配送日"
+}"""
+
+PERSON_JSON_PROMPT = ('次の文章から人物情報を抽出してJSONのみで出力してください。解説は不要です。\n\n'
+                      '文章: 「田中一郎は42歳のエンジニアで、横浜市に住んでいます。」\n\n'
+                      'JSONフォーマット:\n'
+                      '{"name": "名前", "age": "年齢", "job": "職業", "city": "都市"}')
+
+EMAIL_PROMPT = "取引先に納期延期を詫びるメールを、です・ます調で200文字程度で作成してください。"
+LIST_CITIES_PROMPT = """次のテキストから都市名を抽出し、それを箇条書きで列挙してください。
+
+テキスト: 「佐藤は東京に住んでいる。鈴木は大阪に転勤した。高橋は名古屋出身だ。」"""
+LIST_COUNT_PROMPT = """以下の項目から4つを箇条書きで列挙してください。
+
+項目：
+東京タワーは1958年完成。スカイツリーは2012年開業。レインボーブリッジは1993年開通。東京駅は1914年開業。渋谷スクランブル交差点は世界的に有名。"""
+GO_PROMPT = "Goで、文字列のスライスを受け取り長さを返す関数 countItems(items []string) を書いてください。"
+ENGLISH_PROMPT = "What is photosynthesis? Answer in English in 2 sentences."
+FORBID_TWO_PROMPT = ("Snipherについて説明してください。「すごい」「素晴らしい」という言葉は"
+                     "使わないでください。100文字以内で。")
+NO_MATERIAL_SUMMARY_PROMPT = ("あなたは経験豊富な編集者です。親しみやすい口調（〜だよ）で、"
+                              "AIニュースを120文字程度で、3つの箇条書きにまとめてください。"
+                              "必ず「生成AI」という語を含めてください。")
+
+
+def test_parser_does_not_read_material_lines_as_a_field_list() -> None:
+    d = parse(LIST_COUNT_PROMPT)
+    assert d is not None and d.task == "list"
+    assert d.fmt.schema_fields == [], "材料の文を欄名に読み替えてはいけない"
+    assert d.fmt.bullets == 4
+
+
+def test_parser_reads_two_forbidden_words_from_a_quote_run() -> None:
+    d = parse(FORBID_TWO_PROMPT)
+    assert d is not None
+    kinds = [(r.kind, r.value) for r in d.rules]
+    assert ("forbid", "すごい") in kinds and ("forbid", "素晴らしい") in kinds
+
+
+def test_parser_reads_an_english_instruction() -> None:
+    d = parse(ENGLISH_PROMPT)
+    assert d is not None and d.task == "answer"
+    assert d.fmt.language == "英語"
+    assert d.fmt.sentences == 2
+    assert d.question.startswith("What is photosynthesis")
+
+
+def test_parser_reads_a_business_email_as_a_write_task() -> None:
+    d = parse(EMAIL_PROMPT)
+    assert d is not None and d.task == "write"
+    assert d.fmt.target_chars == 200
+
+
+def test_nested_json_template_keeps_its_shape() -> None:
+    res = run_instruction(NESTED_JSON_PROMPT)
+    assert res is not None and res.ok, [(c["name"], c["why"]) for c in (res.checks if res else []) if not c["ok"]]
+    got = json.loads(res.text)
+    assert got["order_id"] == "A-102"
+    assert got["customer"]["name"] == "佐藤花子"
+    assert got["items"][0]["product"] == "ノートPC"
+    assert got["items"][0]["qty"] == "2台"
+    assert got["total"] == "240,000円"
+    assert got["ship_date"] == "3月5日"
+
+
+def test_person_fields_are_read_from_a_plain_sentence() -> None:
+    res = run_instruction(PERSON_JSON_PROMPT)
+    assert res is not None and res.ok
+    got = json.loads(res.text)
+    assert got == {"name": "田中一郎", "age": "42歳", "job": "エンジニア", "city": "横浜市"}
+
+
+def test_business_email_is_a_document_not_a_story() -> None:
+    res = run_instruction(EMAIL_PROMPT)
+    assert res is not None and res.ok, [(c["name"], c["why"]) for c in (res.checks if res else []) if not c["ok"]]
+    body = res.text
+    assert body.startswith("件名:"), "メールは件名から"
+    assert "納期延期" in body and "申し訳ございません" in body
+    assert re.search(r"(?:です|ます)。", body), "です・ます調の指定"
+    assert "【" in body, "材料に無い具体は空欄の印で残す（ねつ造しない）"
+    assert count_chars(body) <= 300
+
+
+def test_list_returns_the_requested_kind_of_item() -> None:
+    res = run_instruction(LIST_CITIES_PROMPT)
+    assert res is not None and res.ok
+    items = [x.strip("・ ") for x in res.text.split("\n") if x.strip()]
+    assert items == ["東京", "大阪", "名古屋"], f"都市名を並べる（文ではなく）: {items}"
+
+
+def test_list_honours_the_requested_count() -> None:
+    res = run_instruction(LIST_COUNT_PROMPT)
+    assert res is not None and res.ok
+    assert len([x for x in res.text.split("\n") if x.strip().startswith("・")]) == 4
+
+
+def test_go_function_keeps_the_declared_signature() -> None:
+    res = run_instruction(GO_PROMPT)
+    assert res is not None and res.ok
+    assert "func countItems(items []string) int" in res.text
+    assert "len(items)" in res.text
+    assert res.meta.get("function") == "countItems"
+
+
+def test_answer_in_english_within_the_sentence_budget() -> None:
+    res = run_instruction(ENGLISH_PROMPT)
+    assert res is not None and res.ok, [(c["name"], c["why"]) for c in (res.checks if res else []) if not c["ok"]]
+    assert not re.search(r"[ぁ-んァ-ヶー一-龯]", res.text), "英語で答える指定"
+    sentences = [x for x in re.split(r"(?<=[.!?])\s+", res.text.strip()) if x.strip()]
+    assert len(sentences) == 2
+
+
+def test_forbidden_words_do_not_appear() -> None:
+    res = run_instruction(FORBID_TWO_PROMPT)
+    assert res is not None and res.ok
+    assert "すごい" not in res.text and "素晴らしい" not in res.text
+    assert count_chars(res.text) <= 100
+
+
+def test_summary_without_material_does_not_echo_the_request() -> None:
+    res = run_instruction(NO_MATERIAL_SUMMARY_PROMPT)
+    assert res is not None and res.ok, [(c["name"], c["why"]) for c in (res.checks if res else []) if not c["ok"]]
+    assert "生成AI" in res.text, "必ず含める指定の語"
+    assert "あなたは" not in res.text and "編集者です" not in res.text, "依頼文を読み上げない"
+    assert len([x for x in res.text.split("\n") if x.strip().startswith("・")]) == 3
+    assert re.search(r"(?:だよ|だね|んだよ|よね|ね|よ)[。！？!?]", res.text), "親しみやすい口調"

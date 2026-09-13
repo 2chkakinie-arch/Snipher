@@ -79,11 +79,27 @@ def operations(text: str) -> list[str]:
 
 
 def _arg_name(args: list[str]) -> str:
+    """引数名を読む（`items []string` → `items`、`nums: number[]` → `nums`）。"""
     for a in args:
-        base = re.sub(r"[:=].*$", "", a).strip()
-        if base.lower() in _LIST_ARG or base.isidentifier():
+        base = re.split(r"\s+|[:=]", str(a or "").strip(), 1)[0].strip("[]*() ")
+        if base and (base.lower() in _LIST_ARG or base.isidentifier()):
             return base
     return "arr"
+
+
+_GO_ELEM = re.compile(r"\[\]\s*([A-Za-z_][A-Za-z0-9_]*)")
+_TS_ELEM = re.compile(r":\s*(?:Array<\s*([A-Za-z_][A-Za-z0-9_]*)\s*>|"
+                      r"([A-Za-z_][A-Za-z0-9_]*)\s*\[\])")
+
+
+def _declared_elem(args: list[str]) -> str:
+    """宣言に書かれた要素の型を読む（`[]string` / `string[]` → `string`）。無ければ ""。"""
+    for a in args:
+        src = str(a or "")
+        m = _GO_ELEM.search(src) or _TS_ELEM.search(src)
+        if m:
+            return next((g for g in m.groups() if g), "")
+    return ""
 
 
 def _js_value(ops: list[str]) -> str:
@@ -170,31 +186,44 @@ def compose_python(name: str, arg: str, ops: list[str]) -> str:
     return "\n".join(lines)
 
 
-def compose_go(name: str, arg: str, ops: list[str]) -> str:
-    export = name[:1].upper() + name[1:]
-    lines = [f"func {export}({arg} []int) []int {{",
-             f"\tout := make([]int, len({arg}))",
-             f"\tcopy(out, {arg})"]
-    if "dedupe" in ops:
-        lines += ["\tseen := map[int]bool{}", "\tdeduped := out[:0]",
+def compose_go(name: str, arg: str, ops: list[str], *, elem: str = "") -> str:
+    """Go の関数を組み立てる。宣言された型（`[]string`）と返す型（件数は int）を守る。"""
+    el = elem or ("string" if elem == "string" else ("int" if any(
+        o in ops for o in ("sum", "max", "min", "filter_even", "filter_odd")) else "any"))
+    el = el or "int"
+    scalar = "int" if any(o in ops for o in ("count", "unique_count", "sum")) else ""
+    ret = scalar or f"[]{el}"
+    lines: list[str] = []
+    if scalar == "int" and "count" in ops and "dedupe" not in ops and "unique_count" not in ops:
+        # 「長さを返す」→ 中身を複製せず len を返す
+        return "\n".join([f"func {name}({arg} []{el}) {ret} {{", f"\treturn len({arg})", "}"])
+    lines += [f"func {name}({arg} []{el}) {ret} {{",
+              f"\tout := make([]{el}, len({arg}))",
+              f"\tcopy(out, {arg})"]
+    if "dedupe" in ops or "unique_count" in ops:
+        lines += [f"\tseen := map[{el}]bool{{}}", "\tdeduped := out[:0]",
                   "\tfor _, v := range out {", "\t\tif !seen[v] {",
                   "\t\t\tseen[v] = true", "\t\t\tdeduped = append(deduped, v)",
                   "\t\t}", "\t}", "\tout = deduped"]
     if "sort_asc" in ops:
-        lines.append("\tsort.Ints(out)")
+        lines.append("\tsort.Strings(out)" if el == "string" else "\tsort.Ints(out)")
     if "sort_desc" in ops:
-        lines.append("\tsort.Slice(out, func(i, j int) bool { return out[i] > out[j] })")
+        lines.append(f"\tsort.Slice(out, func(i, j int) bool {{ return out[i] > out[j] }})")
     if "reverse" in ops:
         lines += ["\tfor i, j := 0, len(out)-1; i < j; i, j = i+1, j-1 {",
                   "\t\tout[i], out[j] = out[j], out[i]", "\t}"]
-    lines += ["\treturn out", "}"]
+    if scalar == "int":
+        lines.append("\treturn len(out)")
+    else:
+        lines.append("\treturn out")
+    lines.append("}")
     return "\n".join(lines)
 
 
 # --------------------------------------------------------------------------- #
 # 実行して確かめる
 # --------------------------------------------------------------------------- #
-def _cases(ops: list[str], lang: str) -> list[tuple[str, str]]:
+def _cases(ops: list[str], lang: str, *, elem: str = "") -> list[tuple[str, str]]:
     """決定的に期待値が出せるテストケース（式の文字列, 期待値の文字列）。"""
     if any(o in ops for o in ("sum", "max", "min", "filter_even", "filter_odd")):
         table = [("sum", "[3, 1, 2]", "6"), ("max", "[3, 1, 2]", "3"),
@@ -209,6 +238,8 @@ def _cases(ops: list[str], lang: str) -> list[tuple[str, str]]:
         pick = [("sort_desc", "[3, 1, 2]", "[3, 2, 1]")]
     else:
         pick = [("sort_asc", "[3, 1, 2]", "[1, 2, 3]")]
+    if elem == "string" and lang == "go":
+        return [("[\"a\", \"b\", \"b\", \"c\"]", "3")]
     out: list[tuple[str, str]] = []
     for _tag, arg, want in pick[:1]:
         if lang in ("javascript", "typescript", "python"):
@@ -292,15 +323,20 @@ def _run_python(code: str, name: str, cases: list[tuple[str, str]]) -> dict:
             "passed": passed, "cases": len(cases)}
 
 
-def _run_go(code: str, name: str, cases: list[tuple[str, str]]) -> dict:
+def _run_go(code: str, name: str, cases: list[tuple[str, str]], *, elem: str = "int") -> dict:
     go = shutil.which("go")
     if not go:
         return {"ran": False, "ok": True, "note": "go が無いので構文の自己点検まで"}
-    export = name[:1].upper() + name[1:]
-    main = ["package main", "", "import (", "\t\"fmt\"", "\t\"sort\"", ")", "",
+    imports = ["\t\"fmt\""]
+    if "sort." in code:
+        imports.append("\t\"sort\"")
+    main = ["package main", "", "import (", *imports, ")", "",
             code.replace("package main\n\n", ""), "", "func main() {"]
     for arg, _want in cases:
-        main.append(f"\tfmt.Println({export}([]int{{{arg.strip('[]')}}}))")
+        items = [x.strip() for x in arg.strip("[] ").split(",") if x.strip()]
+        lit = ", ".join(f'"{x.strip(chr(34))}"' for x in items) if elem == "string" \
+            else ", ".join(items)
+        main.append(f"\tfmt.Println({name}([]{elem}{{{lit}}}))")
     main.append("}")
     with tempfile.TemporaryDirectory(prefix="snipher-go-") as td:
         path = os.path.join(td, "main.go")
@@ -322,8 +358,8 @@ def _run_go(code: str, name: str, cases: list[tuple[str, str]]) -> dict:
 # --------------------------------------------------------------------------- #
 _OP_NOTES = {
     "dedupe": "重複は {dedupe_how} で 1 度だけ残し、もとの順序を保ちます",
-    "sort_asc": "昇順は比較関数を渡してソートするので、文字列化された「10 < 9」も起きません",
-    "sort_desc": "降順は比較関数の向きを逆にしています",
+    "sort_asc": "昇順は {sort_how} で並べるので、文字列化された「10 < 9」も起きません",
+    "sort_desc": "降順は {sort_how} の向きを逆にしています",
     "reverse": "反転は copy に対して行うので、渡された配列は書き換えません",
     "count": "件数は長さで返します",
     "unique_count": "種類数は重複を落としたあとの長さで返します",
@@ -339,15 +375,31 @@ _DEDUPE_HOW = {"javascript": "Set", "typescript": "Set", "python": "dict.fromkey
                "go": "map[int]bool", "rust": "HashSet", "ruby": "uniq"}
 
 
-def explain_ops(ops: list[str], *, lang: str) -> list[str]:
+def explain_ops(ops: list[str], *, lang: str, code: str = "") -> list[str]:
+    """やったことを *実際のコードに合わせて* 書く（やっていないことを書かない）。"""
     out: list[str] = []
+    dedupe_how = _DEDUPE_HOW.get(lang, "Set")
+    if lang == "go" and code and "map[string]bool" in code:
+        dedupe_how = "map[string]bool"
+    sort_how = {"javascript": "比較関数を渡した sort", "typescript": "比較関数を渡した sort",
+                "python": "sort（reverse=True）", "go": "sort.Ints / sort.Strings"}.get(
+                    lang, "比較関数を渡した sort")
+    if lang == "go" and code and "sort.Strings" in code:
+        sort_how = "sort.Strings"
+    if lang == "go" and code and "sort.Slice" in code:
+        sort_how = "sort.Slice"
     for o in ops:
         note = _OP_NOTES.get(o)
         if note:
-            out.append(note.format(dedupe_how=_DEDUPE_HOW.get(lang, "Set")))
+            out.append(note.format(dedupe_how=dedupe_how, sort_how=sort_how))
     if not out:
         out.append("指示の操作をそのまま 1 関数にまとめました")
-    out.append("入力は複製してから触るので、渡された配列そのものは変わりません")
+    copies = ("copy(", ".slice()", "list(", "Array.from(", "new Set(", "dict.fromkeys",
+              "make([]", "[...")
+    if not code or any(c in code for c in copies):
+        out.append("入力は複製してから触るので、渡された配列そのものは変わりません")
+    else:
+        out.append("入力は複製せず、そのまま読んで返します（副作用がありません）")
     return out[:3]
 
 
@@ -364,6 +416,9 @@ def run(d: Directive, *, explain: bool = True) -> dict:
     ops = operations(text)
     notes: list[str] = []
     arg = _arg_name(args)
+    elem = _declared_elem(args)
+    if elem:
+        notes.append(f"引数の型: 宣言どおり []{elem} を使いました")
     if not name and ops:
         # 名前を書かない指示（「配列の合計を返す関数を書いて」）でも、操作から名前を付ける
         name = _name_from_ops(ops, lang)
@@ -379,7 +434,7 @@ def run(d: Directive, *, explain: bool = True) -> dict:
         elif lang == "python":
             built = compose_python(name, arg, ops)
         elif lang == "go":
-            built = compose_go(name, arg, ops)
+            built = compose_go(name, arg, ops, elem=elem)
     if built is None:
         # 名前や操作が読めない依頼は、既存のコード生成器（課題テンプレ＋検証）に渡す。
         # 言語は *指示から読めたもの* を必ず引き継ぐ（codegen 側の判定が外れても
@@ -399,7 +454,7 @@ def run(d: Directive, *, explain: bool = True) -> dict:
 
     from ..solve.code import balanced, syntax_check_python, verify
 
-    cases = _cases(ops, lang)
+    cases = _cases(ops, lang, elem=elem)
     result: dict = {"ran": False, "ok": True, "note": ""}
     if lang == "python":
         ok, why = syntax_check_python(built)
@@ -413,7 +468,7 @@ def run(d: Directive, *, explain: bool = True) -> dict:
             notes.append(f"自己点検: {why}")
         result = _run_node(body, name, cases) if ok else result
     elif lang == "go":
-        result = _run_go(built, name, cases)
+        result = _run_go(built, name, cases, elem=(elem or "int"))
     else:
         res = verify(built, lang)
         result = {"ran": False, "ok": res.ok, "note": " / ".join(res.notes) or "構文の自己点検まで"}
@@ -426,7 +481,7 @@ def run(d: Directive, *, explain: bool = True) -> dict:
                                                             ("javascript", "node") else lang)
     parts = [f"```{fence_lang}\n{built}\n```"]
     if explain:
-        for line in explain_ops(ops, lang=lang):
+        for line in explain_ops(ops, lang=lang, code=built):
             parts.append(line + "。")
         sig = f"{name}({arg})"
         parts.insert(1, f"{label} の {sig} として、指示の操作（"
