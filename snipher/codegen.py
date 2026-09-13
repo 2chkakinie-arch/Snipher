@@ -44,7 +44,7 @@ _GAME_WORDS = ("オセロ", "リバーシ", "othello", "reversi")
 def detect_language(text: str) -> str:
     t = str(text or "").lower()
     # 明示指定が最優先
-    if "index.html" in t or ".html" in t or "htmlで" in t or "htmlに" in t:
+    if "index.html" in t or ".html" in t or re.search(r"html\s*(?:で|に|の|を)", t):
         return "html"
     if "typescript" in t or re.search(r"\bts\b", t):
         return "typescript"
@@ -448,9 +448,14 @@ def javascript_snippet(task: str, request: str) -> str:
 
 
 def _topic_of(request: str) -> str:
+    """依頼文から *作るものの名* だけを残す（言語名・依頼の動詞・敬語は落とす）。"""
     t = re.sub(r"\s+", " ", str(request or "")).strip()
-    t = re.sub(r"(を|の)?(書いて|作って|作成して|実装して|ください|下さい|お願い).*$", "", t)
-    t = re.sub(r"^(Python|python|JavaScript|JS|HTML|html|TypeScript|Java|Go|Rust)[でで]?", "", t).strip()
+    t = re.sub(r"(?:コード|解説|説明|コメント)\s*(?:と|も)?\s*(?:簡単な|かんたんな)?\s*"
+               r"(?:コード|解説|説明)?\s*(?:を)?\s*(?:添えて|つけて|付けて).*$", "", t)
+    t = re.sub(r"(を|の)?(書いて|書い|作って|作成して|実装して|ください|下さい|お願い|ちょうだい).*$", "", t)
+    t = re.sub(r"^(?:Python|JavaScript|JS|TypeScript|TS|HTML|CSS|SQL|Java|Go|Rust|Ruby|PHP|bash)"
+               r"\s*(?:で|に|の|を)?\s*", "", t, flags=re.IGNORECASE).strip()
+    t = re.sub(r"^(?:関数|クラス|メソッド|スクリプト|プログラム|クエリ|ページ|サイト)\s*(?:を|の)?\s*", "", t).strip()
     return t[:40]
 
 
@@ -458,9 +463,12 @@ def _topic_of(request: str) -> str:
 # 公開 API
 # ---------------------------------------------------------------------------
 
-def generate(request: str) -> tuple[str, str, dict]:
-    """要求から (表示テキスト, 言語, メタデータ) を作る。必ず何かを返す。"""
-    lang = detect_language(request)
+def generate(request: str, *, lang: str | None = None) -> tuple[str, str, dict]:
+    """要求から (表示テキスト, 言語, メタデータ) を作る。必ず何かを返す。
+
+    ``lang`` を渡すと、その言語で書く（指示層が *指示文から読んだ言語* を引き継ぐ口）。
+    """
+    lang = (lang or "").lower() or detect_language(request)
     task = detect_task(request)
     topic = _topic_of(request) or "アプリ"
 

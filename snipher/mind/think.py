@@ -442,6 +442,37 @@ def _finalize(out: Rendered, thought: Thought, frame, dossier_obj, claims: list[
     return out, thought
 
 
+def _run_instruction(text: str, *, kb=None, web=None, lm=None, core=None,
+                     history: list[dict] | None = None, turn: int = 0):
+    """指示層を 1 回だけ試す。指示でなければ None（会話の組み立てへ進む）。
+
+    指示層は *例外で会話を止めない* 設計です。落ちたら None を返して、
+    いつもの経路（社会的発話 → 証拠集め → 合成）がそのまま引き継ぎます。
+    """
+    try:
+        from ..instruction import parse as _parse_instr
+        from ..instruction import run_directive as _run_instr
+
+        d = _parse_instr(text)
+        if d is None:
+            return None
+        res = _run_instr(d, kb=kb, web=web, history=history, lm=lm, core=core, turn=turn)
+        if res is None or not str(res.text or "").strip():
+            return None
+        body = str(res.text)
+        notes = [f"task:{res.task}"]
+        notes += [f"check:{c['name']}={'ok' if c['ok'] else 'ng'}" for c in res.checks[:4]]
+        out = Rendered(
+            text=body,
+            sentences=[x for x in re.split(r"(?<=[。！？!?])|(?<=\n)", body) if x.strip()][:8],
+            confidence=float(res.confidence), plan=res.plan, notes=notes[:4],
+            fixes=["instruction"], lm=None, claims=[], authoritative=bool(res.authoritative))
+        return out, notes
+    except Exception:  # noqa: BLE001
+        log.debug("指示層が失敗（会話経路へ続行）", exc_info=True)
+        return None
+
+
 def think(text: str, *, history: list[dict] | None = None, kb=None, web=None, lm=None,
           core=None, polisher=None, tasks=None, web_flag: bool | None = None,
           turn: int | None = None) -> tuple[Rendered, Thought]:
@@ -453,6 +484,23 @@ def think(text: str, *, history: list[dict] | None = None, kb=None, web=None, lm
     thought = Thought(frame=frame.as_dict(), state=state.as_dict(),
                       steps=[f"語気={frame.act} 問い={frame.ask or '-'} 話題={frame.topic or '-'}"])
     claims: list[Claim] = []
+
+    # ---- 0-) 指示（プロンプト）: 頼まれた仕事を実行して、その結果をそのまま返す -- #
+    # ここは会話の組み立てより前に置きます。理由: 指示文には「テキスト」「文章」
+    # 「JSON」といった *材料を指す語* が入っているので、単語を見て反応する経路に
+    # 先に触られると「テキストを読みました」が返ってしまいます（v3 の事故）。
+    # 指示部と材料部を分けて読み、出力仕様（JSON スキーマ・件数・文字数・口調）まで
+    # 契約として受け取り、実行 → 検証まで済ませてから返します。
+    instr = _run_instruction(text, kb=kb, web=web, lm=lm, core=core, history=history,
+                             turn=turn_no)
+    if instr is not None:
+        out, notes = instr
+        thought.steps.append("指示: 指示部と材料を分けて読み、仕事を 1 つ実行した")
+        thought.steps.extend(notes[:3])
+        thought.knowledge = {"via": "instruction", "task": out.plan.split(":", 1)[-1],
+                             "topic": frame.topic or None, "authoritative": True}
+        thought.dossier = {"via": "instruction", "claims": [], "notes": notes[:6]}
+        return out, thought
 
     # ---- 0) 挨拶・礼・感情の受け取り: 相手の語を返して続ける（先に決める） -- #
     if frame.act in ("greet", "thanks", "apology", "farewell", "agree", "disagree", "praise") \

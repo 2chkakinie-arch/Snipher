@@ -161,6 +161,13 @@ def rank_entities(ents: list[Entity], text: str) -> list[Entity]:
         score += min(6, len(e.surface))
         if e.kind == "digits":
             score -= 4
+        # 手元に無い語（＝調べないと答えられない語）が「話題の一等席」。
+        # 逆に *長い語の断片* としてかな 2 文字が引けてしまうと、话题がそこにすり替わる
+        # （「ブラウザ」の中の「ブラ」が主語になっていた事故）ので、強く下げる。
+        if e.web_needed and e.kind in ("ascii", "mixed"):
+            score += 12 + min(8, len(e.surface))
+        if e.kind == "kana" and len(e.surface) <= 3 and not e.known_kb:
+            score -= 12
         return (-score, len(e.surface), 0, 0)
 
     return sorted(ents, key=key)
