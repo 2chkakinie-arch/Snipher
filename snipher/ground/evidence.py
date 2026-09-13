@@ -338,15 +338,19 @@ def kb_claims(query: str, *, kb, frame) -> tuple[list[Claim], dict]:
                                      f"で読みます。",
                              subject=hy["surface"], source="local:kb", weight=0.55,
                              extra={"hypernym": True}))
-    follow = str(material.get("followup") or "").strip()
-    if follow and not re.search(r"(か|かな|でしょう)[。！？?]?$", text):
-        hits.append(Claim(kind="ask", content=follow if follow.endswith(("。", "？", "！"))
-                         else follow.rstrip() + "。", subject=topic, source="local:kb",
-                         slot="followup", weight=0.48))
+    # qa 欄は *問いの答えそのもの* です。同話題の別の切り口（why・tips）や
+    # 話題の汎用フォローアップを足すと、答えが別の話に膨らみます
+    # （「世界で一番小さい言語モデル」に「文章は何を作りたいですか」が増える事故）。
+    if field_name != "qa":
+        follow = str(material.get("followup") or "").strip()
+        if follow and not re.search(r"(か|かな|でしょう)[。！？?]?$", text):
+            hits.append(Claim(kind="ask", content=follow if follow.endswith(("。", "？", "！"))
+                             else follow.rstrip() + "。", subject=topic, source="local:kb",
+                             slot="followup", weight=0.48))
     meta = {"topic": topic, "coverage": material.get("coverage"), "score": material.get("score"),
             "field": field_name, "via": material.get("via") or "kb",
             "hypernym": meta.get("hypernym") or {}}
-    if frame.ask in ("definition", "describe", "open", ""):
+    if field_name != "qa" and frame.ask in ("definition", "describe", "open", ""):
         hits.extend(_extra_angles(query, kb=kb, topic=topic, have=text))
     return hits, meta
 

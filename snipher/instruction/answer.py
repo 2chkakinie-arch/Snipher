@@ -442,8 +442,18 @@ def _overlap(a: str, b: str, n: int = 6) -> float:
     return len(ga & gb) / min(len(ga), len(gb))
 
 
+def _is_ask_sentence(s: str) -> bool:
+    """聞き返し・確認の一文か（文末の形で判定する）。"""
+    s = s.strip()
+    if not s:
+        return False
+    if s.endswith(("？", "?", "か。", "かな。", "ますか。", "ですか。", "ますか？", "ですか？", "か？")):
+        return True
+    return bool(re.search(r"(気になっています|気になります|一言もらう|続けてもらえ|教えてください)$", s))
+
+
 def opening_line(d: "Directive", subject: str, *, tone: str, register: str,
-                 target: int = 0, have: int = 0) -> str:
+                 target: int = 0, have: int = 0, first_body: str = "") -> str:
     """役割を与えられたときの 1 文目（指示の語から作り、口調に合わせて組み替える）。
 
     字数に余裕の無い指定（例: 200 字）で材料が足りているときは、前置きを *削る* ほうが
@@ -458,6 +468,9 @@ def opening_line(d: "Directive", subject: str, *, tone: str, register: str,
     if not subject or len(subject) < 2:
         subject = ""
     if not role and not subject:
+        return ""
+    # 本文の 1 文目に主体がすでに出ているなら、「Xについて答えます」は前置きにすぎない
+    if first_body and subject and subject in first_body:
         return ""
     if role and subject:
         base = f"{role}の立場から、{subject}についてです"
@@ -581,7 +594,8 @@ def answer(d: "Directive", *, kb=None, web=None, history=None, lm=None, core=Non
         sentences = [dup.sub(subject, s.strip(), count=1) for s in sentences]
 
     opening = opening_line(d, subject, tone=tone, register=register,
-                           target=target, have=sum(len(x) for x in sentences))
+                           target=target, have=sum(len(x) for x in sentences),
+                           first_body=sentences[0] if sentences else "")
     if opening:
         sentences = [opening] + sentences
 
@@ -593,6 +607,10 @@ def answer(d: "Directive", *, kb=None, web=None, history=None, lm=None, core=Non
         body = [_shorten(s, room) for s in pick]
     else:
         body = list(sentences)
+        # 聞き返し（followup）は常に *回答の最後* に置く。字数拡張で事実文が
+        # 後から足されると聞き返しが本文の途中に挟まり、途中で切れた回答に見える。
+        asks = [s for s in body if _is_ask_sentence(s)]
+        body = [s for s in body if s not in asks]
         if target or hard:
             cap = hard or int(target * 1.4) + 40
             keep, f2 = fit_length(body, target=target, hard_max=cap)
@@ -607,6 +625,7 @@ def answer(d: "Directive", *, kb=None, web=None, history=None, lm=None, core=Non
                     body, f4 = _expand_to_target(body + extra, target, hard_max=cap)
                     notes.extend(f4)
                     notes.append(f"字数: 同じ話題の {len(extra)} 文を足した")
+        body.extend(asks)
 
     styled, fixes = restyle("\n".join(body), tone=tone, register=register)
     notes.extend(fixes)

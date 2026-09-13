@@ -818,6 +818,7 @@ def merge() -> tuple[list[dict], list[str]]:
             "aliases": it.get("aliases") or [it["topic"]],
             "tags": it.get("tags") or [],
             "def": it.get("def", ""),
+            "en": it.get("en", ""),
             "facts": it.get("facts", []),
             "why": it.get("why", []),
             "how": it.get("how", []),

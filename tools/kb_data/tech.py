@@ -6,7 +6,8 @@ from . import T
 
 ITEMS = [
     T("ai", "AI", cat="技術",
-      ali="AI,人工知能,エーアイ,機械学習,ディープラーニング,チャットボット,生成AI",
+      en="AI is technology that replaces part of human judgment and perception with procedures learned from data.",
+      ali="AI,人工知能,エーアイ,機械学習,ディープラーニング,チャットボット,生成AI,ai",
       d="AI は、人が行う判断や認識の一部を、データから学習した計算手順で置き換える技術です。",
       f=["機械学習は、例を集めて規則を数値で覚える方法で、プログラムを手で書くのとは逆の発想です。",
          "深層学習は何層もの計算を重ねて、画像や文章の特徴を段階的に捉えます。",
@@ -26,7 +27,8 @@ ITEMS = [
       fu=["AI に何をさせてみたいですか。"], rel="LLM,プログラミング,データ,量子コンピュータ", verbs="学習する,予測する,生成する,判断する"),
 
     T("llm", "大規模言語モデル", cat="技術",
-      ali="LLM,大規模言語モデル,言語モデル,ChatGPT,生成AI,プロンプト,トランスフォーマー,チャットAI,"
+      en="A large language model is an AI that predicts the next word from massive amounts of text, and it handles sentences by generating them word by word.",
+      ali="LLM,大規模言語モデル,言語モデル,ChatGPT,生成AI,プロンプト,トランスフォーマー,チャットAI,large language model,llm"
           "基盤モデル,大規模言語模型,foundation model",
       d="大規模言語モデルは、膨大な文章から「次に続く言葉」を予測する学習をした、文章を扱う AI です。",
       f=["入力はトークンと呼ばれる小さな断片に分けられ、数字に置き換えて計算されます。",
@@ -34,18 +36,22 @@ ITEMS = [
          "学習データに含まれない最新の出来事や、固い数字の計算は苦手です。",
          "もっともらしい誤りを平然と出すことがあるので、根拠の確認が必要です。",
          "検索や計算を内部に組み込み、答えを証拠の側へ固定する作り方が主流になりました。",
-         "パラメータを増やすと表現は太りますが、速さとメモリとの交換条件になります。"],
+         "パラメータを増やすと表現は太りますが、速さとメモリとの交換条件になります。",
+         "数百万パラメータの小型モデルもあり、スマートフォンや組み込みで回す用途では小型のほうが実用的です。",
+         "サイズはパラメータ数で比べ、同じ世代でも用途別に軽い版と重い版が出ることが多いです。"],
       why=["次の言葉の予測を極限まで正確にしようとすると、文法や事実の断片も一緒に覚えるからです。"],
       how=["目的を一文で書く", "条件と出力の形を指定する", "例を一つ示す",
            "分からないときは分からないと言うよう求める", "大事な数字は別に確認する"],
       tips=["指示は短い命令より、状況と目的を書いたほうが安定します。"],
       opinion="私は文章の整理がいちばん得意で、事実の確定は人間の確認が要ると思っています。",
       qa=[("なぜ間違える", "確率でもっともらしい続きを選ぶ仕組みなので、真偽ではなく自然さを優先してしまうためです。"),
-          ("どう使うといい", "下書きと要約と整理に使い、事実と数字は自分で確かめるのが安全です。")],
+          ("どう使うといい", "下書きと要約と整理に使い、事実と数字は自分で確かめるのが安全です。"),
+          ("世界で一番小さい言語モデルは", "「最小」に公式な定義はなく、比較の基準はパラメータ数です。数百万パラメータでも文の意味を扱う言語モデルは存在します。コンパクトな代表例は約 10 億パラメータの TinyLlama で、小型 GPU 一枚で動きます。速さやオフラインが目的なら小型ほど実用的です。")],
       fu=["どんな文章を作らせたいですか。"], rel="AI,プログラミング,データ,検索エンジン", verbs="予測する,生成する,学習する,要約する"),
 
     T("programming", "プログラミング", cat="技術",
-      ali="プログラミング,プログラム,コード,開発,エンジニア,バグ,デバッグ,言語",
+      en="Programming is writing the steps you want a computer to run in an exact form with no room for ambiguity.",
+      ali="プログラミング,プログラム,コード,開発,エンジニア,バグ,デバッグ,言語,programming",
       d="プログラミングは、コンピュータに実行させたい手順を、曖昧さのない形で書き下す作業です。",
       f=["コンピュータは書かれたとおりに動くので、意図と手順の差がそのまま不具合になります。",
          "小さな単位に分けて動かしながら確かめるほうが、最後にまとめて直すより速いです。",
@@ -61,7 +67,8 @@ ITEMS = [
       fu=["どんなものを作ってみたいですか。"], rel="AI,アルゴリズム,Python,ウェブサイト", verbs="書く,動かす,直す,調べる"),
 
     T("python", "Python", cat="技術",
-      ali="Python,パイソン,プログラミング言語,スクリプト,pip",
+      en="Python is a programming language designed for readability, widely used in both learning and research.",
+      ali="Python,パイソン,プログラミング言語,スクリプト,pip,python",
       d="Python は、読みやすさを重視した設計のプログラミング言語で、学習と研究の両方で広く使われます。",
       f=["インデントで塊を表すので、見た目の構造と動作が一致します。",
          "数値計算・機械学習・Web・自動化など、用途ごとのライブラリが豊富です。",
@@ -74,7 +81,8 @@ ITEMS = [
       fu=["Python で何をしてみたいですか。"], rel="プログラミング,AI,データ,アルゴリズム", verbs="書く,実行する,調べる"),
 
     T("algorithm", "アルゴリズム", cat="技術",
-      ali="アルゴリズム,計算量,データ構造,ソート,探索,効率",
+      en="An algorithm is a procedure for solving a problem, defined with no ambiguity.",
+      ali="アルゴリズム,計算量,データ構造,ソート,探索,効率,algorithm",
       d="アルゴリズムは、問題を解くための手順を、曖昧さなく定めたものです。",
       f=["同じ結果でも、手順次第で必要な時間は何桁も変わります。",
          "データ量を n とすると、線形は n、二分探索は log n、全探索は n の二乗で増えます。",
@@ -86,7 +94,8 @@ ITEMS = [
       fu=["どんな問題を解きたいですか。"], rel="プログラミング,データ,数学,検索", verbs="解く,並べる,探す,測る"),
 
     T("internet", "インターネット", cat="技術",
-      ali="インターネット,ネット,通信,プロバイダ,回線,パケット,TCP/IP",
+      en="The internet is a worldwide network of computers connected by shared rules.",
+      ali="インターネット,ネット,通信,プロバイダ,回線,パケット,TCP/IP,internet",
       d="インターネットは、共通のルールで繋がった世界中のコンピュータのネットワークです。",
       f=["データは小さなパケットに分けて送られ、別々の経路を通って届きます。",
          "住所に当たる IP と名前に当たる DNS の二つで相手を特定します。",
@@ -99,7 +108,8 @@ ITEMS = [
       fu=["通信で困っていることはありますか。"], rel="Wi-Fi,スマホ,セキュリティ,検索エンジン", verbs="送る,繋ぐ,届く"),
 
     T("wifi", "Wi-Fi", cat="技術",
-      ali="Wi-Fi,ワイファイ,無線LAN,ルーター,電波,通信速度",
+      en="Wi-Fi is a wireless standard that connects devices to a network by radio waves without cables.",
+      ali="Wi-Fi,ワイファイ,無線LAN,ルーター,電波,通信速度,wifi",
       d="Wi-Fi は、ケーブルを使わずに電波で機器をネットワークに繋ぐ無線通信の規格です。",
       f=["2.4 GHz 帯は届きやすく、5 GHz 帯は速いものの壁に弱いです。",
          "電波は水と金属に弱く、人体や冷蔵庫のそばでは速度が落ちます。",
@@ -113,7 +123,8 @@ ITEMS = [
       fu=["Wi-Fi で困っていることはありますか。"], rel="インターネット,スマホ,ルーター,セキュリティ", verbs="繋ぐ,飛ぶ,切れる"),
 
     T("smartphone", "スマートフォン", cat="技術",
-      ali="スマホ,スマートフォン,携帯,モバイル,バッテリー,アプリ,画面",
+      en="A smartphone is a handheld device that combines calls, computing, communication, cameras, and maps in one unit.",
+      ali="スマホ,スマートフォン,携帯,モバイル,バッテリー,アプリ,画面,smartphone",
       d="スマートフォンは、通話に加えて計算・通信・撮影・地図を一台にまとめた携帯端末です。",
       f=["電池は熱に弱く、高温の場所で充電すると劣化が早まります。",
          "画面の明るさが消費電力の大部分を占めます。",
@@ -126,7 +137,8 @@ ITEMS = [
       fu=["スマホで一番よく使う機能は何ですか。"], rel="Wi-Fi,アプリ,バッテリー,セキュリティ", verbs="使う,充電する,撮る,通知する"),
 
     T("security", "セキュリティ", cat="技術",
-      ali="セキュリティ,情報セキュリティ,ウイルス,マルウェア,サイバー攻撃,個人情報,暗号",
+      en="Security is the set of mechanisms that protects information and systems from unintended reading, writing, or destruction.",
+      ali="セキュリティ,情報セキュリティ,ウイルス,マルウェア,サイバー攻撃,個人情報,暗号,security",
       d="セキュリティは、情報とシステムを、意図しない読み書きや破壊から守る仕組みのことです。",
       f=["暗号化は、鍵を持つ人だけが中身を読めるようにする技術です。",
          "なりすましの多くは、パスワードの使い回しから始まります。",
@@ -140,7 +152,8 @@ ITEMS = [
       fu=["二段階認証は使っていますか。"], rel="パスワード,インターネット,スマホ,暗号", verbs="守る,暗号化する,更新する"),
 
     T("computer", "コンピュータ", cat="技術",
-      ali="コンピュータ,パソコン,PC,CPU,メモリ,ストレージ,計算機",
+      en="A computer is a machine that processes information, represented as numbers, at high speed by fixed procedures.",
+      ali="コンピュータ,パソコン,PC,CPU,メモリ,ストレージ,計算機,computer",
       d="コンピュータは、数字として表した情報を、決められた手順で高速に処理する機械です。",
       f=["CPU が計算し、メモリが作業台になり、ストレージが倉庫の役割です。",
          "メモリが足りないと、遅い倉庫を何度も往復するので動作が重くなります。",
@@ -153,7 +166,8 @@ ITEMS = [
       fu=["普段どんな作業をしていますか。"], rel="プログラミング,スマホ,インターネット,AI", verbs="計算する,保存する,起動する"),
 
     T("quantum", "量子コンピュータ", cat="技術",
-      ali="量子コンピュータ,量子コンピューター,量子ビット,キュービット,量子力学,量子技術",
+      en="A quantum computer is a new kind of computer that computes using quantum properties such as superposition and interference.",
+      ali="量子コンピュータ,量子コンピューター,量子ビット,キュービット,量子力学,量子技術,quantum computer",
       d="量子コンピュータは、重ね合わせと干渉という量子の性質を使って計算する、新しい方式の計算機です。",
       f=["古典のビットが 0 か 1 なのに対し、量子ビットは確率的に両方の状態を扱えます。",
          "素因数分解や物質の模擬など、特定の問題で有利になると考えられています。",
@@ -166,7 +180,8 @@ ITEMS = [
       fu=["量子コンピュータに何を計算させたいですか。"], rel="AI,コンピュータ,物理,半導体", verbs="計算する,重ねる,干渉する"),
 
     T("semiconductor", "半導体", cat="技術",
-      ali="半導体,チップ,集積回路,シリコン,半導体工場,微細化",
+      en="A semiconductor is a material whose ability to conduct electricity can be controlled, and it makes the brain of modern electronics.",
+      ali="半導体,チップ,集積回路,シリコン,半導体工場,微細化,semiconductor",
       d="半導体は、電気を流したり止めたりを制御できる材料で、現代の電子機器の頭脳を作ります。",
       f=["シリコンに不純物を入れて、電気の通り道を制御します。",
          "トランジスタを小さくして数を増やすほど、性能と効率が上がります。",
@@ -177,7 +192,8 @@ ITEMS = [
       fu=["電子機器で気になるものはありますか。"], rel="コンピュータ,量子コンピュータ,電気,技術", verbs="制御する,作る,流す"),
 
     T("robot", "ロボット", cat="技術",
-      ali="ロボット,機械,自動運転,産業用ロボット,ヒューマノイド,制御",
+      en="A robot is a combination of machine and computing that moves on its own in response to instructions and information about its surroundings.",
+      ali="ロボット,機械,自動運転,産業用ロボット,ヒューマノイド,制御,robot",
       d="ロボットは、人の指示や周囲の情報に応じて自分で動く、機械と計算の組み合わせです。",
       f=["センサーで状況を読み、計算で判断し、モーターで動く、という三段でできています。",
          "工場のロボットは同じ作業を高い精度で繰り返すのが得意です。",
@@ -189,7 +205,8 @@ ITEMS = [
       fu=["ロボットに任せてみたい作業はありますか。"], rel="AI,プログラミング,自動運転,技術", verbs="動く,判断する,制御する"),
 
     T("ev", "電気自動車", cat="技術",
-      ali="電気自動車,EV,電動車,充電,バッテリー,ハイブリッド",
+      en="An electric vehicle is a car that runs by turning battery-stored electricity to drive a motor.",
+      ali="電気自動車,EV,電動車,充電,バッテリー,ハイブリッド,electric vehicle,ev",
       d="電気自動車は、電池に蓄えた電気でモーターを回して走る自動車です。",
       f=["走行中に排気ガスを出しませんが、発電の仕組みによって環境負荷は変わります。",
          "モーターは止まっているときから力が出るので、発進が滑らかです。",
@@ -201,7 +218,8 @@ ITEMS = [
       fu=["車は使いますか。"], rel="バッテリー,環境,技術,自動車", verbs="走る,充電する,蓄える"),
 
     T("gps", "GPS", cat="技術",
-      ali="GPS,位置情報,衛星測位,地図,ナビ,経度,緯度",
+      en="GPS is a system that finds your position from the time differences of signals arriving from several satellites.",
+      ali="GPS,位置情報,衛星測位,地図,ナビ,経度,緯度,gps",
       d="GPS は、複数の衛星からの電波の届く時間の差を使って、現在地を求める仕組みです。",
       f=["4 つ以上の衛星が見えると、位置と時刻のずれを同時に補正できます。",
          "高層ビルや山のあいだでは電波が遮られ、精度が落ちます。",
@@ -213,7 +231,8 @@ ITEMS = [
       fu=["地図アプリはよく使いますか。"], rel="スマホ,衛星,インターネット,旅行", verbs="測る,特定する,補正する"),
 
     T("cloud", "クラウド", cat="技術",
-      ali="クラウド,オンラインストレージ,サーバー,データセンター,同期",
+      en="Cloud computing keeps your data and processing on machines over a network instead of on your own device.",
+      ali="クラウド,オンラインストレージ,サーバー,データセンター,同期,cloud",
       d="クラウドは、自分の端末ではなく、ネットワーク越しの計算機にデータと処理を置く仕組みです。",
       f=["端末が壊れてもデータが残る、という利点が最も分かりやすいメリットです。",
          "容量は買った分ではなく、使った分だけ払う方式が多いです。",
@@ -224,7 +243,8 @@ ITEMS = [
       fu=["データをどこに置いていますか。"], rel="セキュリティ,インターネット,スマホ,バックアップ", verbs="保存する,同期する,預ける"),
 
     T("search", "検索エンジン", cat="技術",
-      ali="検索,検索エンジン,Google,キーワード,ヒット,クロール,インデックス",
+      en="A search engine collects and organizes text from around the world and returns it ranked to fit a query.",
+      ali="検索,検索エンジン,Google,キーワード,ヒット,クロール,インデックス,search engine",
       d="検索エンジンは、世界中の文章を集めて整理し、質問に合いそうな順に並べて返す仕組みです。",
       f=["ページを集める、言葉を単位に分けて索引を作る、順位を決める、の三段で動きます。",
          "順位は言葉の一致だけでなく、文脈や信頼性も考慮されます。",
@@ -235,7 +255,8 @@ ITEMS = [
       fu=["何を調べたいですか。"], rel="インターネット,AI,ウェブサイト,データ", verbs="探す,集める,並べる"),
 
     T("website", "ウェブサイト", cat="技術",
-      ali="ウェブサイト,ホームページ,HTML,CSS,ブラウザ,ページ,ドメイン",
+      en="A website is a collection of documents whose structure is written in HTML and appearance in CSS, then drawn by a browser.",
+      ali="ウェブサイト,ホームページ,HTML,CSS,ブラウザ,ページ,ドメイン,website",
       d="ウェブサイトは、HTML で構造を書き、CSS で見た目を決め、ブラウザが描いて表示する文書の集まりです。",
       f=["HTML は骨格、CSS は装飾、JavaScript は動き、という役割分担です。",
          "ドメインは住所、サーバーはその場所にある建物に当たります。",
@@ -248,7 +269,8 @@ ITEMS = [
       fu=["自分のページを持ってみたいですか。"], rel="プログラミング,インターネット,検索エンジン,HTML", verbs="作る,公開する,表示する"),
 
     T("math", "数学", cat="学問",
-      ali="数学,算数,数式,方程式,証明,図形,微分積分",
+      en="Mathematics is the study of the rules of numbers, shapes, and change, built up from premises by logic alone.",
+      ali="数学,算数,数式,方程式,証明,図形,微分積分,mathematics,math",
       d="数学は、数と形と変化の規則を、前提から論理だけで積み上げて調べる学問です。",
       f=["答えだけでなく、なぜそうなるかの筋道が本質です。",
          "同じ規則が、物理・経済・情報など別の分野でも繰り返し現れます。",
@@ -262,7 +284,8 @@ ITEMS = [
       fu=["数学で好きな分野はありますか。"], rel="確率,統計,物理,プログラミング", verbs="解く,証明する,計算する"),
 
     T("probability", "確率", cat="学問",
-      ali="確率,確率論,可能性,ギャンブル,期待値,偶然,統計",
+      en="Probability is the fraction of cases in which a specific event happens, expressed as a number.",
+      ali="確率,確率論,可能性,ギャンブル,期待値,偶然,統計,probability",
       d="確率は、起こりうる場合のうち特定のことが起きる割合を、数で表したものです。",
       f=["0 から 1 のあいだの値で、1 なら必ず起き、0 なら起きません。",
          "試行回数が増えると、実際の頻度は理論の確率に近づきます。",
@@ -275,7 +298,8 @@ ITEMS = [
       fu=["確率で気になることはありますか。"], rel="統計,数学,データ,AI", verbs="起こる,数える,見積もる"),
 
     T("statistics", "統計", cat="学問",
-      ali="統計,データ分析,平均,中央値,散布図,相関,アンケート",
+      en="Statistics is the set of methods for drawing conclusions from data, while accounting for random variation.",
+      ali="統計,データ分析,平均,中央値,散布図,相関,アンケート,statistics",
       d="統計は、集めた数字の傾向を読み取り、そこから全体を推測する手法です。",
       f=["平均は外れ値に引っ張られるので、中央値と並べて見るほうが実態が分かります。",
          "相関があることは、原因があることを意味しません。",
@@ -288,7 +312,8 @@ ITEMS = [
       fu=["どんなデータを見てみたいですか。"], rel="確率,データ,AI,数学", verbs="集める,測る,比べる"),
 
     T("physics", "物理", cat="学問",
-      ali="物理学,物理,力学,運動,エネルギー,重力,相対性理論",
+      en="Physics is the science that explains the behavior of matter and energy by a small number of fundamental laws.",
+      ali="物理学,物理,力学,運動,エネルギー,重力,相対性理論,physics",
       d="物理学は、物の動きとエネルギーの規則を、観察と数式で明らかにする学問です。",
       f=["力は加えた分だけ動きが変わり、何もしなければ今の状態が続きます。",
          "エネルギーは形を変えても、全体の量は保存されます。",
@@ -300,7 +325,8 @@ ITEMS = [
       fu=["物理で気になる現象はありますか。"], rel="数学,化学,宇宙,電気", verbs="動く,落ちる,保存する"),
 
     T("chemistry", "化学", cat="学問",
-      ali="化学,分子,原子,元素,化学反応,実験,周期表",
+      en="Chemistry is the science of how matter is made up and how it changes, from atoms to materials.",
+      ali="化学,分子,原子,元素,化学反応,実験,周期表,chemistry",
       d="化学は、原子と分子の組み合わせと、その変化の規則を扱う学問です。",
       f=["元素は周期表に並び、性質が周期的に繰り返されます。",
          "化学反応では原子の種類と数は変わらず、組み替わるだけです。",
@@ -313,7 +339,8 @@ ITEMS = [
       fu=["化学で興味があるものはありますか。"], rel="物理,元素,実験,料理", verbs="反応する,結びつく,分解する"),
 
     T("biology", "生物学", cat="学問",
-      ali="生物学,生物,細胞,DNA,遺伝子,進化,生態系",
+      en="Biology is the science of living things, from cells to whole ecosystems.",
+      ali="生物学,生物,細胞,DNA,遺伝子,進化,生態系,biology",
       d="生物学は、生き物の構造・働き・生まれ変わり・関係をしらべる学問です。",
       f=["すべての生き物は細胞でできていて、細胞の中に設計図の DNA があります。",
          "DNA は四種類の塩基の並びで情報を記録し、複製のときに違いが生じます。",
@@ -325,7 +352,8 @@ ITEMS = [
       fu=["生き物で気になるものはありますか。"], rel="DNA,進化,細胞,自然", verbs="生きる,増える,変化する"),
 
     T("electricity", "電気", cat="学問",
-      ali="電気,電流,電圧,電池,発電,送電,静電気",
+      en="Electricity is a form of energy produced by the flow of electric charge, used for power, computing, and signaling.",
+      ali="電気,電流,電圧,電池,発電,送電,静電気,electricity",
       d="電気は、電子の流れとしてエネルギーを運ぶ現象で、現代の生活の基盤です。",
       f=["電圧は押す力、電流は流れる量、抵抗は通りにくさです。",
          "発電は、磁石とコイルの相対運動で電気を起こす方式が中心です。",
@@ -338,7 +366,8 @@ ITEMS = [
       fu=["電気代で気になることはありますか。"], rel="磁石,電池,発電,半導体", verbs="流れる,起こす,運ぶ"),
 
     T("light", "光", cat="学問",
-      ali="光,可視光,紫外線,赤外線,反射,屈折,レーザー,色",
+      en="Light is a form of electromagnetic radiation visible to the eye, and it travels in straight lines until it is reflected or refracted.",
+      ali="光,可視光,紫外線,赤外線,反射,屈折,レーザー,色,light",
       d="光は、電磁波のうち目で感じられる範囲のことで、物の見え方を決めます。",
       f=["波長が短いほど青く、長いほど赤く見えます。",
          "光はまっすぐ進み、境界で反射と屈折を起こします。",

@@ -67,7 +67,7 @@ def _words(v: Any) -> list[str]:
 
 
 def T(id: str, topic: str, *, cat: str = "", ali: Any = None, tags: Any = None,
-      d: str | None = None, f: Any = None, why: Any = None, how: Any = None,
+      d: str | None = None, en: str | None = None, f: Any = None, why: Any = None, how: Any = None,
       when: str | None = None, where: str | None = None, who: str | None = None,
       cost: str | None = None, tips: Any = None, opinion: str | None = None,
       qa: Any = None, fu: Any = None, rel: Any = None, verbs: Any = None) -> dict:
@@ -86,6 +86,7 @@ def T(id: str, topic: str, *, cat: str = "", ali: Any = None, tags: Any = None,
         "aliases": _words(ali) or [topic],
         "tags": _words(tags),
         "def": (d or "").strip(),
+        "en": (en or "").strip(),
         "facts": _lst(f),
         "why": _lst(why),
         "how": _lst(how),
@@ -137,6 +138,9 @@ def validate(items: list[dict]) -> list[str]:
         seen_topic.add(it["topic"])
         if not it.get("def"):
             errs.append(f"{tid}: 定義(d)がありません")
+        _en = it.get("en") or ""
+        if _en and not _en.endswith((".", "!", "?")):
+            errs.append(f"{tid}.en: 文末が閉じていません → {_en[-12:]}")
         if not it.get("facts") and not it.get("qa"):
             errs.append(f"{tid}: 事実(f)も qa もありません")
         for field in _STR_FIELDS:

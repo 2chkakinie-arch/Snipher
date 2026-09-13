@@ -56,8 +56,11 @@ _FUNC_WORDS = {
     "誰", "いくら", "どんな", "どういう", "どう", "おすすめ", "好き", "嫌い", "ある", "いる",
     "する", "した", "して", "これ", "それ", "あれ", "この", "その", "あの", "わたし", "私",
     "あなた", "僕", "俺", "ちょっと", "少し", "いろいろ", "何か", "なんか", "ね", "よ", "さ",
-    "かな", "わ", "ぞ", "ぜ", "ば", "たら", "ので", "けど", "し", "て", "だ", "た", "ない",
+    "かな", "わ", "ぞ", "ぜ", "ば", "たら", "の", "だけ", "だけ", "ので", "けど", "し", "て", "だ", "た", "ない",
     "たい", "でしょう", "みたい", "っぽい", "そう", "とても", "すごく", "どれ", "どの",
+    "について", "に関して", "に対して", "につい", "について教えてください",
+    "教えてください", "教えて", "説明して", "詳しく", "詳しく教えてください",
+    "簡単に", "短く", "長く", "ゆっくり", "教えてください", "説明してください",
 }
 
 # 未知語の塊から前後を削る機能語（中身は壊さない）
@@ -807,7 +810,21 @@ class KnowledgeBase:
                     ("夜の挨拶", "夜の挨拶は「こんばんは」です。", 1.0),
                 )
         words, word_score, word_hits = self.match_words(query)
-        content = {w for w in words if w not in _FUNC_WORDS}
+        # 被覆率は *話題の内容語* だけで数える。「について」「詳しく」のような
+        # 助詞句・副詞・依頼語が残ると、被覆率が下がり正しい話題が落ちる
+        # （「日本について詳しく教えてください」→ 日本 だけが残ることが重要）。
+        content = {w for w in words
+                   if w not in _FUNC_WORDS
+                   and not w.endswith("て")
+                   and not w.endswith(("ください", "ましょう", "ます", "です"))
+                   and not (len(w) >= 3 and w.endswith("く"))}
+        # 問いの *形* を決める語（値段・いくら・いつ・どこ）は話題の内容ではなく
+        # 質問の型です（「電球 平均値段」→ 話題は 電球 だけ）。
+        _Q_SHAPE = {"値段", "価格", "いくら", "いくらか", "費用", "料金", "コスト", "何円",
+                    "いつ", "どこ", "誰", "だれ", "どこで", "理由", "仕組み", "作り方", "やり方"}
+        content_narrow = {w for w in content if w not in _Q_SHAPE}
+        if len(content_narrow) < len(content):
+            content = content_narrow
         qtype = question_type(query)
         hits = self.search(query, top_k=4)
 
@@ -869,6 +886,19 @@ class KnowledgeBase:
                     best = (len(name), h)
             if best is not None:
                 strong_hit = best[1]
+        if strong_hit is None:
+            # 名詞句の問い: 4 文字以上の *具体的な索引語*（話題名・alias）が発話の
+            # 末尾に立っていれば、疑問詞が無くてもその話題の質問です
+            # （「世界で一番小さい言語モデル」→ 末尾の「言語モデル」）。
+            # 「世界」「小さい」のような修飾語が被覆率を薄めても、末尾の語が話題を決める。
+            t2 = normalized_query.rstrip("。、！？!?…・〜 　")
+            if 4 <= len(t2) <= 28:
+                tail2 = words[-1] if words else ""
+                if tail2 and len(tail2) >= 4:
+                    for h in hits:
+                        if h.get("topic_hit") and tail2 in (h.get("word_hits") or []):
+                            strong_hit = h
+                            break
         if strong_hit is not None:
             chosen = dict(strong_hit)
             chosen["via"] = "word"

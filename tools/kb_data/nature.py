@@ -308,5 +308,18 @@ ITEMS = [
       tips=["入る前にかけ湯をして、出たあとは水分を取ると体の負担が減ります。"],
       opinion="露天風呂で夜風にあたる時間が、いちばん贅沢だと思います。",
       qa=[("効果はある", "温熱と血行の促進で、こわばった体が楽になる感じは多くの人が得られます。")],
-      fu=["好きな温泉地はありますか。"], rel="火山,旅行,山,リラックス", verbs="湧く,浸かる,温まる")
+      fu=["好きな温泉地はありますか。"], rel="火山,旅行,山,リラックス", verbs="湧く,浸かる,温まる"),
+
+    T("kouseigo", "光合成", cat="自然",
+      ali="光合成,光合成作用,photosynthesis,炭酸同化,葉緑体",
+      d="光合成は、植物や藻類が光のエネルギーを使って二酸化炭素と水から糖を作り、酸素を出す反応です。",
+      en="Photosynthesis is the process in which plants and algae use light energy to turn carbon dioxide and water into sugar while releasing oxygen. It takes place in the chloroplasts of leaves and provides most of the oxygen in Earth's atmosphere.",
+      f=["葉緑体の中のクロロフィルが光のエネルギーを吸収します。",
+         "光反応とカルビン回路の 2 段階で進みます。",
+         "地球上の酸素の多くは、光合成によって生み出されています。",
+         "作られた糖は、呼吸や成長のエネルギー源になります。"],
+      why=["光エネルギーを糖という形で安定して保存できるからです。"],
+      qa=[("光合成の条件は", "光、水、二酸化炭素、そして葉緑体の四つが必要です。"),
+          ("行われる場所は", "主に葉の葉緑体で行われます。")],
+      fu=["どの方面のことが気になっていますか。"], rel="植物,生態系,科学,化学", verbs="光る,合成する,酸素を出す")
 ]

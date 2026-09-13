@@ -45,9 +45,10 @@ mongodb influxdb elastic search kibana linux unix macos windows ios android chro
 safari edge chromium webkit git gitflow pr ci cd lint eslint prettier ruff mypy pytest jest
 vitest cypress playwright shell bash zsh sh terminal cli gui ui ux spa ssr ssg hydration
 utf utf-8 utf8 ascii unicode emoji ansi shift_jis euc-jp
-ai ml dl nlp cv ocr llm gpt prompt prompt-engineering tokenizer token tokens embedding
+ai ml dl nlp cv ocr llm gpt glm tinyllama llama mistral phi gemini claude photosynthesis chlorophyll prompt prompt-engineering tokenizer token tokens embedding
 embeddings dataset batch epoch learning gradient tensor pytorch torch numpy numpy2 numpyjs
-cpu gpu tpu ram ssd hdd vram cache kv cache-control etag
+cpu gpu tpu ram ssd hdd vram cache kv cache-control etag led
+bit 4bit 8bit 16k 1b
 url uri uuid uri-template email webhook websocket websocket-api
 kb mb gb tb ms sec v1 v2 v3 v4 beta alpha rc ok ng abc xyz
 frontend backend fullstack devops mlops saas paas iaas

@@ -10,7 +10,8 @@ from . import T
 
 ITEMS = [
     T("llm_internals", "大規模言語モデルの内部", cat="技術",
-      ali="言語モデル,トランスフォーマー,注意機構,自己注意,コンテキストウィンドウ,文脈長",
+      en="A large language model is a huge collection of matrices that splits text into small pieces and keeps predicting the probability of the next piece.",
+      ali="言語モデル,トランスフォーマー,注意機構,自己注意,コンテキストウィンドウ,文脈長,llm internals",
       tags=["IT", "技術"],
       d="大規模言語モデルは、文章を小さな断片に分けて、次に来る断片の確率を予測し続ける巨大な行列の集まりです。",
       f=["注意機構は、離れた位置の語同士を結び付けて、主語と述語のような関係を拾います。",
@@ -28,6 +29,7 @@ ITEMS = [
       verbs="予測する,生成する,結ぶ"),
 
     T("sft", "指示追従学習", cat="技術",
+      en="Instruction tuning is a stage of training in which a model is shown many pairs of instructions and desirable answers, so it learns to behave the way it is asked.",
       ali="sft,instruction tuning,指示チューニング,追従学習,教師あり微調整",
       tags=["技術", "学問"],
       d="指示追従学習は、指示と望ましい回答の組を大量に見せて、頼まれ方に応じた振る舞いを模型に覚えさせる追いか訓練です。",
@@ -48,7 +50,8 @@ ITEMS = [
       verbs="教える,揃える,検証する"),
 
     T("rlhf", "選好で寄せる学習", cat="技術",
-      ali="rlhf,選好学習,dpo,報酬モデル,preference",
+      en="Preference-based training adjusts a model so it favors answers that people rated as better, using records of human choices between two answers.",
+      ali="rlhf,選好学習,dpo,報酬モデル,preference,preference learning",
       tags=["技術", "学問"],
       d="選好で寄せる学習は、二つの答えからどちらが好ましいかを人が選んだ記録で、模型の出し方の方針を調整する仕組みです。",
       f=["正解が無い問題（柔らかさ、詳しさ、安全さ）に数値の指針を与えられます。",
@@ -61,6 +64,7 @@ ITEMS = [
       fu=["どんな好みを反映させたいですか。"], rel="指示追従学習,モデル評価", verbs="選ぶ,寄せる,縛る"),
 
     T("rag", "検索拡張生成", cat="技術",
+      en="Retrieval-augmented generation is a method where the model looks up sources first and then writes the answer along the text it found.",
       ali="rag,検索拡張,検索と生成,リランク,索引生成",
       tags=["IT", "技術"],
       d="検索拡張生成は、答える前に資料を探して、その本文に沿って文を作る作り方のことです。",
@@ -79,7 +83,8 @@ ITEMS = [
       verbs="探す,絞る,付ける"),
 
     T("embedding", "埋め込みベクトル", cat="技術",
-      ali="埋め込み,ベクトル検索,類似検索,コサイン距離",
+      en="An embedding vector turns text or images into a row of numbers so that similar meanings sit at similar distances.",
+      ali="埋め込み,ベクトル検索,類似検索,コサイン距離,embedding vector,embedding",
       tags=["技術", "学問"],
       d="埋め込みベクトルは、文章や画像を数字の並びに直し、近い意味を近い距離で扱えるようにする技術です。",
       f=["距離の近さが意味の似通いに対応しますが、同じ話題でも評価が逆のものを近づけてしまうことがあります。",
@@ -91,7 +96,8 @@ ITEMS = [
       fu=["何と何を近づけたいですか。"], rel="検索拡張生成,データベース", verbs="映す,測る,並べる"),
 
     T("quantization", "量子化", cat="技術",
-      ali="量子化,int8,q4,重みの圧縮",
+      en="Quantization shrinks a model by moving its weights from fine numbers to coarser ones, trading a little accuracy for speed and memory.",
+      ali="量子化,int8,q4,重みの圧縮,quantization",
       tags=["技術", "学問"],
       d="量子化は、模型の重みを細かい数値から粗い数値へ寄せて、メモリと速度を稼ぐ方法です。",
       f=["8 ビットや 4 ビットに寄せると、重みの分だけ読み込みと計算が軽くなります。",
@@ -105,7 +111,8 @@ ITEMS = [
       fu=["どこで動かしたいですか。"], rel="知識の蒸留,推論の速さ", verbs="寄せる,軽くする,速くなる"),
 
     T("distill_model", "知識の蒸留", cat="技術",
-      ali="蒸留,生徒模型,教師模型,スモールモデル",
+      en="Distillation copies the behavior of a large, good model into a smaller one by making the smaller model imitate it.",
+      ali="蒸留,生徒模型,教師模型,スモールモデル,knowledge distillation",
       tags=["技術", "学問"],
       d="蒸留は、大きくて良い答を出す模型の振る舞いを、小さい模型に真似させて移す方法です。",
       f=["答えの文だけ見せるより、確からしさの分布ごと見せるほうが移ります。",
@@ -119,7 +126,8 @@ ITEMS = [
       fu=["どの能力を移したいですか。"], rel="量子化,指示追従学習", verbs="写す,絞る,測る"),
 
     T("inference_speed", "推論の速さ", cat="技術",
-      ali="推論,デコード,中間状態の再利用,応答時間",
+      en="Inference speed is how quickly a model can produce text, split into the delay of the first word and the speed of the rest.",
+      ali="推論,デコード,中間状態の再利用,応答時間,inference speed",
       tags=["技術", "学問"],
       d="推論の速さは、作りたい文をどのくらいの待ち時間で出せるかという話で、初手の遅さと出てからの速さの二つに分かれます。",
       f=["初手は入力の読み込み量で決まり、その後は生成の回数で決まります。",
@@ -133,7 +141,8 @@ ITEMS = [
       fu=["どこが気になっていますか。"], rel="量子化,モデル評価", verbs="測る,縮める,出す"),
 
     T("tokenizer", "トークン化", cat="技術",
-      ali="トークン,分割,語彙サイズ,bpe",
+      en="Tokenization is splitting text into the small pieces a model can count, deciding how text is divided and how big its vocabulary is.",
+      ali="トークン,分割,語彙サイズ,bpe,tokenization",
       tags=["技術", "学問"],
       d="トークン化は、文章を模型が数えられる小さな断片に分ける作業で、ここで分け方と語彙の大きさが決まります。",
       f=["文字より大きく語より小さい、頻出の並びを単位にする方法が良く使われます。",
@@ -146,7 +155,8 @@ ITEMS = [
       fu=["何のための分割ですか。"], rel="大規模言語モデル,量子化", verbs="分ける,数える"),
 
     T("ml_eval", "モデル評価", cat="技術",
-      ali="評価,ベンチマーク,スコア,正解率,合格ライン",
+      en="Model evaluation is measuring, with fixed test sets and automatic checks, whether the behavior you want actually reproduces.",
+      ali="評価,ベンチマーク,スコア,正解率,合格ライン,model evaluation",
       tags=["技術", "学問"],
       d="モデル評価は、望む振る舞いが再現できているかを、決まった問題集と機械の検査で数える作業です。",
       f=["問題集が知られると、そこだけ強くなる偏りが起きやすいです。",
@@ -160,7 +170,8 @@ ITEMS = [
       fu=["何が出来ていれば合格にしますか。"], rel="量子化,検索拡張生成", verbs="測る,数える,比べる"),
 
     T("hallucination", "模型の尤もらしい嘘", cat="技術",
-      ali="ハルシネーション,尤もらしい嘘,勝手に埋める,モデルの誤り",
+      en="Hallucination is when a model fills the parts it does not know with confident-sounding guesses, without flagging that it does not know.",
+      ali="ハルシネーション,尤もらしい嘘,勝手に埋める,モデルの誤り,hallucination",
       tags=["技術", "学問"],
       d="尤もらしい嘘は、模型が知らない所を知らないままに、もっともらしい形で埋めてしまう現象です。",
       f=["知らない語を、知っている語の並びで埋めるので、文の形は崩れません。",
@@ -174,7 +185,8 @@ ITEMS = [
       fu=["何が起きると困りますか。"], rel="検索拡張生成,モデル評価", verbs="埋める,確かめる"),
 
     T("agent_tool", "道具を使う仕組み", cat="技術",
-      ali="エージェント,ツール呼び出し,関数呼び出し,自動実行",
+      en="An agent tool is a design that lets the model ask outside tools to compute, search, and execute, choosing its next step as it goes.",
+      ali="エージェント,ツール呼び出し,関数呼び出し,自動実行,tool use,agent tool",
       tags=["技術", "学問"],
       d="道具を使う仕組みは、模型に計算・検索・実行を頼める形にして、自分で次の手を決めながら仕事を進める作りです。",
       f=["呼び出し方を決めることで、確かめられる結果を答えの土台にできます。",
@@ -187,7 +199,8 @@ ITEMS = [
       fu=["何をさせたいですか。"], rel="検索拡張生成,指示追従学習", verbs="呼び出す,確かめる"),
 
     T("prompt_design", "指示の書き方", cat="技術",
-      ali="プロンプト,指示文,出力指定,役割付与,条件書き",
+      en="Prompt design is the wording you use to ask a model for work; the more you fix the conditions and output shape, the more stable the result.",
+      ali="プロンプト,指示文,出力指定,役割付与,条件書き,prompt design",
       tags=["技術", "勉強"],
       d="指示の書き方は、模型に仕事を頼むときの文面で、条件と出力の形を決めるほど結果が安定します。",
       f=["役割の指定は口調に効き、出力形式の指定は形に効きます。",
@@ -204,7 +217,8 @@ ITEMS = [
       fu=["どんな仕事を頼いたいですか。"], rel="指示追従学習,役割", verbs="書く,揃える"),
 
     T("role_style", "役割の指定", cat="技術",
-      ali="役割,ペルソナ,口調指定,ですます,だである,文体",
+      en="Role assignment is an instruction that fixes the speaker and stance first, which lines up the tone and the level of detail together.",
+      ali="役割,ペルソナ,口調指定,ですます,だである,文体,role assignment",
       tags=["技術", "言葉"],
       d="役割の指定は、話し手と立ち位置を先に決める指示で、口調と詳しさの水準が一緒に揃います。",
       f=["「専門家に頼む」形にすると、語彙と説明の粒度が変わります。",
@@ -215,4 +229,15 @@ ITEMS = [
       opinion="役割は飾りではなく、粒度と口調を揃える実務的な指定だと思っています。",
       qa=[("本当に効く", "形と口調にははっきり効きますが、事実の正確さには効きません。")],
       fu=["どんな話し手にしたいですか。"], rel="指示の書き方,敬語", verbs="決める,揃える"),
+
+    T("tinyllama", "TinyLlama", cat="技術",
+      en="TinyLlama is an open 1-billion-parameter language model that runs on a single consumer GPU.",
+      ali="TinyLlama,ティニーラマ,tiny llama,1B,10億パラメータ",
+      d="TinyLlama は、10 億パラメータのオープンな言語モデルで、小型 GPU 一枚でも動きます。",
+      f=["パラメータ数は約 10 億（1B）で、LLaMA 系の小型版として公開されました。",
+         "4bit 量子化すれば 8GB 前後の GPU メモリで推論できます。",
+         "文脈長は 16k トークンです。"],
+      qa=[("何億パラメータ", "約 10 億パラメータ（1B）です。"),
+          ("どこで動かせる", "8GB 前後の GPU メモリで 4bit 推論が回るのが目安です。")],
+      fu=["どんな用途に使いたいですか。"], rel="大規模言語モデル", verbs="動かす,推論する")
 ]

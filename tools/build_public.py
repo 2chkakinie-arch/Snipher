@@ -32,7 +32,7 @@ FUNCS = ROOT / "functions"
 
 # Pages Function が *同期で読む* ファイルなので、大きくしすぎない（Workers の memory 上限）
 MAX_KB_BYTES = 4 * 1024 * 1024
-KEEP = ("id", "topic", "cat", "aliases", "def", "facts", "why", "how", "tips",
+KEEP = ("id", "topic", "cat", "aliases", "def", "en", "facts", "why", "how", "tips",
         "opinion", "qa", "followups", "related", "tags")
 
 

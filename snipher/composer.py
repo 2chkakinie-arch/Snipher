@@ -232,6 +232,33 @@ _NOMINAL_ENDS = ("こと", "もの", "はず", "ため", "ほど", "わけ", "�
                  "ばかり", "限り", "最中", "場合", "必要", "予定", "確認")
 
 
+def _mask_quoted(sentence: str) -> str:
+    """「」で囲まれた引用部をユニークな印に置き換える。
+
+    語を *説明する文*（「ぬるぬる猿」は「ぬるぬる」と「猿」を合わせた…）では、
+    説明対象の語が 2 回以上引用されて 2-gram が繰り返される。それは正当な引用なので、
+    ループ検査の前で引用部だけマスクする（各引用に番号を付けるので印自体は重複しない）。
+    """
+    if "「" not in sentence:
+        return sentence
+    out: list[str] = []
+    i, k = 0, 0
+    while i < len(sentence):
+        ch = sentence[i]
+        if ch == "「":
+            j = sentence.find("」", i + 1)
+            if j == -1:
+                out.append(sentence[i:])
+                break
+            k += 1
+            out.append(f"◆{k}◆")
+            i = j + 1
+        else:
+            out.append(ch)
+            i += 1
+    return "".join(out)
+
+
 def validate(text: str, *, max_len: int = 170, min_len: int = 6) -> tuple[bool, str]:
     """組み立てた文が日本語として成立しているかを検査する。→ (ok, 理由)"""
     t = (text or "").strip()
@@ -272,12 +299,14 @@ def validate(text: str, *, max_len: int = 170, min_len: int = 6) -> tuple[bool, 
         counts[sent] = counts.get(sent, 0) + 1
         if counts[sent] >= 3:
             return False, f"loop:{sent[:2]}×3"
-    # 2-gram の反復は文ごとに数える（文をまたいだ相同 2-gram をループと誤検知していた）
+    # 2-gram の反復は文ごとに数える（文をまたいだ相同 2-gram をループと誤検知していた）。
+    # 「ぬるぬる猿」のように *説明している語自体* を引用して繰り返す文は、引用部を
+    # マスクしてから数える（引用の反復は生成のループではない）。
     for sentence in re.split(r"[。！？!?]", t):
-        sentence = sentence.strip()
+        masked = _mask_quoted(sentence.strip())
         seen: dict[str, int] = {}
-        for i in range(len(sentence) - 1):
-            g = sentence[i:i + 2]
+        for i in range(len(masked) - 1):
+            g = masked[i:i + 2]
             if _ASCII_GRAM.match(g):
                 continue
             seen[g] = seen.get(g, 0) + 1
