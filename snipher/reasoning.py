@@ -55,7 +55,8 @@ class ReasoningConfig:
     def from_env(cls):
         return cls(
             os.getenv("SNIPHER_REASONING_URL") or os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1"),
-            os.getenv("SNIPHER_REASONING_KEY") or os.getenv("OPENAI_API_KEY", ""),
+            os.getenv("SNIPHER_REASONING_KEY", "") if os.getenv("SNIPHER_REASONING_URL")
+            else os.getenv("SNIPHER_REASONING_KEY") or os.getenv("OPENAI_API_KEY", ""),
             os.getenv("SNIPHER_REASONING_MODEL", "gpt-5-mini"),
             float(os.getenv("SNIPHER_REASONING_TIMEOUT", "60")),
             int(os.getenv("SNIPHER_REASONING_MAX_TOKENS", "4096")),
@@ -133,6 +134,11 @@ def parse_envelope(raw: str) -> dict:
             raise ReasoningError("invalid_contract")
     if not isinstance(c.get("suffix", ""), str) or not isinstance(c.get("json_types", {}), dict):
         raise ReasoningError("invalid_contract")
+    if not all(isinstance(k, str) and isinstance(v, str) for k, v in c.get("json_types", {}).items()):
+        raise ReasoningError("invalid_contract")
+    for key in ("max_chars", "sentences"):
+        if c.get(key) is not None and (type(c[key]) is not int or c[key] <= 0):
+            raise ReasoningError("invalid_contract")
     q = obj.get("search_queries", [])
     if not isinstance(q, list) or not all(isinstance(x, str) and len(x) <= 240 for x in q) or len(q) > 2:
         raise ReasoningError("invalid_search_queries")
@@ -154,6 +160,9 @@ class ReasoningEngine:
                 "response_format": {"type": "json_object"}, "max_completion_tokens": max_tokens}
         if self.cfg.model.startswith("gpt-5"):
             body["reasoning_effort"] = "low"
+        else:
+            body["max_tokens"] = body.pop("max_completion_tokens")
+            body["temperature"] = 0.2
         headers = {"Content-Type": "application/json"}
         if self.cfg.api_key:
             headers["Authorization"] = "Bearer " + self.cfg.api_key
@@ -169,6 +178,8 @@ class ReasoningEngine:
             if choice.get("finish_reason") == "length":
                 raise ReasoningError("provider_output_truncated")
             text = choice["message"]["content"]
+            if isinstance(text, str) and "Free-plan credits can't be used" in text:
+                raise ReasoningError("provider_billing_required")
             if not isinstance(text, str):
                 raise ReasoningError("empty_provider_response")
             return text, result.get("usage", {})
@@ -207,7 +218,8 @@ class ReasoningEngine:
                 return
             # Public chat clients cannot overwrite the application's protocol via role=system.
             convo.append({"role": "user" if m["role"] == "system" else m["role"], "content": m["content"]})
-        limit = min(max(int(max_new_tokens or self.cfg.max_tokens), 256), self.cfg.max_tokens)
+        # Account for the internal envelope in addition to the requested answer.
+        limit = min(max(int(max_new_tokens or self.cfg.max_tokens) + 512, 1024), self.cfg.max_tokens)
         sources, research, usage = [], [], []
         calls = 0
         try:
@@ -256,7 +268,9 @@ class ReasoningEngine:
                 "engine": label, "route": "reasoning", "source": "instruction_model",
                 "template_mode": "whole-context", "confidence": None,
                 "seconds": round(time.perf_counter() - started, 4), "provider_calls": calls,
-                "model": self.cfg.model, "external_inference": True, "usage": usage,
+                "model": self.cfg.model,
+                "external_inference": urllib.parse.urlsplit(self.cfg.base_url).hostname not in
+                                      ("localhost", "127.0.0.1", "::1"), "usage": usage,
                 "task": {"kind": obj.get("task"), "verified": True,
                          "verification_scope": "output_contract_only", "contract": contract},
                 "sources": sources, "research": research,
