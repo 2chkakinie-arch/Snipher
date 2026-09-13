@@ -3,163 +3,168 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Snipher — 軽くて、賢い。日本語AI</title>
-<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%236c8cff'/%3E%3Ctext x='16' y='23' font-size='19' text-anchor='middle' fill='white' font-family='sans-serif' font-weight='bold'%3ES%3C/text%3E%3C/svg%3E">
+<title>Snipher — 推論で解く、日本語AI</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='white'/%3E%3Ctext x='16' y='22' font-size='18' text-anchor='middle' fill='black' font-family='sans-serif' font-weight='900'%3ES%3C/text%3E%3C/svg%3E">
 <style>
   :root {
-    --bg: #0b0e1a;
-    --bg2: #111527;
-    --panel: #161b31;
-    --panel2: #1c2338;
-    --line: #262d4a;
-    --accent: #6c8cff;
-    --accent2: #9db4ff;
-    --text: #eceef8;
-    --muted: #9aa1bd;
-    --dim: #6b7390;
-    --user: #2b3a6e;
-    --ok: #4ade80;
-    --warn: #fbbf24;
-    --radius: 16px;
+    --bg: #000000;
+    --bg2: #050505;
+    --panel: #0a0a0a;
+    --panel2: #111111;
+    --panel3: #161616;
+    --line: #1e1e1e;
+    --line2: #2a2a2a;
+    --accent: #ffffff;
+    --accent2: #a1a1aa;
+    --text: #fafafa;
+    --muted: #71717a;
+    --dim: #52525b;
+    --user-bg: #18181b;
+    --user-line: #27272a;
+    --ok: #22c55e;
+    --warn: #eab308;
+    --radius: 14px;
   }
   * { box-sizing: border-box; }
   html, body { height: 100%; }
   body {
     margin: 0; color: var(--text);
-    font-family: "Hiragino Kaku Gothic ProN", "Noto Sans JP", "Yu Gothic", system-ui, sans-serif;
-    background: radial-gradient(1200px 600px at 80% -10%, #1b2350 0%, transparent 60%),
-                radial-gradient(900px 500px at 10% 110%, #14243f 0%, transparent 55%),
-                var(--bg);
+    font-family: "Geist", "Inter", "Hiragino Kaku Gothic ProN", "Noto Sans JP", system-ui, sans-serif;
+    background: var(--bg);
     display: flex; flex-direction: column; height: 100dvh;
     -webkit-font-smoothing: antialiased;
+    letter-spacing: -0.01em;
   }
-  /* ---------- header ---------- */
+  /* subtle grid */
+  body::before {
+    content: ""; position: fixed; inset: 0; pointer-events: none; opacity: 0.035;
+    background-image:
+      linear-gradient(var(--line) 1px, transparent 1px),
+      linear-gradient(90deg, var(--line) 1px, transparent 1px);
+    background-size: 32px 32px;
+  }
   header {
-    display: flex; align-items: center; gap: 12px;
-    padding: 12px 20px; border-bottom: 1px solid var(--line);
-    background: rgba(11, 14, 26, .72); backdrop-filter: blur(12px);
+    display: flex; align-items: center; gap: 14px;
+    padding: 14px 20px; border-bottom: 1px solid var(--line);
+    background: rgba(0,0,0,0.85); backdrop-filter: blur(16px) saturate(180%);
     position: sticky; top: 0; z-index: 10;
   }
   .logo {
-    width: 34px; height: 34px; border-radius: 10px; flex: none;
-    background: linear-gradient(135deg, var(--accent), #4a63d8);
-    display: grid; place-items: center; font-weight: 800; font-size: 19px;
-    box-shadow: 0 4px 18px rgba(108, 140, 255, .45);
+    width: 30px; height: 30px; border-radius: 8px; flex: none;
+    background: var(--accent); color: #000;
+    display: grid; place-items: center; font-weight: 900; font-size: 16px; letter-spacing: -0.05em;
   }
-  .brand { line-height: 1.25; }
-  .brand b { font-size: 1.02rem; letter-spacing: .4px; }
-  .brand small { display: block; color: var(--muted); font-size: .72rem; }
+  .brand { line-height: 1.1; }
+  .brand b { font-size: 0.95rem; font-weight: 700; letter-spacing: -0.02em; }
+  .brand small { display: block; color: var(--muted); font-size: 0.68rem; font-weight: 500; letter-spacing: 0.02em; text-transform: uppercase; margin-top: 1px; }
   .spacer { flex: 1; }
   .pill {
-    display: inline-flex; align-items: center; gap: 7px;
-    font-size: .75rem; color: var(--muted);
+    display: inline-flex; align-items: center; gap: 6px;
+    font-size: 0.70rem; font-weight: 500; color: var(--muted);
     border: 1px solid var(--line); border-radius: 999px;
-    padding: 5px 12px; background: var(--panel); white-space: nowrap;
+    padding: 4px 10px; background: var(--panel); white-space: nowrap; letter-spacing: 0.01em;
   }
-  .pill .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--dim); }
-  .pill.live .dot { background: var(--ok); box-shadow: 0 0 8px var(--ok); }
-  .pill.busy .dot { background: var(--warn); box-shadow: 0 0 8px var(--warn); }
+  .pill .dot { width: 6px; height: 6px; border-radius: 50%; background: var(--dim); }
+  .pill.live .dot { background: var(--ok); box-shadow: 0 0 6px var(--ok); }
+  .pill.busy .dot { background: var(--warn); box-shadow: 0 0 6px var(--warn); }
   select.mode {
     background: var(--panel); color: var(--text); border: 1px solid var(--line);
-    border-radius: 999px; padding: 6px 10px; font-size: .75rem; outline: none; cursor: pointer;
+    border-radius: 999px; padding: 5px 10px; font-size: 0.72rem; outline: none; cursor: pointer;
   }
-  /* ---------- chat ---------- */
-  main { flex: 1; overflow-y: auto; scroll-behavior: smooth; }
-  #thread { max-width: 820px; margin: 0 auto; padding: 28px 18px 24px; display: flex; flex-direction: column; gap: 22px; }
-  .msg { display: flex; gap: 11px; animation: rise .25s ease; }
-  @keyframes rise { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: none; } }
+  select.mode:focus { border-color: var(--line2); }
+  main { flex: 1; overflow-y: auto; scroll-behavior: smooth; position: relative; }
+  #thread { max-width: 760px; margin: 0 auto; padding: 32px 20px 28px; display: flex; flex-direction: column; gap: 24px; }
+  .msg { display: flex; gap: 12px; animation: rise 0.28s ease; }
+  @keyframes rise { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; transform: none; } }
   .avatar {
-    width: 32px; height: 32px; border-radius: 50%; flex: none; margin-top: 2px;
-    display: grid; place-items: center; font-size: .8rem; font-weight: 700;
+    width: 28px; height: 28px; border-radius: 50%; flex: none; margin-top: 2px;
+    display: grid; place-items: center; font-size: 0.72rem; font-weight: 700; letter-spacing: -0.02em;
   }
-  .msg.ai .avatar { background: linear-gradient(135deg, var(--accent), #4a63d8); color: #fff; }
+  .msg.ai .avatar { background: var(--text); color: #000; }
   .msg.user { flex-direction: row-reverse; }
-  .msg.user .avatar { background: var(--panel2); color: var(--accent2); border: 1px solid var(--line); }
+  .msg.user .avatar { background: var(--panel2); color: var(--muted); border: 1px solid var(--line); }
   .bubble { max-width: 88%; min-width: 0; }
   .msg.user .bubble {
-    background: linear-gradient(135deg, #33417e, #27315f);
-    border: 1px solid #3d4c96; border-radius: var(--radius) 6px var(--radius) var(--radius);
-    padding: 10px 15px; white-space: pre-wrap; word-break: break-word; line-height: 1.65;
+    background: var(--user-bg); border: 1px solid var(--user-line);
+    border-radius: var(--radius) 4px var(--radius) var(--radius);
+    padding: 11px 14px; white-space: pre-wrap; word-break: break-word; line-height: 1.65; font-size: 0.92rem;
   }
   .msg.ai .bubble {
-    background: var(--panel); border: 1px solid var(--line);
-    border-radius: 6px var(--radius) var(--radius) var(--radius);
-    padding: 13px 16px 11px; width: 100%;
+    background: transparent; border: none; padding: 2px 0 0; width: 100%;
   }
-  .body { line-height: 1.85; font-size: .94rem; word-break: break-word; }
-  .body p { margin: 0 0 .7em; }
+  .msg.ai .bubble .body {
+    background: var(--panel); border: 1px solid var(--line);
+    border-radius: 4px var(--radius) var(--radius) var(--radius);
+    padding: 14px 16px 12px;
+  }
+  .body { line-height: 1.85; font-size: 0.93rem; word-break: break-word; }
+  .body p { margin: 0 0 0.75em; }
   .body p:last-child { margin-bottom: 0; }
-  .body h1, .body h2, .body h3 { margin: .9em 0 .4em; line-height: 1.4; }
-  .body h1 { font-size: 1.15rem; } .body h2 { font-size: 1.05rem; } .body h3 { font-size: .98rem; }
-  .body ul, .body ol { margin: .4em 0 .8em; padding-left: 1.4em; }
-  .body li { margin: .25em 0; }
-  .body a { color: var(--accent2); }
-  .body code.ic { background: #0c0f20; border: 1px solid var(--line); border-radius: 6px;
-    padding: 1px 6px; font-size: .85em; font-family: ui-monospace, "SF Mono", Menlo, monospace; }
-  .codebox { margin: .7em 0; border: 1px solid var(--line); border-radius: 12px; overflow: hidden; background: #0a0d1c; }
+  .body h1, .body h2, .body h3 { margin: 1em 0 0.45em; line-height: 1.35; font-weight: 700; letter-spacing: -0.02em; }
+  .body h1 { font-size: 1.12rem; } .body h2 { font-size: 1.02rem; } .body h3 { font-size: 0.96rem; }
+  .body ul, .body ol { margin: 0.5em 0 0.9em; padding-left: 1.35em; }
+  .body li { margin: 0.3em 0; }
+  .body a { color: var(--text); text-decoration: underline; text-underline-offset: 3px; text-decoration-color: var(--line2); }
+  .body a:hover { text-decoration-color: var(--text); }
+  .body code.ic { background: var(--panel2); border: 1px solid var(--line); border-radius: 6px;
+    padding: 1px 6px; font-size: 0.82em; font-family: ui-monospace, "SF Mono", Menlo, monospace; }
+  .codebox { margin: 0.8em 0; border: 1px solid var(--line); border-radius: 12px; overflow: hidden; background: #050505; }
   .codebox .chead {
-    display: flex; align-items: center; gap: 8px; padding: 7px 12px;
-    background: var(--panel2); font-size: .72rem; color: var(--muted);
-    border-bottom: 1px solid var(--line); font-family: ui-monospace, Menlo, monospace;
+    display: flex; align-items: center; gap: 8px; padding: 8px 12px;
+    background: var(--panel2); font-size: 0.70rem; color: var(--muted);
+    border-bottom: 1px solid var(--line); font-family: ui-monospace, Menlo, monospace; letter-spacing: 0.02em;
   }
   .codebox .chead button {
-    margin-left: auto; background: transparent; border: 1px solid var(--line); color: var(--muted);
-    border-radius: 7px; font-size: .72rem; padding: 3px 10px; cursor: pointer;
+    margin-left: auto; background: var(--panel3); border: 1px solid var(--line); color: var(--muted);
+    border-radius: 7px; font-size: 0.70rem; padding: 4px 10px; cursor: pointer; transition: all 0.15s;
   }
-  .codebox .chead button:hover { color: var(--text); border-color: var(--accent); }
-  .codebox pre { margin: 0; padding: 12px 14px; overflow-x: auto; font-size: .83rem; line-height: 1.7;
-    font-family: ui-monospace, "SF Mono", Menlo, "Noto Sans Mono", monospace; }
-  /* 出典 favicon 行 */
-  .sources { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 11px; padding-top: 10px; border-top: 1px dashed var(--line); }
+  .codebox .chead button:hover { color: var(--text); border-color: var(--line2); background: var(--panel); }
+  .codebox pre { margin: 0; padding: 13px 14px; overflow-x: auto; font-size: 0.82rem; line-height: 1.7;
+    font-family: ui-monospace, "SF Mono", Menlo, monospace; }
+  .sources { display: flex; flex-wrap: wrap; gap: 7px; margin-top: 12px; padding-top: 10px; border-top: 1px solid var(--line); }
   .src {
-    display: inline-flex; align-items: center; gap: 7px; max-width: 240px;
-    background: #0e1226; border: 1px solid var(--line); border-radius: 999px;
-    padding: 4px 12px 4px 5px; font-size: .74rem; color: var(--muted);
-    text-decoration: none; transition: border-color .15s, color .15s;
+    display: inline-flex; align-items: center; gap: 6px; max-width: 220px;
+    background: var(--panel); border: 1px solid var(--line); border-radius: 999px;
+    padding: 4px 10px 4px 5px; font-size: 0.72rem; color: var(--muted);
+    text-decoration: none; transition: all 0.15s;
   }
-  .src:hover { border-color: var(--accent); color: var(--text); }
-  .src img { width: 20px; height: 20px; border-radius: 50%; background: #fff; flex: none; }
+  .src:hover { border-color: var(--line2); color: var(--text); background: var(--panel2); }
+  .src img { width: 18px; height: 18px; border-radius: 50%; background: #fff; flex: none; }
   .src span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-  .meta { margin-top: 9px; font-size: .7rem; color: var(--dim); display: flex; gap: 10px; flex-wrap: wrap; }
-  .thinking { display: inline-flex; align-items: center; gap: 9px; color: var(--muted); font-size: .85rem; padding: 6px 0; }
-  .spinner { width: 15px; height: 15px; border-radius: 50%; border: 2px solid var(--line);
-    border-top-color: var(--accent); animation: spin .7s linear infinite; }
+  .meta { margin-top: 8px; font-size: 0.68rem; color: var(--dim); display: flex; gap: 10px; flex-wrap: wrap; letter-spacing: 0.01em; }
+  .thinking { display: inline-flex; align-items: center; gap: 8px; color: var(--muted); font-size: 0.84rem; padding: 4px 0; }
+  .spinner { width: 14px; height: 14px; border-radius: 50%; border: 1.5px solid var(--line2);
+    border-top-color: var(--text); animation: spin 0.65s linear infinite; }
   @keyframes spin { to { transform: rotate(360deg); } }
-  .cursor::after { content: "▍"; color: var(--accent); animation: blink 1s steps(1) infinite; }
+  .cursor::after { content: "▍"; color: var(--text); animation: blink 1s steps(1) infinite; font-weight: 300; }
   @keyframes blink { 50% { opacity: 0; } }
-  /* ---------- hero / suggestions ---------- */
-  .hero { text-align: center; padding: 30px 10px 6px; }
-  .hero h1 { margin: 0; font-size: 1.7rem; letter-spacing: 1px;
-    background: linear-gradient(120deg, #fff, var(--accent2)); -webkit-background-clip: text; background-clip: text; color: transparent; }
-  .hero p { color: var(--muted); font-size: .86rem; margin: 8px 0 0; }
-  .chips { display: flex; flex-wrap: wrap; gap: 9px; justify-content: center; padding: 16px 4px 4px; }
-  .chip {
-    background: var(--panel); border: 1px solid var(--line); color: var(--text);
-    border-radius: 999px; padding: 8px 16px; font-size: .8rem; cursor: pointer; transition: all .15s;
-  }
-  .chip:hover { border-color: var(--accent); background: var(--panel2); transform: translateY(-1px); }
-  /* ---------- composer ---------- */
-  footer { border-top: 1px solid var(--line); background: rgba(11, 14, 26, .85); backdrop-filter: blur(12px); }
-  .composer { max-width: 820px; margin: 0 auto; padding: 14px 18px 8px; display: flex; gap: 10px; align-items: flex-end; }
+  .hero { text-align: center; padding: 44px 12px 8px; }
+  .hero h1 { margin: 0; font-size: 1.65rem; font-weight: 800; letter-spacing: -0.04em; color: var(--text); }
+  .hero p { color: var(--muted); font-size: 0.86rem; margin: 10px 0 0; line-height: 1.7; max-width: 520px; margin-inline: auto; }
+  .hero .sub { color: var(--dim); font-size: 0.74rem; margin-top: 14px; letter-spacing: 0.01em; }
+  footer { border-top: 1px solid var(--line); background: rgba(0,0,0,0.92); backdrop-filter: blur(16px) saturate(180%); }
+  .composer { max-width: 760px; margin: 0 auto; padding: 14px 20px 10px; display: flex; gap: 10px; align-items: flex-end; }
   #input {
     flex: 1; background: var(--panel); color: var(--text); border: 1px solid var(--line);
-    border-radius: 14px; padding: 12px 15px; font-size: .93rem; line-height: 1.6;
-    font-family: inherit; resize: none; max-height: 160px; outline: none;
+    border-radius: 14px; padding: 12px 14px; font-size: 0.92rem; line-height: 1.6;
+    font-family: inherit; resize: none; max-height: 160px; outline: none; transition: border-color 0.15s, box-shadow 0.15s;
   }
-  #input:focus { border-color: var(--accent); box-shadow: 0 0 0 3px rgba(108, 140, 255, .18); }
+  #input::placeholder { color: var(--dim); }
+  #input:focus { border-color: var(--line2); box-shadow: 0 0 0 2px rgba(255,255,255,0.06); }
   #send {
-    flex: none; width: 46px; height: 46px; border-radius: 14px; border: none; cursor: pointer;
-    background: linear-gradient(135deg, var(--accent), #4a63d8); color: #fff; font-size: 1.15rem;
-    box-shadow: 0 4px 16px rgba(108, 140, 255, .4); transition: transform .12s, opacity .12s;
+    flex: none; width: 44px; height: 44px; border-radius: 12px; border: 1px solid var(--line); cursor: pointer;
+    background: var(--text); color: #000; font-size: 1.05rem; font-weight: 700;
+    transition: transform 0.12s, opacity 0.12s, background 0.12s; display: grid; place-items: center;
   }
-  #send:hover:not(:disabled) { transform: translateY(-1px); }
-  #send:disabled { opacity: .45; cursor: default; }
-  .foot { text-align: center; color: var(--dim); font-size: .68rem; padding: 0 0 12px; }
-  .err { color: #fca5a5; font-size: .85rem; }
+  #send:hover:not(:disabled) { transform: translateY(-1px); background: #fff; }
+  #send:disabled { opacity: 0.35; cursor: default; }
+  .foot { text-align: center; color: var(--dim); font-size: 0.66rem; padding: 0 0 12px; letter-spacing: 0.02em; }
+  .err { color: #f87171; font-size: 0.85rem; }
   @media (max-width: 640px) {
     .brand small { display: none; }
     .pill.kb { display: none; }
     .bubble { max-width: 94%; }
+    #thread { padding: 24px 14px 20px; }
   }
 </style>
 </head>
@@ -167,14 +172,14 @@
 
 <header>
   <div class="logo">S</div>
-  <div class="brand"><b>Snipher</b><small>軽くて、賢い。日本語AI</small></div>
+  <div class="brand"><b>Snipher</b><small>Reasoning Engine</small></div>
   <div class="spacer"></div>
-  <span class="pill kb" id="kbPill" title="知識ベース"><span class="dot"></span><span id="kbText">知識ベース …</span></span>
+  <span class="pill kb" id="kbPill" title="知識ベース"><span class="dot"></span><span id="kbText">…</span></span>
   <span class="pill" id="stPill"><span class="dot"></span><span id="stText">接続中…</span></span>
   <select class="mode" id="mode" title="応答モード">
     <option value="auto">自動</option>
     <option value="fast">高速</option>
-    <option value="light">内蔵コア</option>
+    <option value="light">内蔵</option>
   </select>
 </header>
 
@@ -182,18 +187,18 @@
   <div id="thread">
     <div class="hero" id="hero">
       <h1>Snipher</h1>
-      <p>なんでも聞いてください — 質問・計算・コード・文章作成・最新情報の調査まで。<br>必要なときは自動でWebを調べ、出典つきで答えます。</p>
-      <div class="chips" id="chips"></div>
+      <p>推論で解く。高速なテンプレートではなく、確率と検索と熟考を重ねて<br>その場で日本語を組み立てます。</p>
+      <div class="sub">Gemma級確率生成 · リアルタイム・ステアリング · 並列熟考 · 無限知識波</div>
     </div>
   </div>
 </main>
 
 <footer>
   <div class="composer">
-    <textarea id="input" rows="1" placeholder="メッセージを入力…（Enterで送信 / Shift+Enterで改行）"></textarea>
-    <button id="send" title="送信">➤</button>
+    <textarea id="input" rows="1" placeholder="メッセージを入力…"></textarea>
+    <button id="send" title="送信">↑</button>
   </div>
-  <div class="foot">Snipher は内部の知識・計算・Web調査を組み合わせて回答を組み立てます。出典がある回答はロゴから確認できます。</div>
+  <div class="foot">Snipher v5 — 高速経路 + Gemma級LLM + 並列熟考 + リアルタイムWeb波</div>
 </footer>
 
 <script>
@@ -208,14 +213,20 @@ async function refreshStatus() {
   try {
     const r = await fetch("/api/status");
     const s = await r.json();
-    const assist = (s.hybrid && s.hybrid.assist) || "rule";
-    const label = assist === "lfm" ? "フルモデル稼働中" : assist === "light" ? "内蔵コア稼働中" : "高速コア稼働中";
-    txt.textContent = label;
+    const assist = (s.hybrid && s.hybrid.assist) || (s.gemma ? "gemma" : "rule");
+    const label = assist === "lfm" ? "フルモデル" : assist === "gemma" ? "Gemma級" : assist === "light" ? "内蔵コア" : "高速コア";
+    const gemma = s.gemma ? " · Gemma" : "";
+    const steer = s.steering ? " · ステアリング" : "";
+    txt.textContent = label + gemma + steer;
     pill.className = "pill live";
     const kb = s.knowledge || {};
     if (kb.topics) {
-      $("kbText").textContent = `知識 ${kb.topics}件`;
+      $("kbText").textContent = `${kb.topics} topics`;
       $("kbPill").classList.add("live");
+    }
+    // タイトルに無限知識の可視化
+    if (s.infinite_knowledge) {
+      $("kbPill").title = "無限知識 (リアルタイムWeb波 有効)";
     }
   } catch (e) {
     txt.textContent = "オフライン";
@@ -225,45 +236,28 @@ async function refreshStatus() {
 refreshStatus();
 setInterval(refreshStatus, 30000);
 
-/* ---------- 提案チップ ---------- */
-const SUGGESTS = ["ミームって何？", "12×34+56は？", "オセロを作って", "短い詩を書いて", "今日のニュースは？", "PythonでFizzBuzz"];
-for (const q of SUGGESTS) {
-  const b = document.createElement("button");
-  b.className = "chip"; b.textContent = q;
-  b.onclick = () => { input.value = q; send(); };
-  $("chips").appendChild(b);
-}
-
-/* ---------- markdown-lite レンダラ ---------- */
+/* ---------- markdown-lite ---------- */
 function esc(s) {
   return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
 }
 function renderMd(src) {
   const codes = [];
-  // コードブロックを退避
   let t = src.replace(/```(\w*)\n?([\s\S]*?)```/g, (_, lang, code) => {
     codes.push({ lang: lang || "text", code: code.replace(/\n$/, "") });
     return `\u0000CODE${codes.length - 1}\u0000`;
   });
   t = esc(t);
-  // 見出し
   t = t.replace(/^### (.+)$/gm, "<h3>$1</h3>").replace(/^## (.+)$/gm, "<h2>$1</h2>").replace(/^# (.+)$/gm, "<h1>$1</h1>");
-  // 箇条書き
   t = t.replace(/^(?:- |・)(.+)$/gm, "<li>$1</li>");
   t = t.replace(/(<li>.*<\/li>\n?)+/g, (m) => `<ul>${m}</ul>`);
   t = t.replace(/^\d+[.)] (.+)$/gm, "<li>$1</li>");
-  // 太字・インラインコード
   t = t.replace(/\*\*(.+?)\*\*/g, "<strong>$1</strong>");
   t = t.replace(/`([^`\n]+?)`/g, "<code class=\"ic\">$1</code>");
-  // URL 自動リンク
   t = t.replace(/(https?:\/\/[^\s<\)）」]+)/g, "<a href=\"$1\" target=\"_blank\" rel=\"noopener\">$1</a>");
-  // 段落
   t = t.split(/\n{2,}/).map((p) => /^\s*<(h\d|ul|li|\u0000)/.test(p) ? p : `<p>${p.replace(/\n/g, "<br>")}</p>`).join("");
-  // コードブロック復元
   t = t.replace(/\u0000CODE(\d+)\u0000/g, (_, i) => {
     const c = codes[Number(i)];
-    return `<div class="codebox"><div class="chead"><span>${esc(c.lang)}</span>` +
-      `<button onclick="copyCode(this)">コピー</button></div><pre><code>${esc(c.code)}</code></pre></div>`;
+    return `<div class="codebox"><div class="chead"><span>${esc(c.lang)}</span><button onclick="copyCode(this)">コピー</button></div><pre><code>${esc(c.code)}</code></pre></div>`;
   });
   return t;
 }
@@ -273,39 +267,28 @@ function copyCode(btn) {
     btn.textContent = "コピー済み"; setTimeout(() => (btn.textContent = "コピー"), 1400);
   });
 }
-
-/* ---------- 出典 favicon ---------- */
 function favicon(url) {
-  try {
-    const host = new URL(url).hostname;
-    return `https://www.google.com/s2/favicons?domain=${encodeURIComponent(host)}&sz=64`;
-  } catch (e) { return ""; }
+  try { const host = new URL(url).hostname; return `https://www.google.com/s2/favicons?domain=${encodeURIComponent(host)}&sz=64`; } catch (e) { return ""; }
 }
-function domainOf(url) {
-  try { return new URL(url).hostname.replace(/^www\./, ""); } catch (e) { return url; }
-}
+function domainOf(url) { try { return new URL(url).hostname.replace(/^www\./, ""); } catch (e) { return url; } }
 
-/* ---------- メッセージ描画 ---------- */
+/* ---------- メッセージ ---------- */
 function addUser(text) {
   const d = document.createElement("div");
   d.className = "msg user";
-  d.innerHTML = `<div class="avatar">あなた</div><div class="bubble"></div>`;
+  d.innerHTML = `<div class="avatar">U</div><div class="bubble"></div>`;
   d.querySelector(".bubble").textContent = text;
-  thread.appendChild(d);
-  scrollTop();
+  thread.appendChild(d); scrollTop();
 }
 function addAi() {
   const d = document.createElement("div");
   d.className = "msg ai";
-  d.innerHTML = `<div class="avatar">S</div><div class="bubble"><div class="body cursor"><span class="thinking"><span class="spinner"></span>考えています…</span></div><div class="sources" style="display:none"></div><div class="meta"></div></div>`;
-  thread.appendChild(d);
-  scrollTop();
-  return d;
+  d.innerHTML = `<div class="avatar">S</div><div class="bubble"><div class="body cursor"><span class="thinking"><span class="spinner"></span>推論中…</span></div><div class="sources" style="display:none"></div><div class="meta"></div></div>`;
+  thread.appendChild(d); scrollTop(); return d;
 }
 function scrollTop() { scroll.scrollTop = scroll.scrollHeight; }
 
 /* ---------- ローカルフォールバック ---------- */
-/* /api が無い環境でも同じ質問形式で答えるため、Pages に同梱した engine.mjs を使います。 */
 let localEngine = null;
 async function localReply(messages) {
   try {
@@ -315,29 +298,40 @@ async function localReply(messages) {
       localEngine = { mod, index: new mod.Index(kb) };
     }
     const out = localEngine.mod.respond(messages, { index: localEngine.index, turn: messages.length });
-    const pill = $("stPill");
-    if (pill) pill.innerHTML = `<b>Snipher</b> · pages (lite) · ${out.confidence ?? ""}`;
     return out.text || "";
-  } catch (err) {
-    return "";
-  }
+  } catch (err) { return ""; }
 }
 
-/* ---------- 送信 ---------- */
+/* ---------- 送信 (リアルタイム・ステアリング対応: 生成中でも追加入力可能) ---------- */
 let sending = false;
+let currentController = null;
 async function send() {
   const text = input.value.trim();
+  // 生成中に別プロンプトを送ったら、ステアリングとして干渉させる (止めない)
+  if (sending && text) {
+    try {
+      await fetch("/api/steer", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ text })
+      });
+      input.value = ""; input.style.height = "auto";
+      // ユーザー側にも小さく表示
+      const d = document.createElement("div");
+      d.className = "msg user"; d.style.opacity = "0.55";
+      d.innerHTML = `<div class="avatar">↗</div><div class="bubble" style="font-size:0.82rem">↗ ${esc(text)} (steer)</div>`;
+      thread.appendChild(d); scrollTop();
+      return;
+    } catch (e) { /* fall through */ }
+  }
   if (!text || sending) return;
   sending = true; sendBtn.disabled = true;
-  const hero = $("hero");
-  if (hero) hero.style.display = "none";
+  const hero = $("hero"); if (hero) hero.style.display = "none";
   input.value = ""; input.style.height = "auto";
   addUser(text);
   history.push({ role: "user", content: text });
   const node = addAi();
   const body = node.querySelector(".body"), srcBox = node.querySelector(".sources"), meta = node.querySelector(".meta");
   const pill = $("stPill"); pill.classList.add("busy");
-
   let acc = "", engine = "", stats = null, started = false;
   try {
     const res = await fetch("/api/chat", {
@@ -346,12 +340,9 @@ async function send() {
       body: JSON.stringify({ messages: history.slice(-12), mode: $("mode").value }),
     });
     if (!res.ok || !res.body) throw new Error(`HTTP ${res.status}`);
-    const reader = res.body.getReader();
-    const dec = new TextDecoder();
-    let buf = "";
+    const reader = res.body.getReader(); const dec = new TextDecoder(); let buf = "";
     for (;;) {
-      const { done, value } = await reader.read();
-      if (done) break;
+      const { done, value } = await reader.read(); if (done) break;
       buf += dec.decode(value, { stream: true });
       let idx;
       while ((idx = buf.indexOf("\n\n")) >= 0) {
@@ -362,55 +353,43 @@ async function send() {
           if (ev.type === "start") { engine = ev.engine || ""; }
           else if (ev.type === "delta") {
             if (!started) { started = true; body.innerHTML = ""; }
-            acc += ev.text || "";
-            body.innerHTML = renderMd(acc);
-            scrollTop();
-          }
-          else if (ev.type === "done") {
-            acc = ev.text || acc; stats = ev.stats || null;
-          }
+            acc += ev.text || ""; body.innerHTML = renderMd(acc); scrollTop();
+          } else if (ev.type === "done") { acc = ev.text || acc; stats = ev.stats || null; }
           else if (ev.type === "error") { acc = `エラー: ${ev.message || "不明"}`; }
         }
       }
     }
   } catch (e) {
-    // API が無い場所（静的ホストだけの Pages プレビュー）では、同梱の engine.mjs で答えます
     acc = await localReply(history.slice(-12));
-    if (!acc) acc = "通信に失敗しました。時間をおいてもう一度お試しください。";
+    if (!acc) acc = "通信に失敗しました。時間をおいてお試しください。";
     else { body.innerHTML = renderMd(acc); }
   }
   body.classList.remove("cursor");
-  body.innerHTML = acc.startsWith("エラー") || acc.startsWith("通信に")
-    ? `<p class="err">${esc(acc)}</p>` : renderMd(acc);
-  // 出典
+  body.innerHTML = acc.startsWith("エラー") || acc.startsWith("通信に") ? `<p class="err">${esc(acc)}</p>` : renderMd(acc);
   const sources = (stats && stats.sources) || [];
   if (sources.length) {
     srcBox.style.display = "flex";
     for (const s of sources.slice(0, 6)) {
-      const a = document.createElement("a");
-      a.className = "src"; a.href = s.url; a.target = "_blank"; a.rel = "noopener";
+      const a = document.createElement("a"); a.className = "src"; a.href = s.url; a.target = "_blank"; a.rel = "noopener";
       a.title = s.title || s.url;
-      const img = document.createElement("img");
-      img.src = favicon(s.url); img.alt = ""; img.loading = "lazy";
+      const img = document.createElement("img"); img.src = favicon(s.url); img.alt = ""; img.loading = "lazy";
       img.onerror = () => { img.style.display = "none"; };
-      const sp = document.createElement("span");
-      sp.textContent = s.title || domainOf(s.url);
-      a.appendChild(img); a.appendChild(sp);
-      srcBox.appendChild(a);
+      const sp = document.createElement("span"); sp.textContent = s.title || domainOf(s.url);
+      a.appendChild(img); a.appendChild(sp); srcBox.appendChild(a);
     }
   }
-  // メタ
   const bits = [];
   if (engine || (stats && stats.engine)) bits.push(esc(engine || stats.engine));
   if (stats && stats.seconds != null) bits.push(`${stats.seconds}秒`);
   if (stats && stats.confidence != null) bits.push(`確信度 ${stats.confidence}`);
-  if (bits.length) meta.textContent = bits.join(" ・ ");
+  if (stats && stats.gemma) bits.push("Gemma波");
+  if (stats && stats.realtime_web) bits.push("Web波");
+  if (bits.length) meta.textContent = bits.join(" · ");
   history.push({ role: "assistant", content: acc });
   pill.classList.remove("busy");
   sending = false; sendBtn.disabled = false;
   input.focus(); scrollTop();
 }
-
 sendBtn.onclick = send;
 input.addEventListener("keydown", (e) => {
   if (e.key === "Enter" && !e.shiftKey && !e.isComposing) { e.preventDefault(); send(); }

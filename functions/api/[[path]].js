@@ -118,6 +118,11 @@ export async function onRequest(context) {
     });
   }
 
+  if (url.pathname === "/api/steer") {
+    // Pages 静的デモではステアリングは no-op だが 200 を返す (前端の生成を止めない)
+    return jsonReply({ ok: true, queued: String((body && body.text) || ""), mode: "pages-lite" });
+  }
+
   if (url.pathname === "/api/answer") {
     try {
       const idx = await localIndex(env);

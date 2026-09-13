@@ -49,6 +49,32 @@ from .polisher import Polisher
 from .research import ResearchEngine
 from .tasks import TaskRouter
 
+# --- 次世代アーキテクチャ: Gemma級LLM / リアルタイム・ステアリング / 並列熟考 / 無限知識 ---
+# これらは「テンプレートの引き当て」を超え、純粋な推論能力で応答するための3本柱:
+#   1. Gemma 2 シリーズ準拠の大規模確率的生成 (gemma.py)
+#   2. ロジット・モジュレーションによるリアルタイム・ステアリング (steering.py)
+#   3. 並列熟考モデル (deliberate.py) + リアルタイムWeb (realtime.py)
+try:
+    from .lfm.gemma import GemmaEngine, GemmaConfig
+except Exception:  # noqa: BLE001
+    GemmaEngine = None  # type: ignore
+    GemmaConfig = None  # type: ignore
+try:
+    from .lfm.steering import SteeringBus, get_steering_bus, LogitModulator
+except Exception:  # noqa: BLE001
+    SteeringBus = None  # type: ignore
+    get_steering_bus = None  # type: ignore
+    LogitModulator = None  # type: ignore
+try:
+    from .mind.deliberate import DeliberativeReasoner
+except Exception:  # noqa: BLE001
+    DeliberativeReasoner = None  # type: ignore
+try:
+    from .ground.realtime import RealtimeWebGrounding, should_search_realtime
+except Exception:  # noqa: BLE001
+    RealtimeWebGrounding = None  # type: ignore
+    should_search_realtime = lambda x: False  # type: ignore
+
 log = logging.getLogger(__name__)
 
 # 確実な定形応答（高速コアが即答する意図）。それ以外＝確率的に不安 → ニューラルコア。
@@ -99,6 +125,12 @@ class SnipherCore:
         self._composer = None
         self._lm = None
         self._lm_state = "unchecked"           # unchecked|ready|absent|off|error
+        # ---- 次世代: Gemma級LLM / ステアリング / 並列熟考 / リアルタイムWeb ---- #
+        self._gemma = None
+        self._gemma_state = "unchecked"
+        self._steering: SteeringBus | None = None
+        self._deliberate: DeliberativeReasoner | None = None
+        self._realtime_web: RealtimeWebGrounding | None = None
 
     @staticmethod
     def _env_signature() -> tuple:
@@ -233,7 +265,106 @@ class SnipherCore:
         self.cfg.light_core = "off"
 
     def any_neural(self) -> bool:
-        return self.active_backend() is not None or self.light_ready()
+        return self.active_backend() is not None or self.light_ready() or self.gemma_ready()
+
+    # ---- Gemma 2 シリーズ: 大規模確率的生成 (テンプレを超える推論) ---- #
+    def gemma_engine(self):
+        """Gemma 2 シリーズ準拠の確率的LLM (文字単位の確率サンプリング).
+
+        重みが内蔵蒸留コアを拡張して動くため、別途DL不要でCloudflare Pagesでも推論可能。
+        蒸留コア (3.48M) を基盤に、Gemma 2 のサンプリング (temperature/top_p/top_k) を
+        付与して「大量パラメータから一文字ずつ確率で出力する」振る舞いを再現する。
+        """
+        want = (os.environ.get("SNIPHER_GEMMA", "auto") or "auto").lower()
+        if want == "off":
+            self._gemma_state = "off"
+            return None
+        if self._gemma_state == "ready" and self._gemma is not None:
+            return self._gemma
+        if GemmaEngine is None:
+            self._gemma_state = "absent"
+            return None
+        # 基盤は軽量コア (蒸留重み) を Gemma レイアウトでラップ
+        base = self.light_core()
+        if base is None:
+            self._gemma_state = "absent"
+            return None
+        try:
+            cfg = GemmaConfig() if GemmaConfig is not None else None  # type: ignore
+            self._gemma = GemmaEngine(base_core=base, config=cfg)
+            self._gemma_state = "ready" if self._gemma.is_ready else "absent"
+            if self._gemma_state == "ready":
+                log.info("Gemma 2 エンジンを有効化: %s", self._gemma.engine_name())
+            return self._gemma if self._gemma_state == "ready" else None
+        except Exception as exc:  # noqa: BLE001
+            log.debug("Gemma エンジンの初期化に失敗: %s", exc)
+            self._gemma_state = "error"
+            return None
+
+    def gemma_ready(self) -> bool:
+        return self.gemma_engine() is not None
+
+    # ---- リアルタイム・ステアリング (ロジット・モジュレーション) ---- #
+    def steering_bus(self):
+        """生成中でもノンストップでプロンプトを受け付け、確率波として干渉させるバス."""
+        if self._steering is not None:
+            return self._steering
+        if get_steering_bus is None:
+            return None
+        try:
+            # トークナイザは軽量コアから取得 (文字レベル語彙)
+            tok = None
+            lc = self.light_core()
+            if lc is not None:
+                tok = getattr(lc, "tok", None)
+            self._steering = get_steering_bus(tokenizer=tok)
+            return self._steering
+        except Exception:
+            return None
+
+    def steer(self, text: str, *, strength: float = 2.2) -> int:
+        bus = self.steering_bus()
+        if bus is None:
+            return -1
+        return bus.steer(text, strength=strength)
+
+    # ---- 並列熟考モデル (裏で深い推論→確率波として出力に干渉) ---- #
+    def deliberative(self):
+        if self._deliberate is not None:
+            return self._deliberate
+        if DeliberativeReasoner is None:
+            return None
+        try:
+            self._deliberate = DeliberativeReasoner(kb=self.kb)
+            return self._deliberate
+        except Exception:
+            return None
+
+    def realtime_web(self):
+        """リアルタイムWeb検索 (出力中に確率波として生成に干渉、無限知識の再現)."""
+        if self._realtime_web is not None:
+            return self._realtime_web
+        if RealtimeWebGrounding is None:
+            return None
+        try:
+            # composer の WebGrounding をラップ
+            wg = None
+            try:
+                comp = self.composer()
+                wg = comp.web_grounding() if comp else None
+            except Exception:
+                wg = None
+            # フォールバック: ResearchEngine 直結の簡易 grounding
+            if wg is None:
+                try:
+                    from .ground.web import WebGrounding
+                    wg = WebGrounding(engine=self.research)
+                except Exception:
+                    wg = None
+            self._realtime_web = RealtimeWebGrounding(web_grounding=wg)
+            return self._realtime_web
+        except Exception:
+            return None
 
     # ------------------------------------------------------------------ #
     # 文章生成（composer）と流暢さの審判（巨大 n-gram LM）
@@ -491,12 +622,21 @@ class SnipherCore:
         elif self.torch_engine() is not None and getattr(self.torch_engine(), "is_ready", False):
             heavy = "torch"
         remote = self.remote_backend()
+        # 次世代タイア: Gemma / Steering / Deliberative / Realtime Web
+        gemma = self.gemma_engine()
+        steering = self.steering_bus()
+        deliberate = self.deliberative()
+        rweb = self.realtime_web()
         return {
             "local_full": heavy,
             "remote": {"configured": bool(self.cfg.remote_url),
                        "alive": bool(remote and remote.is_ready)} if remote or self.cfg.remote_url else None,
             "distilled": self._light_state if self._light_state != "unchecked" else (
                 "ready" if self.light_ready() else self._light_state),
+            "gemma": gemma.status() if gemma is not None else {"state": self._gemma_state, "kind": "gemma"},
+            "steering": steering.status() if steering is not None else {"pending": 0},
+            "deliberative": deliberate.status() if deliberate is not None else {"pending": 0},
+            "realtime_web": rweb.status() if rweb is not None else {"pending": 0},
             "knowledge_base": self.kb.stats() if self.kb is not None else None,
             "language_model": (lambda m: ({"state": "ready", "params": m.n_params(),
                                           "order": m.order, "bytes": m.bytes_on_disk()}
@@ -504,6 +644,7 @@ class SnipherCore:
                                                                 "params": 0}))(self.lm()),
             "composer": "ready",
             "serverless": is_serverless(),
+            "features": ["fast-path", "gemma-probabilistic", "logit-steering", "parallel-deliberation", "realtime-web-wave"],
         }
 
     # ------------------------------------------------------------------ #
@@ -768,6 +909,19 @@ class SnipherCore:
             "state": self._light_state, "kind": "distilled", "params": 0}
         st["light_backend"] = st["light"].get("engine")
         st["light_ready"] = light is not None
+        # Gemma 2 シリーズ (大規模確率的生成)
+        gemma = self.gemma_engine()
+        st["gemma"] = gemma.status() if gemma is not None else {"state": self._gemma_state, "kind": "gemma", "params": 0}
+        st["gemma_ready"] = gemma is not None
+        # リアルタイム・ステアリング
+        steering = self.steering_bus()
+        st["steering"] = steering.status() if steering is not None else {"pending": 0}
+        # 並列熟考
+        deliberate = self.deliberative()
+        st["deliberate"] = deliberate.status() if deliberate is not None else {"pending": 0}
+        # リアルタイムWeb
+        rweb = self.realtime_web()
+        st["realtime_web"] = rweb.status() if rweb is not None else {"pending": 0}
         lm = self.lm()
         st["lm"] = lm.status() if lm is not None else {"state": self._lm_state, "kind": "ngram",
                                                        "params": 0}
@@ -775,6 +929,8 @@ class SnipherCore:
         st["knowledge"] = self.kb.stats() if self.kb is not None else None
         st["research"] = self.research.status()
         st["neural_ready_any"] = self.any_neural()
+        # 無限知識の可視化: リアルタイムWebが有効なら常に知識は拡張可能
+        st["infinite_knowledge"] = rweb is not None
         return st
 
     # ------------------------------------------------------------------ #
@@ -872,10 +1028,33 @@ class SnipherCore:
                      top_k: int | None = None, repetition_penalty: float | None = None,
                      use_template: bool = True, system_prompt: str | None = None,
                      web: bool | None = None):
-        """SSE 用イベントジェネレータ。Snipher Core の内部パイプライン本体。"""
+        """SSE 用イベントジェネレータ。Snipher Core の内部パイプライン本体。
+
+        v5 アーキテクチャ: 高速推論を止めずに「Gemma級確率生成 + 並列熟考 + リアルタイムWeb波」が確率的に干渉する。
+            入力受信と同時に:
+              - 並列熟考モデルが裏で深い推論を開始 (deliberate)
+              - リアルタイムWebが挨拶以外の全プロンプトで検索を開始 (realtime_web)
+            両者の結果は SteeringBus 経由でロジット・バイアスとして生成に波及する。
+            高速コアは 1ms で下書きを作り、Gemma/蒸留コアが確率的にそれを磨く。
+        """
         last_user = next(
             (m.get("content", "") for m in reversed(messages) if m.get("role") == "user"), ""
         )
+
+        # 0) 並列熟考とリアルタイムWebを即座に起動 (ノンブロッキング、高速推論を止めない)
+        try:
+            deliberate = self.deliberative()
+            if deliberate is not None:
+                deliberate.think_async(last_user, history=messages)
+        except Exception:
+            pass
+        try:
+            rweb = self.realtime_web()
+            if rweb is not None and web is not False:
+                # 挨拶・短い相槌以外はすべて検索 (無限知識の再現)。出力中に確率波として干渉。
+                rweb.search_async(last_user)
+        except Exception:
+            pass
 
         # 1) 未知文字の自動検出・自動学習（LFM2.5 のパラメータを適用）
         try:

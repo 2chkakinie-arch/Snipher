@@ -139,6 +139,21 @@ class DistilledCore:
     def _sample(self, logits: np.ndarray, rng: np.random.Generator, temperature: float,
                 top_k: int, penalty_ids: list[int], repetition_penalty: float) -> int:
         lg = logits.astype(np.float32).copy()
+        # --- リアルタイム・ステアリング: 確率の波をロジットに干渉 ---
+        # 生成中でもノンストップで受け取った介入プロンプト/Web検索結果を
+        # ロジット・バイアスとして加算する (出力を止めずにステア可能)
+        try:
+            from ..lfm.steering import get_steering_bus
+            bus = get_steering_bus(tokenizer=self.tok)
+            # bus が保持するバイアスを加算 (TTL/減衰付き)
+            signals = bus.poll() if bus is not None else []
+            if signals:
+                for sig in signals:
+                    for tid, v in (sig.bias or {}).items():
+                        if 0 <= tid < lg.shape[-1]:
+                            lg[tid] += float(v) * 0.55
+        except Exception:
+            pass
         if repetition_penalty and penalty_ids:
             for i in set(penalty_ids):
                 if lg[i] > 0:
