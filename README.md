@@ -11,7 +11,7 @@
 | 1 応答 | **中央値 1.66 ms**（19.5 応答/秒） | 秒単位 + GPU 推奨 |
 | 常駐 | **37 MiB** | GB 単位 |
 | 依存 | numpy（API は FastAPI） | transformers 系 |
-| 日本語の正しさ | `validate()` + n-gram + 規則の三重、通過率 100%（18 発話 × 3 ターン） | 生成次第 |
+| 日本語の正しさ | `validate()` + n-gram + 規則の三重、通過率 100%（18 発話 × 3 ターン, tools/bench.py） | 生成次第 |
 
 ```bash
 pip install -r requirements.txt
@@ -166,7 +166,7 @@ SNIPHER_EDGE_SEARCH_URL=...  # エンドポイント差し替え
 ## 9. テストと計測
 
 ```bash
-.venv/bin/python -m pytest -q          # 436 passed, 3 skipped
+.venv/bin/python -m pytest -q          # 437 passed, 3 skipped
 .venv/bin/python tools/bench.py        # 速度・常駐・規模・文章の健全性
 ```
 
