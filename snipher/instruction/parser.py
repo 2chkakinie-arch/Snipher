@@ -21,6 +21,7 @@ v3 までの応答は *発話全体を 1 つの話題* として扱っていま�
 
 from __future__ import annotations
 
+import json
 import re
 from dataclasses import dataclass, field
 
@@ -72,6 +73,17 @@ _IMPERATIVE_SENT = re.compile(
     r"列挙して|説明して|変換して|直して|修正して|評価して|比較して|分類して|翻訳して|訳して)"
     r"[。！!]?",
 )
+_IMPERATIVE_EN = re.compile(
+    r"\b(?:please\s+)?(answer|explain|summarize|summarise|list|write|extract|translate|"
+    r"describe|compare|convert|generate|create|output|return|provide|give|rewrite|count)\b",
+    re.IGNORECASE)
+_SENTENCES = re.compile(r"(?:([0-9０-９]+|[一二三四五六七八九十]+)\s*文(?:で|以内|以下|程度|くらい|に)|"
+                        r"in\s+([0-9]+)\s+sentences?|([0-9]+)\s*sentence\s+(?:answer|summary|reply))",
+                        re.IGNORECASE)
+_ARTIFACT = re.compile(r"(?:メール|電子メール|記事|レポート|報告書|文案|コピー|手紙|案内文|お詫び|"
+                       r"説明文|議事録|スピーチ|プレゼン|ポエム|詩|短文|作文|スローガン|見出し|タイトル|"
+                       r"essay|article|email|report|memo|paragraph|headline|slogan|speech)",
+                       re.IGNORECASE)
 _ROLE = re.compile(
     r"(?:あなた|君|きみ|お前|そちら|assistant|ai)\s*(?:は|って|として)\s*"
     r"[「『\"']?([^」』\"'。\n]{2,40})[」』\"']?\s*(?:という|の)?\s*"
@@ -100,6 +112,9 @@ _BULLETS = re.compile(
     rf"箇条書き\s*(?:で|にして)?\s*(?P<b>{_N})\s*(?:つ|個|本|点)|"
     rf"(?P<c>{_N})\s*(?:行|つ|個|ポイント|要点)\s*(?:で|以内に)?\s*(?:短く)?\s*"
     rf"(?:まとめて|要約して|まとめてください|書く|列挙して|挙げて|あげて)|"
+    rf"(?P<e>{_N})\s*(?:つ|個|本|点|行|件)\s*(?:を|に)?\s*"
+    rf"(?:箇条書き|ポイント|要点|リスト|ブルレット)?\s*(?:で|にして|に)?\s*"
+    rf"(?:列挙|挙げ|あげ|書|出|まとめ|要約|並べ|書き出し)|"
     rf"(?:ポイント|要点|項目|箇条書き)\s*(?:を|は)?\s*(?P<d>{_N})\s*(?:つ|個|本|点|つほど)"
     rf"(?:\s*(?:で|に)?\s*(?:短く)?\s*(?:まとめて|要約して|挙げ|あげ|列挙|書|出))?)",
     re.IGNORECASE,
@@ -164,11 +179,14 @@ _SUMMARY_WORDS = re.compile(
 _LIST_WORDS = re.compile(r"(?:列挙|列举|リストアップ|挙げて|あげて|並べて|書き出して|enumerate)", re.IGNORECASE)
 _TRANSLATE_WORDS = re.compile(r"(?:翻訳|訳して|訳し|に翻訳|translate)", re.IGNORECASE)
 _ANSWER_WORDS = re.compile(
-    r"(?:答えて|答えよ|回答して|回答せよ|応えて|解説して|説明して|教えて|述べて|説明せよ|answer|explain)",
+    r"(?:答えて|答えよ|回答して|回答せよ|応えて|解説して|説明して|教えて|述べて|説明せよ|"
+    r"answer|explain|describe|define|compare|discuss|elaborate)",
     re.IGNORECASE)
 _WRITE_WORDS = re.compile(
-    r"(?:を書いて|を書いてください|を書いて下さい|作成して|作文|エッセイ|記事を書いて|文案|コピーを考えて|"
-    r"write|compose)", re.IGNORECASE)
+    r"(?:を[^。\n]{0,24}(?:書いて|書き|作成して|作って|したためて|執筆し|まとめて)|"
+    r"(?:書いて|作成して|作って)(?:ください|下さい|くれ|ほしい|頂く|いただく)|"
+    r"を書いて|を書いてください|を書いて下さい|作成して|作文|エッセイ|記事を書いて|文案|"
+    r"コピーを考えて|write|compose|draft)", re.IGNORECASE)
 
 _KANJI_NUM = {"一": 1, "二": 2, "三": 3, "四": 4, "五": 5, "六": 6, "七": 7, "八": 8, "九": 9,
               "十": 10}
@@ -194,8 +212,10 @@ class FormatSpec:
     no_greeting: bool = False
     no_explanation: bool = False
     schema_fields: list[tuple[str, str]] = field(default_factory=list)   # [(key, hint)]
+    schema_template: str = ""            # JSON テンプレートそのもの（入れ子の形を保つ）
     indent: int = 2
     bullets: int = 0
+    sentences: int = 0                   # 「2文で」「in 2 sentences」
     bullet_char: str = "・"
     numbered: bool = False
     lines: int = 0
@@ -212,7 +232,9 @@ class FormatSpec:
     def as_dict(self) -> dict:
         return {"kind": self.kind or None, "strict": self.strict,
                 "schema": [k for k, _ in self.schema_fields],
-                "bullets": self.bullets or None, "numbered": self.numbered or None,
+                "schema_template": self.schema_template or None,
+                "bullets": self.bullets or None, "sentences": self.sentences or None,
+                "numbered": self.numbered or None,
                 "target_chars": self.target_chars or None, "length_kind": self.length_kind or None,
                 "max_chars": self.max_chars or None, "tone": self.tone or None,
                 "tone_words": self.tone_words or None, "no_greeting": self.no_greeting or None,
@@ -289,14 +311,41 @@ def find_json_templates(text: str) -> list[tuple[str, int, int]]:
     # 入れ子（外側が内側を含む）は外側だけ残す
     kept: list[tuple[str, int, int]] = []
     for body, a, b in out:
-        if any(a <= a2 and b2 <= b and (a, b) != (a2, b2) for _x, a2, b2 in out):
+        # ほかのテンプレートに *含まれている* ものは内側 → 捨てる
+        if any(a2 <= a and b <= b2 and (a, b) != (a2, b2) for _x, a2, b2 in out):
             continue
         kept.append((body, a, b))
     return kept
 
 
 def schema_fields(template: str) -> list[tuple[str, str]]:
-    """{"origin": "出発地", ...} → [("origin", "出発地"), ...]（順序を保つ）。"""
+    """{"origin": "出発地", ...} → [("origin", "出発地"), ...]（順序を保つ）。
+
+    入れ子（`"customer": {"name": "顧客名"}`）は *葉の欄* を返します。形そのものは
+    `FormatSpec.schema_template` に残してあるので、出力は入れ子のまま組み直せます。
+    """
+    try:
+        obj = json.loads(template)
+    except Exception:  # noqa: BLE001
+        obj = None
+    if isinstance(obj, (dict, list)):
+        leaves: list[tuple[str, str]] = []
+
+        def walk(node) -> None:
+            if isinstance(node, dict):
+                for k, v in node.items():
+                    if isinstance(v, (dict, list)):
+                        walk(v)
+                    elif k not in [x for x, _ in leaves]:
+                        leaves.append((str(k), str(v) if isinstance(v, str) else ""))
+            elif isinstance(node, list):
+                for it in node:
+                    walk(it)
+
+        walk(obj)
+        if leaves:
+            return leaves
+
     out: list[tuple[str, str]] = []
     for m in re.finditer(r'"([^"\n]{1,40})"\s*:\s*(?:"([^"\n]{0,80})"|(\[[^\]\n]*\])|(\{[^}\n]*\})|([^,\n}]+))',
                          template):
@@ -315,6 +364,14 @@ _FIELD_LIST_LABEL = re.compile(
     r"(?:項目|欄|キー|フィールド|columns?|fields?)\s*[：:]\s*([^\n]+)", re.IGNORECASE)
 _LATIN_HEADER = re.compile(
     r"^\s*([A-Za-z_][A-Za-z0-9_]*(?:\s*,\s*[A-Za-z_][A-Za-z0-9_]*)+)\s*$")
+
+
+def _is_sentence_list(body: str) -> bool:
+    """`項目：` の後ろが *欄名の列* ではなく *文* かどうか（材料をスキーマにしないため）。"""
+    src = str(body or "")
+    if re.search(r"(?:。|です|ます|だった|である|有名|完成|開業|開通|生まれた|住んで)", src):
+        return True
+    return len(src) > 60
 
 
 def _split_field_names(body: str) -> list[str]:
@@ -354,7 +411,7 @@ def parse_schema(text: str) -> tuple[list[tuple[str, str]], list[tuple[int, int]
             spans.append((m.start(1), m.end(1)))
             return [(n, "") for n in names], spans
     m = _FIELD_LIST_LABEL.search(t)
-    if m:
+    if m and not _is_sentence_list(m.group(1)):
         names = _split_field_names(m.group(1))
         if names:
             spans.append((m.start(1), m.end(1)))
@@ -378,6 +435,10 @@ def parse_format(text: str, *, schema: list[tuple[str, str]] | None = None) -> F
     f = FormatSpec()
     if schema:
         f.schema_fields = list(schema)
+    if not f.schema_template:
+        tmpl = find_json_templates(t)
+        if tmpl:
+            f.schema_template = tmpl[0][0]
 
     # ---- 形式 ---- #
     # 明示された形式（CSV / 表 / key: value）を *先に* 読みます。JSON テンプレートが
@@ -417,6 +478,11 @@ def parse_format(text: str, *, schema: list[tuple[str, str]] | None = None) -> F
         n = _num(raw)
         if n and 1 <= n <= 30:
             f.bullets = n
+    msent = _SENTENCES.search(t)
+    if msent and not f.bullets:
+        n = _num(next((g for g in msent.groups() if g), ""))
+        if n and 1 <= n <= 20:
+            f.sentences = n
     if _NUMBERED_WORD.search(t):
         f.numbered = True
     mline = re.search(r"([0-9０-９]+|[一二三四五六七八九十]+)\s*行\s*(?:で|以内|に)", t)
@@ -491,9 +557,17 @@ def parse_format(text: str, *, schema: list[tuple[str, str]] | None = None) -> F
                 f.tone_words.append(e)
 
     # ---- 言語 ---- #
-    m = re.search(r"(英語|日本語|中国語|韓国語|フランス語|ドイツ語|スペイン語|イタリア語|ロシア語)\s*(?:で|に)\s*(?:書いて|出力して|答えて|返して|訳して)", t)
+    m = re.search(r"(英語|日本語|中国語|韓国語|フランス語|ドイツ語|スペイン語|イタリア語|ロシア語)\s*(?:で|に)\s*(?:書いて|出力して|答えて|返して|訳して|説明して|まとめて)", t)
     if m:
         f.language = m.group(1)
+    else:
+        m2 = re.search(r"\bin\s+(english|japanese|chinese|korean|french|german|spanish|"
+                       r"italian|russian)\b", t, re.IGNORECASE)
+        if m2:
+            f.language = {"english": "英語", "japanese": "日本語", "chinese": "中国語",
+                          "korean": "韓国語", "french": "フランス語", "german": "ドイツ語",
+                          "spanish": "スペイン語", "italian": "イタリア語",
+                          "russian": "ロシア語"}[m2.group(1).lower()]
 
     # ---- 出力ルール: 指示層の厳密な読みを先に、既存コンパイラは形の話だけ ---- #
     # `compile_rules` の require/forbid は緩く拾うので（「〜を要約してください」まで
@@ -533,6 +607,15 @@ _FORBID = re.compile(
     r"入れない|含めない)")
 
 
+_Q = r"[「『\"\'“][^「」『』\"\'“”\n]{1,40}[」』\"\'”]"
+_QUOTE_RUN = re.compile(_Q + r"(?:\s*(?:[とや、,]\s*)?" + _Q + r")*")
+_REQUIRE_TAIL = re.compile(r"^(?:という(?:語|単語|文字列|言葉)?\s*)?(?:を|は|も)?\s*"
+                           r"(?:含め|入れ|使い|使用し|記載|書い|書く|入れよ|残し|残せ)")
+_FORBID_TAIL = re.compile(r"^(?:という(?:語|単語|文字列|言葉)?\s*)?(?:を|は|も)?\s*"
+                          r"(?:含めな|入れな|使わ|使用しな|書か|禁じ|なしで|無しで|不要|"
+                          r"入れない|含めない|避け|やめ|出すな|述べるな)")
+
+
 def read_output_rules(text: str) -> list[Rule]:
     """「必ず「X」を含めて」「Xは書かない」を *引用符の中身そのもの* として読む。
 
@@ -542,14 +625,27 @@ def read_output_rules(text: str) -> list[Rule]:
     """
     t = str(text or "")
     out: list[Rule] = []
+
+    def add(kind: str, val: str, raw: str) -> None:
+        val = str(val or "").strip(" 　。、,.!?！？")
+        if not val or any(r.kind == kind and r.value == val for r in out):
+            return
+        out.append(Rule(kind=kind, value=val, raw=raw, hard=True))
+
+    # 引用符の *並び*（「すごい」「素晴らしい」という言葉は使わない）→ 中の語を全部拾う
+    for m in _QUOTE_RUN.finditer(t):
+        tail = t[m.end():m.end() + 30]
+        kind = "require" if _REQUIRE_TAIL.match(tail) else (
+            "forbid" if _FORBID_TAIL.match(tail) else "")
+        if not kind:
+            continue
+        for q in re.findall(r"[「『\"\'“]([^「」『』\"\'“”\n]{1,40})[」』\"\'”]", m.group(0)):
+            add(kind, q, m.group(0))
+
+    # 引用符の無い形（`αという語を含めて`）と、1 引用 + 動詞の形
     for pat, kind in ((_REQUIRE, "require"), (_FORBID, "forbid")):
         for m in pat.finditer(t):
-            val = (m.group(1) or m.group(2) or "").strip(" 　。、,.!?！？")
-            if not val:
-                continue
-            if any(r.kind == kind and r.value == val for r in out):
-                continue
-            out.append(Rule(kind=kind, value=val, raw=m.group(0), hard=True))
+            add(kind, (m.group(1) or m.group(2) or ""), m.group(0))
     return out
 
 
@@ -675,9 +771,12 @@ def parse_role(text: str) -> str:
     return ""
 
 
-#: ラベルの無い問い（「〜とは何ですか？」）も行として拾う
+#: ラベルの無い問い（「〜とは何ですか？」/ `What is …?`）も行として拾う
 _BARE_QUESTION_LINE = re.compile(r"([^\n]{4,80}?(?:とは何ですか|とはなんで|は何ですか|って何ですか|"
                                  r"とは何ですか|ですか|でしょうか)[？?]?)")
+_EN_QUESTION_LINE = re.compile(
+    r"((?:what|why|how|who|when|where|which|is|are|can|could|does|do|did|will|should)\b"
+    r"[^\n]{2,90}\?)", re.IGNORECASE)
 
 
 def parse_question(text: str) -> str:
@@ -691,6 +790,11 @@ def parse_question(text: str) -> str:
         m2 = _BARE_QUESTION_LINE.search(line)
         if m2 and not re.search(r"(?:してください|して下さい|ください|せよ|しろ)$", m2.group(1)):
             return m2.group(1).strip("「」『』 　。、")
+    # 英語の 1 通（`What is photosynthesis? Answer in English in 2 sentences.`）
+    for line in [x.strip() for x in re.split(r"(?<=[.!?])\s+", t) if x.strip()]:
+        m3 = _EN_QUESTION_LINE.match(line)
+        if m3:
+            return m3.group(1).strip()
     return ""
 
 
@@ -732,6 +836,16 @@ def function_spec(text: str) -> tuple[str, list[str]]:
 def classify_task(instruction: str, fmt: FormatSpec, *, payload: str = "", question: str = "") -> str:
     t = str(instruction or "")
     structured = fmt.kind in ("json", "csv", "table", "keyvalue")
+
+    def _last(pat) -> int:
+        hits = list(pat.finditer(t))
+        return hits[-1].start() if hits else -1
+
+    # 「都市名を抽出し、それを箇条書きで列挙して」→ 成果物は *最後* の動詞の形（列挙）
+    p_ex, p_list, p_sum = _last(_EXTRACT_WORDS), _last(_LIST_WORDS), _last(_SUMMARY_WORDS)
+    if p_list >= 0 and p_list > max(p_ex, p_sum) and (payload or question or fmt.bullets) \
+            and not (structured and fmt.schema_fields):
+        return "list"
     if fmt.schema_fields and (structured or _EXTRACT_WORDS.search(t) or _JSON_WORD.search(t)):
         return "extract"
     if _EXTRACT_WORDS.search(t) and (structured or payload):
@@ -775,6 +889,10 @@ def classify_task(instruction: str, fmt: FormatSpec, *, payload: str = "", quest
 
 def _imperatives(text: str) -> list[str]:
     seen: list[str] = []
+    for m in _IMPERATIVE_EN.finditer(text or ""):      # 英語の命令文（Answer in English …）
+        v = m.group(1).lower()
+        if v not in seen:
+            seen.append(v)
     for m in _IMPERATIVE_SENT.finditer(text or ""):
         body = m.group(0).strip("。！! ")
         tail = body[-6:]
@@ -794,7 +912,8 @@ _TASK_VERBS = ("要約", "まとめ", "抽出", "出力", "書いて", "作成",
                "取り除", "除い", "置き換え", "整形",
                "全角", "半角", "文字数",
                "summarize", "extract", "output", "write", "implement", "create", "list",
-               "translate", "convert", "reverse")
+               "translate", "convert", "reverse", "answer", "explain", "describe", "compare",
+               "generate", "provide", "rewrite", "define", "discuss", "elaborate")
 
 
 def _task_verbs(text: str) -> list[str]:
@@ -874,6 +993,22 @@ def parse(text: str, *, min_score: float = 0.55) -> Directive | None:
     if role:
         score += 0.12
         signals.append(f"role:{role}")
+    if _ARTIFACT.search(instruction or raw):
+        score += 0.12
+        signals.append("artifact")
+    if task == "write":
+        score += 0.20                       # 成果物（メール/記事/報告書）を名指しした依頼
+        signals.append("write:deliverable")
+    if fmt.sentences:
+        score += 0.10
+        signals.append(f"sentences:{fmt.sentences}")
+    if fmt.language and task in ("answer", "summarize", "write", "list", "transform"):
+        score += 0.12                       # 「英語で答えて」＝出力言語の指定
+        signals.append(f"out-lang:{fmt.language}")
+    if verbs and (fmt.bullets or fmt.sentences or fmt.lines or fmt.max_chars
+                  or fmt.target_chars or fmt.kind or fmt.language):
+        score += 0.10                       # 命令 + 出力仕様が揃っている形
+        signals.append("imperative+spec")
     if task == "transform" and payload:
         # 「材料 + 操作」の形が揃っていれば、それは指示です（会話ではない）
         score += 0.14

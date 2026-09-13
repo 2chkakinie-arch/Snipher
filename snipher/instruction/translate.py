@@ -32,7 +32,21 @@ _TIME: dict[str, str] = {
     "いつも": "always", "時々": "sometimes",
     "よく": "often", "あまり": "not much", "とても": "very", "少し": "a little",
     "もう": "already", "まだ": "yet", "すぐ": "soon", "初めて": "for the first time",
+    "約": "about", "およそ": "about", "大体": "roughly", "だいたい": "roughly",
+    "ちょうど": "exactly", "ほぼ": "almost", "毎朝": "every morning", "毎晩": "every evening",
+    "先週": "last week", "先日": "the other day", "昨晩": "last night",
 }
+
+#: 数 + 助数詞（2時間 / 3日 / 120円）→ 英語の数量
+_COUNTER = {
+    "時間": "hours", "分": "minutes", "秒": "seconds", "日": "days", "週間": "weeks",
+    "週": "weeks", "か月": "months", "ヶ月": "months", "月": "months", "年": "years",
+    "円": "yen", "台": "units", "個": "pieces", "件": "items", "枚": "sheets",
+    "本": "bottles", "人": "people", "回": "times", "歳": "years old", "キロ": "kilometers",
+    "メートル": "meters", "km": "kilometers", "分間": "minutes", "時間半": "and a half hours",
+}
+_NUM_COUNTER = re.compile(r"([0-9０-９]+)\s*(" + "|".join(
+    sorted((re.escape(k) for k in _COUNTER), key=len, reverse=True)) + r")")
 
 _NOUNS: dict[str, str] = {
     "天気": "the weather", "雨": "rain", "雪": "snow", "風": "the wind", "空": "the sky",
@@ -110,11 +124,17 @@ _VERBS: dict[str, tuple[str, str]] = {
     "乗る": ("ride", "rode"), "降りる": ("get off", "got off"), "撮る": ("take", "took"),
     "歌う": ("sing", "sang"), "踊る": ("dance", "danced"), "手伝う": ("help", "helped"),
     "調べる": ("look up", "looked up"), "予約する": ("reserve", "reserved"),
+    "かかる": ("take", "took"), "訪れる": ("visit", "visited"), "過ごす": ("spend", "spent"),
+    "楽しむ": ("enjoy", "enjoyed"), "泊まる": ("stay", "stayed"), "出発する": ("depart", "departed"),
+    "到着する": ("arrive", "arrived"), "戻る": ("return", "returned"), "向かう": ("head", "headed"),
+    "過ごす": ("spend", "spent"), "見物する": ("sightsee", "went sightseeing"),
+    "食べる": ("eat", "ate"), "注文する": ("order", "ordered"),
     "勉強する": ("study", "studied"), "散歩する": ("take a walk", "took a walk"),
     "買い物する": ("go shopping", "went shopping"),
 }
 
-_SA_SURU = ("勉強", "散歩", "買い物", "予約", "運動", "仕事", "食事", "料理", "掃除", "洗濯")
+_SA_SURU = ("勉強", "散歩", "買い物", "予約", "運動", "仕事", "食事", "料理", "掃除", "洗濯",
+            "出発", "到着", "注文", "見物", "観光", "連絡", "準備", "説明")
 
 _PARTICLES: dict[str, str] = {
     "は": "", "が": "", "を": "", "に": "to", "へ": "to", "で": "at", "と": "with",
@@ -306,7 +326,13 @@ def _en_of(surface: str, kind: str) -> str:
 
 def _next_token(src: str, i: int, unknown: list[str]) -> dict:
     n = len(src)
-    for size in range(min(8, n - i), 1, -1):
+    mq = _NUM_COUNTER.match(src, i)
+    if mq:                                     # 2時間 → 2 hours の形（数はそのまま）
+        num, unit = mq.group(1), mq.group(2)
+        en = f"{num} {_COUNTER[unit]}"
+        return {"surface": mq.group(0), "kind": "quantity", "en": en,
+                "len": mq.end() - mq.start()}
+    for size in range(min(8, n - i), 0, -1):   # 1 文字の助詞（は・が・を・に）もここで拾う
         cand = src[i:i + size]
         if cand in _TOK:
             kind = _TOK[cand]
@@ -327,14 +353,18 @@ def _next_token(src: str, i: int, unknown: list[str]) -> dict:
         if rom:
             unknown.append(cand)
             return {"surface": cand, "kind": "unk", "en": rom, "len": size}
-    cand = src[i]
-    if cand in _TOK:
-        kind = _TOK[cand]
-        return {"surface": cand, "kind": kind, "en": _en_of(cand, kind), "len": 1}
-    if cand.strip(" 　。、！？!?"):
-        unknown.append(cand)
-        return {"surface": cand, "kind": "unk", "en": _romaji(cand) or cand, "len": 1}
-    return {"surface": cand, "kind": "punct", "en": "", "len": 1}
+    # 対応表にも語彙バンクにも無い連続 → 次の既知語の手前までを 1 語として残す
+    run_end = min(n, i + 8)
+    for j in range(i + 1, min(n, i + 9)):
+        if any(src[j:j + k] in _TOK for k in range(min(6, n - j), 1, -1)):
+            run_end = j
+            break
+    chunk = src[i:run_end].strip(" 　。、！？!?")
+    if chunk:
+        unknown.append(chunk)
+        rom = _romaji(chunk)
+        return {"surface": chunk, "kind": "unk", "en": rom or chunk, "len": run_end - i}
+    return {"surface": src[i], "kind": "punct", "en": "", "len": 1}
 
 
 def _tokens(clause: str, unknown: list[str]) -> list[dict]:
@@ -416,6 +446,9 @@ def _clause_en(clause: str, ctx: dict, unknown: list[str]) -> str:
     toks = _tokens(clause, unknown)
     if not toks:
         return ""
+    if re.search(r"(?:て|で)$", str(clause).strip("。、 ")) and any(
+            t["kind"] == "verb" for t in toks):
+        ctx["te"] = True                       # 〜て、＝動作の連続（and でつなぐ）
     fr = _frame(toks)
 
     # 主題が時間の語だけ（今日は / 明日は）→ 副詞として前に出す
@@ -430,6 +463,15 @@ def _clause_en(clause: str, ctx: dict, unknown: list[str]) -> str:
     subj = subj or (ctx.get("subject") or "")
 
     pred_toks = fr["mod"] + fr["tail"]
+    if fr["verb"] and (fr["verb"].get("stem") or "") == "かかる":
+        qty = [t for t in toks if t["kind"] == "quantity"]
+        by = _np(fr["loc"]) or (_np(fr["dest"][0]) if fr["dest"] else "")
+        amount = " ".join(str(t.get("en") or "") for t in qty).strip()
+        line = f"It took {amount}" if amount else "It took some time"
+        if by:
+            line += f" by {by}"
+        return line
+
     if fr["verb"]:
         v = fr["verb"]
         stem = v.get("stem") or ""
@@ -440,6 +482,9 @@ def _clause_en(clause: str, ctx: dict, unknown: list[str]) -> str:
         pieces = [vp]
         if fr["object"]:
             pieces.append(_np(fr["object"]))
+        elif [t for t in toks if t["kind"] == "quantity"] and stem in ("過ごす", "待つ", "食べる"):
+            pieces.append(" ".join(str(t.get("en") or "") for t in toks
+                                   if t["kind"] == "quantity"))
         if fr["dest"]:
             if len(fr["dest"]) >= 2 and stem == "行く":
                 pieces.append(f"to {_np(fr['dest'][0])} for {_np(fr['dest'][1])}")
@@ -510,16 +555,25 @@ def to_english(source: str) -> tuple[str, list[str]]:
                 rest = [_clause_en(q, ctx, unknown) for q in parts[i + 1:]]
                 tail = ", and ".join(x for x in rest if x)
                 if reason and tail:
-                    pieces.append(f"{reason}, so {tail}")
+                    pieces.append(("", f"{reason}, so {tail}"))
                 elif reason or tail:
-                    pieces.append(reason or tail)
+                    pieces.append(("", reason or tail))
                 break
+            ctx.pop("te", None)
             piece = _clause_en(p, ctx, unknown)
             if piece:
-                pieces.append(piece)
+                pieces.append(("and" if ctx.get("te") else "", piece))
             i += 1
         front = " ".join(ctx.get("times") or [])
-        line = ", ".join(x for x in pieces if x)
+        joined: list[str] = []
+        for _conj, piece in pieces:
+            if not piece:
+                continue
+            if _conj == "and" and joined:
+                joined[-1] = joined[-1] + ", and " + piece
+            else:
+                joined.append(piece)
+        line = ", ".join(joined)
         line = re.sub(r"\s+", " ", f"{front}, {line}" if front and line else (line or front)).strip()
         line = line.strip(", ").strip()
         if not line:
