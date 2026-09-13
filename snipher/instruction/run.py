@@ -77,19 +77,51 @@ def _default_kb(kb):
 def _do_extract(d: Directive) -> dict:
     schema = d.fmt.schema_fields
     payload = d.payload or d.question or d.raw
-    if not schema:
-        # スキーマが無い抽出依頼 → 材料から読めた値を key: value で返す
-        cands = _extract.candidates(payload)[:8]
-        schema = [(f"field{i + 1}", "") for i in range(len(cands))]
-        values = {k: c["surface"] for k, c in zip([k for k, _ in schema], cands)}
-        missing: list[str] = []
-        trace = {"candidates": [{"kind": c["kind"], "surface": c["surface"]} for c in cands]}
-    else:
-        values, missing, trace = _extract.extract_fields(payload, schema)
     kind = d.fmt.kind or "json"
+    if not schema:
+        # スキーマが無い抽出依頼 → *材料に書いてあるラベル/主語* を欄名にする（field1 は作らない）
+        labels = _extract.label_values(payload) or dict(_extract.subject_values(payload))
+        if labels:
+            schema = [(k, k) for k in list(labels)[:12]]
+            values = {k: labels[k] for k, _ in schema}
+            missing: list[str] = []
+            trace = {"via": "labels", "candidates": []}
+        else:
+            cands = _extract.candidates(payload)[:8]
+            schema = [(f"field{i + 1}", "") for i in range(len(cands))]
+            values = {k: c["surface"] for k, c in zip([k for k, _ in schema], cands)}
+            missing = []
+            trace = {"via": "candidates",
+                     "candidates": [{"kind": c["kind"], "surface": c["surface"]} for c in cands]}
+        text = _extract.render_table(values, schema, kind, indent=d.fmt.indent)
+        return {"text": text, "values": values, "missing": missing, "trace": trace, "kind": kind,
+                "rows": [values], "confidence": 0.94 if values else 0.6}
+
+    # 材料が *複数の記録*（りんごは1個120円。みかんは1個80円。）なら行を増やす
+    rows = _extract.extract_records(payload, schema)
+    if len(rows) >= 2 and kind in ("table", "csv", "markdown", "json"):
+        filled = [k for r in rows for k, v in r.items() if str(v).strip()]
+        missing = [k for k, _ in schema if not any(str(r.get(k, "")).strip() for r in rows)]
+        text = _extract.render_rows(rows, schema, kind, indent=d.fmt.indent)
+        return {"text": text, "values": rows[0], "rows": rows, "missing": missing,
+                "trace": {"via": "records", "rows": len(rows), "filled": len(filled)},
+                "kind": kind, "confidence": 0.94 if not missing else 0.84}
+
+    values, missing, trace = _extract.extract_fields(payload, schema)
+    # 欄名が材料のラベルと一致するなら、ラベルの値をそのまま使う（取り違えを防ぐ）
+    labels = _extract.label_values(payload)
+    if labels:
+        for key, hint in schema:
+            for lab, val in labels.items():
+                if not str(values.get(key, "")).strip() and _extract._same_field(lab, key, hint):
+                    values[key] = val
+                    if key in missing:
+                        missing.remove(key)
+                    trace.setdefault("labels", {})[key] = lab
+                    break
     text = _extract.render_table(values, schema, kind, indent=d.fmt.indent)
-    return {"text": text, "values": values, "missing": missing, "trace": trace, "kind": kind,
-            "confidence": 0.96 if not missing else 0.86}
+    return {"text": text, "values": values, "rows": [values], "missing": missing, "trace": trace,
+            "kind": kind, "confidence": 0.96 if not missing else 0.86}
 
 
 def _do_summarize(d: Directive, *, room_bonus: int = 0) -> dict:
@@ -106,9 +138,12 @@ def _do_summarize(d: Directive, *, room_bonus: int = 0) -> dict:
 
 
 def _do_code(d: Directive) -> dict:
-    explain = not (d.fmt.no_explanation and d.fmt.strict)
-    explain = explain or bool(re.search(r"解説|説明|コメント", d.raw))
+    # 「解説は不要」のような *打ち消し* に反応して解説を足さない（no_explanation が勝つ）
+    explain = not bool(d.fmt.no_explanation)
+    if not explain and not re.search(r"(?:解説|説明|コメント)(?:は|も)?(?:不要|いらない|なし|省略)", d.raw):
+        explain = bool(re.search(r"(?:解説|説明|コメント)(?:を|も)?(?:加えて|してください|付けて|付きで)", d.raw))
     got = _code.run(d, explain=explain)
+    got["explain"] = explain
     return got
 
 
@@ -146,9 +181,20 @@ def _transform_query(target: str, instruction: str) -> str:
     return f"{target}\n{instruction}".strip()
 
 
-def _do_transform(d: Directive) -> dict:
-    """文字・語の変換（既存の solve 層が実際に計算する）。"""
+def _do_transform(d: Directive, *, kb=None) -> dict:
+    """文字・語の変換（翻訳は訳文を作り、それ以外は既存の solve 層が実際に計算する）。"""
     from ..solve import text as textops
+    from . import translate as _tr
+
+    instruction = str(d.instruction or "")
+    if _tr.is_translation_request(instruction) or _tr.is_translation_request(d.raw):
+        material = (d.payload or d.question or "").strip()
+        if material:
+            tgt = _tr.detect_target(instruction or d.raw, source=material)
+            body, notes = _tr.translate(material, tgt)
+            if body.strip():
+                return {"text": body.strip(), "confidence": 0.9, "notes": notes,
+                        "kind": "translate", "verified": True, "target": tgt}
 
     target = (d.payload or d.question or "").strip()
     query = _transform_query(target, d.instruction) if target else d.raw
@@ -203,7 +249,7 @@ def execute(d: Directive, *, kb=None, web=None, history=None, lm=None, core=None
     if task == "answer":
         return _do_answer(d, kb=kb, web=web, history=history, lm=lm, core=core, turn=turn)
     if task == "transform":
-        return _do_transform(d)
+        return _do_transform(d, kb=kb)
     if task == "list":
         return _do_list(d, kb=kb, web=web, history=history)
     if task == "write":
@@ -233,6 +279,62 @@ def check_text(text: str) -> tuple[bool, str]:
     except Exception:  # noqa: BLE001
         pass
     return True, "ok"
+
+
+def _insert_required(body: str, val: str) -> str:
+    """指定の語を、材料をねじ曲げない形で入れる（最初の文の話題として前に置く）。"""
+    lines = str(body or "").split("\n")
+    for i, line in enumerate(lines):
+        if not line.strip() or line.lstrip().startswith(("```", "{", "[", "|")):
+            continue
+        m = re.match(r"^(\s*(?:[・\-*•●○]|\d+[.)、．])\s*)(.*)$", line)
+        if m and m.group(2).strip():
+            lines[i] = f"{m.group(1)}{val}については、{m.group(2)}"
+        else:
+            lines[i] = f"{val}については、{line}"
+        return "\n".join(lines)
+    return f"{val}については、{body}".strip()
+
+
+def apply_rules(d: Directive, text: str) -> tuple[str, list[str]]:
+    """指示の規則（require / forbid）を出力に当てる。verify の前に 1 回だけ通します。"""
+    body = str(text or "")
+    notes: list[str] = []
+    rules = list(getattr(d, "rules", None) or [])
+    if not rules or not body.strip():
+        return body, notes
+    structured = (d.fmt.kind in ("json", "csv", "table", "keyvalue")
+                  or body.lstrip().startswith(("{", "[", "```")))
+    for r in rules:
+        kind = str(getattr(r, "kind", "") or "").lower()
+        val = str(getattr(r, "value", "") or "").strip()
+        if not val:
+            continue
+        if kind == "forbid" and val in body:
+            if re.search(r"です|ます", val):
+                from . import style as _style
+                body = _style.restyle(body, register="plain")
+                notes.append(f"規則: 「{val}」を避けた言い方にしました")
+            elif not structured:
+                body = re.sub(re.escape(val), "", body)
+                notes.append(f"規則: 「{val}」を落としました")
+        elif kind == "require" and val not in body and not structured:
+            body = _insert_required(body, val)
+            notes.append(f"規則: 指定の語「{val}」を入れました")
+    if notes and d.fmt.max_chars:
+        # 語を足した分だけ長くなるので、指定の上限に *収め直す*（材料は増やさない）
+        from . import style as _style
+        if _style.count_chars(body) > d.fmt.max_chars:
+            lines = [x for x in body.split("\n") if x.strip()]
+            if d.fmt.bullets and lines:
+                room = max(16, int(d.fmt.max_chars / len(lines)) + 4)
+                kept = [_style.clause_trim(x, room) for x in lines]
+            else:
+                weights = [3.0] + [1.0] * max(0, len(lines) - 1)
+                kept, _fixes = _style.fit_length(lines, hard_max=d.fmt.max_chars, weights=weights)
+            body = "\n".join(x for x in kept if x.strip())
+            notes.append(f"規則: 上限 {d.fmt.max_chars} 字に収めました")
+    return body, notes
 
 
 def verify(d: Directive, text: str, got: dict) -> list[dict]:
@@ -295,6 +397,29 @@ def verify(d: Directive, text: str, got: dict) -> list[dict]:
         else:
             add("bullet_is_sentence", True)
 
+    for r in list(getattr(d, "rules", None) or []):
+        kind = str(getattr(r, "kind", "") or "").lower()
+        val = str(getattr(r, "value", "") or "").strip()
+        if not val:
+            continue
+        if kind == "require":
+            add("rule_require", val in body, f"指定の語「{val}」がありません")
+        elif kind == "forbid":
+            add("rule_forbid", val not in body, f"使ってはいけない「{val}」があります")
+
+    if d.fmt.lines:
+        n_lines = len([x for x in body.split("\n") if x.strip()])
+        add("line_count", n_lines == d.fmt.lines, f"{n_lines} 行（指定 {d.fmt.lines}）")
+
+    if d.fmt.no_explanation or d.fmt.only_output:
+        outside = re.sub(r"```.*?```", "", body, flags=re.DOTALL).strip()
+        if d.task == "code":
+            add("no_extra_prose", not outside, "コードブロックの外に文字があります")
+        elif outside:
+            add("no_extra_prose",
+                not re.search(r"確認したこと|構文検査まで|実行結果|解説|説明します", outside),
+                "解説の文が混ざっています")
+
     if d.fmt.max_chars and not d.fmt.bullets:
         n = count_chars(body)
         add("max_chars", n <= d.fmt.max_chars, f"{n}字（上限 {d.fmt.max_chars}）")
@@ -351,6 +476,11 @@ def run(text: str, *, kb=None, web=None, history=None, lm=None, core=None, turn:
            "turn": turn}
     got = execute(d, **ctx)
     body = str(got.get("text") or "").strip()
+    if body:
+        body, rule_notes = apply_rules(d, body)
+        if rule_notes:
+            got["notes"] = list(got.get("notes") or []) + rule_notes
+            got["text"] = body
     checks = verify(d, body, got) if body else [{"name": "non_empty", "ok": False, "why": "空"}]
     attempts = 1
     if not _all_ok(checks) and d.task == "summarize":
@@ -389,6 +519,11 @@ def run_directive(d: Directive, *, kb=None, web=None, history=None, lm=None, cor
     """`Directive` を直接実行する（core / api からの入口）。"""
     got = execute(d, kb=_default_kb(kb), web=web, history=history, lm=lm, core=core, turn=turn)
     body = str(got.get("text") or "").strip()
+    if body:
+        body, rule_notes = apply_rules(d, body)
+        if rule_notes:
+            got["notes"] = list(got.get("notes") or []) + rule_notes
+            got["text"] = body
     checks = verify(d, body, got)
     ok = _all_ok(checks)
     conf = float(got.get("confidence") or 0.7)

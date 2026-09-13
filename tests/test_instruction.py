@@ -440,3 +440,128 @@ def test_instruction_route_is_fast() -> None:
     assert res is not None and res.ok
     assert dt < 2.0, f"抽出に {dt:.2f}s かかった"
 
+
+# --------------------------------------------------------------------------- #
+# 難しい指示の形（欄の読み方・規則・翻訳・コードのみ）
+# --------------------------------------------------------------------------- #
+CSV_PROMPT = """次のテキストから情報を抽出し、CSV形式のみで出力してください。
+
+テキスト: 「氏名: 山田太郎, 年齢: 34, 住所: 大阪市」
+
+CSVフォーマット:
+name,age,city"""
+
+TABLE_PROMPT = """次のテキストから情報を抽出し、表形式で出力してください。
+
+テキスト: 「りんごは1個120円。みかんは1個80円です。」
+
+項目: 名前と値段"""
+
+KV_PROMPT = """次のテキストから情報を抽出し、key: value 形式で出力してください。
+
+テキスト: 「開始は10時、終了は17時です。」"""
+
+RULE_REQUIRE_PROMPT = ("アルファベータ探索について、100文字以内で説明してください。"
+                       "必ず「α-β枝刈り」という語を含めてください。")
+RULE_FORBID_PROMPT = "Snipherの仕組みを3つの箇条書きで説明してください。「です・ます」は使わないこと。"
+TRANSLATE_EN_PROMPT = """次の文章を英語に翻訳してください。
+
+文章: 「今日は天気が良いので、公園に散歩に行きました。」"""
+TRANSLATE_JA_PROMPT = ('Translate the following sentence into Japanese.\n\n'
+                       'Text: "The weather is good today, so I went to the park for a walk."')
+CODE_ONLY_PROMPT = """JavaScriptで、配列の合計を返す関数を書いてください。
+
+コードのみを出力してください（解説は不要です）。"""
+
+
+def test_parser_reads_csv_header_as_schema() -> None:
+    d = parse(CSV_PROMPT)
+    assert d is not None and d.task == "extract"
+    assert d.fmt.kind == "csv"
+    assert [k for k, _ in d.fmt.schema_fields] == ["name", "age", "city"]
+
+
+def test_parser_reads_field_list_and_length_cap() -> None:
+    d = parse(TABLE_PROMPT)
+    assert d is not None and d.fmt.kind == "table"
+    assert [k for k, _ in d.fmt.schema_fields] == ["名前", "値段"]
+
+    d2 = parse(RULE_REQUIRE_PROMPT)
+    assert d2 is not None and d2.fmt.max_chars == 100
+    assert ("require", "α-β枝刈り") in [(r.kind, r.value) for r in d2.rules]
+
+
+def test_parser_reads_a_forbidden_style_as_plain_not_polite() -> None:
+    d = parse(RULE_FORBID_PROMPT)
+    assert d is not None
+    assert ("forbid", "です・ます") in [(r.kind, r.value) for r in d.rules]
+    assert d.fmt.tone != "polite", "「使わない」を *使え* と読み替えてはいけない"
+
+
+def test_csv_extract_fills_the_named_columns() -> None:
+    res = run_instruction(CSV_PROMPT)
+    assert res is not None and res.ok
+    lines = [x for x in res.text.split("\n") if x.strip()]
+    assert lines[0] == "name,age,city"
+    assert "山田太郎" in lines[1] and "34" in lines[1]
+
+
+def test_table_extract_makes_one_row_per_record() -> None:
+    res = run_instruction(TABLE_PROMPT)
+    assert res is not None and res.ok
+    body = res.text
+    assert "| 名前 | 値段 |" in body
+    assert "りんご" in body and "みかん" in body
+    assert "120円" in body and "80円" in body
+    rows = [x for x in body.split("\n") if x.strip().startswith("|")]
+    assert len(rows) == 4, f"ヘッダ + 区切り + 2 行のはず: {rows}"
+
+
+def test_keyvalue_extract_uses_the_labels_in_the_material() -> None:
+    res = run_instruction(KV_PROMPT)
+    assert res is not None and res.ok
+    assert "field1" not in res.text, "材料に書いてあるラベルを欄名にする"
+    assert re.search(r"開始\s*[:：]\s*10時", res.text)
+    assert re.search(r"終了\s*[:：]\s*17時", res.text)
+
+
+def test_required_word_is_included_within_the_length_cap() -> None:
+    res = run_instruction(RULE_REQUIRE_PROMPT)
+    assert res is not None and res.ok, [(c["name"], c["why"]) for c in (res.checks if res else []) if not c["ok"]]
+    assert "α-β枝刈り" in res.text
+    assert count_chars(res.text) <= 100
+
+
+def test_forbidden_style_is_not_used() -> None:
+    res = run_instruction(RULE_FORBID_PROMPT)
+    assert res is not None and res.ok
+    bullets = [x for x in res.text.split("\n") if x.strip().startswith("・")]
+    assert len(bullets) == 3
+    assert not re.search(r"(?:です|ます)[。、]", res.text), "禁止された語尾が残っている"
+
+
+def test_translation_into_english() -> None:
+    res = run_instruction(TRANSLATE_EN_PROMPT)
+    assert res is not None and res.ok
+    assert res.meta.get("kind") == "translate"
+    for word in ("weather", "park", "walk"):
+        assert word in res.text.lower()
+    assert not re.search(r"[ぁ-んァ-ヶー一-龯]", res.text), "英語の訳文に日本語が残っている"
+
+
+def test_translation_into_japanese() -> None:
+    res = run_instruction(TRANSLATE_JA_PROMPT)
+    assert res is not None and res.ok
+    assert res.meta.get("kind") == "translate"
+    for word in ("天気", "公園", "散歩"):
+        assert word in res.text
+    assert re.search(r"(?:ました|です|だ)。?$", res.text.strip()[-4:]) or "行きました" in res.text
+
+
+def test_code_only_output_has_no_prose() -> None:
+    res = run_instruction(CODE_ONLY_PROMPT)
+    assert res is not None and res.ok
+    assert res.text.startswith("```") and res.text.rstrip().endswith("```")
+    outside = re.sub(r"```.*?```", "", res.text, flags=re.DOTALL).strip()
+    assert not outside, f"コードの外に文字がある: {outside[:60]}"
+    assert "function" in res.text and "reduce" in res.text

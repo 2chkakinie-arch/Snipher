@@ -91,6 +91,48 @@ JSONフォーマット:
 りんごは赤い果物です。みかんは冬に出回る柑橘です。ぶどうは房になって実ります。"""},
     {"task": "transform", "name": "文字列の変換（大文字化）", "expect": {"checks": True},
      "prompt": '次のテキストを大文字に変換してください。\n\nテキスト: "hello snipher"'},
+    {"task": "extract", "name": "CSV 抽出（ヘッダ行から欄を読む）",
+     "expect": {"checks": True, "contains": ["name,age,city", "山田太郎", "34"]},
+     "prompt": """次のテキストから情報を抽出し、CSV形式のみで出力してください。
+
+テキスト: 「氏名: 山田太郎, 年齢: 34, 住所: 大阪市」
+
+CSVフォーマット:
+name,age,city"""},
+    {"task": "extract", "name": "表抽出（材料の 2 件を 2 行に）",
+     "expect": {"checks": True, "contains": ["| 名前 | 値段 |", "りんご", "みかん", "120円", "80円"]},
+     "prompt": """次のテキストから情報を抽出し、表形式で出力してください。
+
+テキスト: 「りんごは1個120円。みかんは1個80円です。」
+
+項目: 名前と値段"""},
+    {"task": "extract", "name": "key: value 抽出（材料のラベルを欄名に）",
+     "expect": {"checks": True, "contains": ["開始", "10時", "終了", "17時"],
+                "absent": ["field1"]},
+     "prompt": """次のテキストから情報を抽出し、key: value 形式で出力してください。
+
+テキスト: 「開始は10時、終了は17時です。」"""},
+    {"task": "answer", "name": "応答（必ず含める語 + 100 字以内）",
+     "expect": {"checks": True, "contains": ["α-β枝刈り"]},
+     "prompt": "アルファベータ探索について、100文字以内で説明してください。必ず「α-β枝刈り」という語を含めてください。"},
+    {"task": "answer", "name": "応答（禁止する語 + 箇条書き 3）",
+     "expect": {"checks": True, "absent": ["です。", "ます。"]},
+     "prompt": "Snipherの仕組みを3つの箇条書きで説明してください。「です・ます」は使わないこと。"},
+    {"task": "transform", "name": "翻訳（英訳）",
+     "expect": {"checks": True, "contains": ["weather", "park", "walk"]},
+     "prompt": """次の文章を英語に翻訳してください。
+
+文章: 「今日は天気が良いので、公園に散歩に行きました。」"""},
+    {"task": "transform", "name": "翻訳（和訳）",
+     "expect": {"checks": True, "contains": ["天気", "公園", "散歩"]},
+     "prompt": 'Translate the following sentence into Japanese.\n\n'
+               'Text: "The weather is good today, so I went to the park for a walk."'},
+    {"task": "code", "name": "コードのみ（解説を付けない）",
+     "expect": {"checks": True, "contains": ["```javascript", "function"],
+                "absent": ["まとめました", "構文検査まで"]},
+     "prompt": """JavaScriptで、配列の合計を返す関数を書いてください。
+
+コードのみを出力してください（解説は不要です）。"""},
 ]
 
 #: 指示と誤読してはいけない会話の 1 通（ここで Directive が出たら誤検出）
@@ -130,8 +172,18 @@ def measure(runs: int = 1) -> dict:
             if banned:
                 refusals.append(f"{case['name']} → {banned[0]}")
             spec_ok = bool(res is not None and res.ok and text.strip())
+            failed = [k for k, v in checks.items() if not v]
+            want = (case.get("expect") or {}).get("contains") or []
+            avoid = (case.get("expect") or {}).get("absent") or []
+            for w in want:
+                if w not in text:
+                    spec_ok = False
+                    failed.append(f"contains:{w}")
+            for w in avoid:
+                if w in text:
+                    spec_ok = False
+                    failed.append(f"absent:{w}")
             if not spec_ok:
-                failed = [k for k, v in checks.items() if not v]
                 rows.append({"case": case["name"], "task": case["task"], "ok": False,
                              "ms": round(dt, 1), "chars": len(text.replace("\n", "")),
                              "failed": failed})
