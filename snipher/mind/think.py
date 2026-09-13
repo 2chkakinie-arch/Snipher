@@ -140,38 +140,52 @@ def opaque_claims(text: str, turn: int = 0) -> list[Claim]:
 
 def capability_claims(*, kb=None, lm=None, core=None, web=None) -> list[Claim]:
     """「何ができる？」に、実測の規模と実モジュールで答える（自己紹介の定型ではない）。"""
-    bank = lex.bank()
-    stats = bank.stats()
-    bits = [
-        f"手元には {stats['words']:,} 語の語彙バンク（読み・拍・品詞つき）と "
-        f"{stats['game_words']:,} 語の手遊び用の索引があります",
-    ]
+    # 「何ができる」に対する答えは、*相手の仕事は何が進むか* で書きます。
+    # 内部の索引語数や品詞・拍のような道具立てを並べるのは自己紹介ではありません。
+    bits = ["質問にその場で答える、渡された文を指定の形に整える（JSON・箇条書き・表・文字数）、"
+            "コードを書いて実行結果まで確認する、会話の途中で調べ物を引き継ぐ、の四つができます"]
     if kb is not None:
         try:
             s = kb.stats()
-            bits.append(f"知識ベースは {s.get('topics', 0)} 話題・{s.get('facts', 0)} 事実・"
-                        f"{s.get('qa', 0)} 問答を持っていて、問いの型（定義・理由・手順・いつ・値段）で欄を選びます")
-        except Exception:  # noqa: BLE001
-            pass
-    if lm is not None:
-        try:
-            bits.append(f"流暢さの審判に {lm.n_params():,} エントリの n-gram モデルを使っています")
+            bits.append(f"手元には {s.get('topics', 0)} 話題・{s.get('qa', 0)} 問答の材料があるので、"
+                        "定義・理由・手順・いつ・値段のように問いの形で引き分けられます")
         except Exception:  # noqa: BLE001
             pass
     if core is not None:
         try:
-            bits.append(f"内蔵ニューラルコアは {core.n_params():,} パラメータ（int8 量子化・KV キャッシュ付き）")
+            bits.append(f"内蔵の小型モデル（{core.n_params():,} パラメータ）で文の続きとその場の言い換えもします")
         except Exception:  # noqa: BLE001
             pass
     if web is not None:
         try:
             prov = ", ".join(web.status().get("providers") or [])
-            bits.append(f"手元に無い語は {prov or 'Edge 検索'} で裏を取ってから書きます")
+            bits.append(f"知らない語は {prov or '検索'} で本文まで開いてから書きます")
         except Exception:  # noqa: BLE001
             pass
-    bits.append("計算は分数・平方根まで厳密に検算し、コードは生成したあと実際に走らせて出力まで確認します")
-    return [Claim(kind="fact", content="。".join(bits) + "。", subject="Snipher",
-                  source="local:meta", weight=0.82)]
+    bits.append("数え物は分数・平方根まで厳密に検算します")
+    # 1 文に繋げると *検証の長さ上限* でまとめて弾かれ、その隙に古い定型棚が
+    # 顔を覗かせます。項目ごとに短い主張として渡し、長さの予算で落ちるようにします。
+    kinds = ["fact", "fact", "opinion", "fact", "fact", "fact"]
+    return [Claim(kind=kinds[i] if i < len(kinds) else "fact", content=b, subject="Snipher",
+                  source="local:meta", weight=0.82 - 0.02 * i)
+            for i, b in enumerate(bits)][:5]
+
+
+def intro_claims(*, kb=None, core=None) -> list[Claim]:
+    """自己紹介は 3 点だけ: 名前・役割・相手に何が起きるか。道具立ての数えません。"""
+    bits = [Claim(kind="definition",
+                  content="私は Snipher。日本語で質問に答えて、渡された文を指定の形に整えて、"
+                          "コードまでその場で書くアシスタントです。",
+                  subject="Snipher", source="local:meta", weight=0.84)]
+    can = "問いには検索まで裏を取って答え、形式の指定（JSON・箇条書き・文字数・口調）は守るように組みます"
+    if kb is not None:
+        try:
+            can += f"。手元の見出しは {int(kb.stats().get('topics') or 0)} 話題まであります"
+        except Exception:  # noqa: BLE001
+            pass
+    bits.append(Claim(kind="fact", content=can + "。", subject="Snipher",
+                      source="local:meta", weight=0.78))
+    return bits
 
 
 def identity_claims(*, kb=None) -> list[Claim]:
@@ -332,7 +346,7 @@ def plan_name(frame, dossier_obj, claims: list[Claim]) -> str:
         return f"lex:{frame.ask or 'word'}"
     if frame.act in ("greet", "thanks", "apology", "farewell", "agree", "disagree", "praise"):
         return frame.act
-    if frame.ask in ("identity", "capability"):
+    if frame.ask in ("identity", "capability", "self_intro"):
         return "self"
     if frame.ask == "identity_user":
         return "session:profile"
@@ -357,10 +371,15 @@ def knowledge_meta(frame, dossier_obj, claims: list[Claim], thought: Thought) ->
     if not meta:
         meta = {"topic": topic or (frame.topic or None), "coverage": cov, "via": via}
     # KB 由来の主张には 欄名（field / usage）を付ける（既存契約）
-    kb_claim = next((c for c in claims if c.source.startswith("local:kb")), None)
+    kb_claim = next((c for c in claims if c.source.startswith("local:kb")
+                     and (not topic or str((c.extra or {}).get("topic") or "") in (topic, frame.topic or "")
+                          or str((c.extra or {}).get("topic") or "") in (frame.topic or ""))), None)
     if kb_claim is not None:
         extra = kb_claim.extra or {}
-        meta.update({"field": kb_claim.slot or "answer", "usage": kb_claim.slot or "answer",
+        # 欄名は *実際に引けた欄* だけ名乗ります。「answer」とでっち上げると、
+        # 知識を引き当てたふりになったので（v3 の契約検査がここを見ています）。
+        slot = str(kb_claim.slot or extra.get("slot") or "")
+        meta.update({"field": slot or None, "usage": slot or None,
                      "score": extra.get("score"), "qtype": extra.get("qtype"),
                      "coverage": extra.get("coverage", cov), "via": extra.get("via", via)})
     if via == "web":
@@ -410,7 +429,7 @@ def _finalize(out: Rendered, thought: Thought, frame, dossier_obj, claims: list[
         plan = "statement" if frame.act in ("declare", "wish") else (frame.act or "statement")
     elif frame.act in ("greet", "thanks", "apology", "farewell", "agree", "disagree", "praise"):
         plan = frame.act
-    elif frame.ask in ("identity", "capability"):
+    elif frame.ask in ("identity", "capability", "self_intro"):
         plan = "self"
     elif frame.ask == "identity_user":
         plan = "session:profile"
@@ -422,8 +441,15 @@ def _finalize(out: Rendered, thought: Thought, frame, dossier_obj, claims: list[
                   "coverage": raw.get("coverage"), "claims": raw.get("claims")}
     if kb_claim is not None:
         extra = kb_claim.extra or {}
-        meta.update({"field": kb_claim.slot or "answer", "usage": kb_claim.slot or "answer",
-                     "score": extra.get("score"), "qtype": extra.get("qtype"),
+        # `field` は「知識ベースのどの欄を引いたか」を名乗る欄です。会話は *話題の断片* を
+        # 素材に使うだけなので、欄を引いていないときに "answer" と書くと、引き当てを
+        # 装ったことになり、v3 の契約検査が弾きます（実际、知らない語の応答で出ていました）。
+        slot = str(kb_claim.slot or extra.get("slot") or "")
+        if via == "kb" and slot:
+            meta.update({"field": slot, "usage": slot})
+        else:
+            meta.update({"field": None, "usage": None})
+        meta.update({"score": extra.get("score"), "qtype": extra.get("qtype"),
                      "coverage": extra.get("coverage", meta.get("coverage")),
                      "via": extra.get("via", via)})
     if via == "web":
@@ -435,6 +461,12 @@ def _finalize(out: Rendered, thought: Thought, frame, dossier_obj, claims: list[
     if plan in ("statement",) and not any(c.source.startswith(("local:kb", "web", "tool"))
                                           for c in claims):
         out.confidence = min(float(out.confidence), 0.52)
+    # 相手の主語が *辞書にも索引にも無い語* のとき、周りの話題から話を組んではいますが、
+    # その語について分かったふりはしません。確信度は上げておかないのが契約です。
+    unknown_head = any(bool(getattr(e, "web_needed", False)) and not bool(getattr(e, "known_dict", True))
+                       for e in (getattr(frame, "entities", None) or []))
+    if unknown_head and via != "kb" and plan in ("statement", "unknown_topic"):
+        out.confidence = min(float(out.confidence), 0.54)
     if plan == "opaque_input":
         # 入力が読めないターンは「答えられた」と見せない（確信度を盛らない）
         thought.knowledge = {}
@@ -573,6 +605,9 @@ def think(text: str, *, history: list[dict] | None = None, kb=None, web=None, lm
                                         f"{int(facts.get('age_at') or 1)} ターン目）と覚えています。",
                                 source="session", weight=0.7))
         thought.steps.append("相手の記憶: 自己紹介ではなく会話履歴を読んだ")
+    if not claims and frame.ask == "self_intro":
+        claims.extend(intro_claims(kb=kb, core=core))
+        thought.steps.append("自己紹介: 名前・役割・相手benefit の 3 点だけ")
     if not claims and frame.ask in ("identity",):
         claims.extend(identity_claims(kb=kb))
         thought.steps.append("自己言及: 実構成で答えた")
@@ -812,6 +847,12 @@ def _topic_moves(frame, text: str, *, kb=None, turn: int = 0,
         return []
     # 話題名に助詞が残っていたら落とす（「今日のニュース」型の取り込み防止）
     w = re.sub(r"^(私の|僕の|俺の|ボクの)?", "", w)
+    # 指示文の札がそのまま語になった形（「質問:Redis」）は、問い返しで引用すると
+    # 画面が内部語彙を見せてしまうので、語だけに残します。
+    w = re.sub(r"^(?:質問|問い|設問|テーマ|topic|文章|テキスト|本文)\s*[:：]\s*", "", w, flags=re.I)
+    w = w.strip("「」『』“”‘’\"'。、・:： 　")
+    if len(w) > 16 or re.search(r"[。！？\n]", w):
+        w = w[:16].strip("、。・ ")
     said = " ".join(str(m.get("content") or "") for m in (history or [])
                     if m.get("role") == "assistant")
     menu: list[list[Claim]] = []
@@ -821,7 +862,7 @@ def _topic_moves(frame, text: str, *, kb=None, turn: int = 0,
     ask_lex = bool(re.search(r"(拍|モーラ|音数|読み|ふりがな|を含む語|同类|品詞|活用|何文字|画数)",
                              normalize(text)))
     if not ask_lex:
-        menu = menu        # (ア)(イ)(ウ) は作らず、(エ) の隣接話題だけ数える
+        # (ア)(イ)(ウ) は作らず、(エ) の隣接話題だけ数えます。
         lexical_only = False
     else:
         lexical_only = True
@@ -896,30 +937,52 @@ def _topic_moves(frame, text: str, *, kb=None, turn: int = 0,
         live = menu
     return list(live[int(turn) % len(live)])
 
+_SHAPES: tuple[tuple[str, str], ...] = (
+    (r"(手順|申請|手続き|やり方|使い方|方法|how\s*to)",
+     "手続きを尋ねる形として組みます。決めるのは、いつまでに・誰に出すか・どの形で残すか、の三つです。"),
+    (r"(値段|いくらか|費用|コスト|料金)",
+     "費用の話として組みます。材料代と手間時間のどちらを先に押さえるかで答えの形が変わります。"),
+    (r"(違い|比較|vs| versus|どっち)",
+     "比較の形にします。速さ・手間・あとから拡張できるかの三本で揃えて比べるのが安全です。"),
+    (r"(おすすめ|選び方|向いて|どれがいい|価値|コスパ|使いやすい)",
+     "向きの話として組みます。扱う量と、壊れたときに立て直す時間を基準にすると迷いません。"),
+    (r"(エラー|動かない|失敗|直したい|bug)",
+     "詰まっている話として受け取ります。まず *最後に変わった一点* を切り分けると早く減ります。"),
+)
+
+
+def shape_line(text: str) -> str:
+    """発話が *どの形の問い* かを読んで、当面の組み立て方針を 1 文で返します。
+
+    語彙に無い語が来たとき、知らない語の説明をする代わりに、この方針で進めます。
+    """
+    t = normalize(str(text or ""))
+    for pat, msg in _SHAPES:
+        if re.search(pat, t, re.IGNORECASE):
+            return msg
+    if re.search(r"(いくつ|何個|数量|どれくらい|量)", t):
+        return "量の話を聞いている形にします。単位と、数える対象が決まれば答えられます。"
+    return "どんな場面で使う語かを一言もらえれば、その場で同じ形に組みます。"
+
+
 def _decompose_claims(frame, text: str, turn: int = 0) -> list[Claim]:
-    """語彙に無い語が来たとき、*分解して分かること* を出す（推測で埋めない）。"""
+    """語彙に無い語が来たとき、*読める断片と問いの形* から当たりを付けて先に進みます。
+
+    索引の語数・読み・拍は答えとして出さない（v3 はここで辞書を引き返していました）。
+    返すのは、問いの形に対する当面の組み立て方針だけです。
+    """
     t = normalize(text)
     pieces = [p for p, _ in lex.bank().segment(t) if len(p) >= 1][:8]
-    known = [p for p in pieces if lex.bank().has(p)]
+    known = [p for p in pieces if len(p) >= 2 and lex.bank().has(p)]
     bits = []
-    if known:
-        reads = "、".join(f"「{p}」{('(' + lex.bank().reading(p) + ')') if lex.bank().reading(p) else ''}"
-                          for p in known[:4])
-        bits.append(f"文を分解すると {reads} まで読めます")
-    else:
-        bits.append(f"入力 {char_count(t)} 文字は、こちらの手元の語彙では塊として引けませんでした")
-    if frame.needs_web:
-        tried = frame.flags.get("web_tried")
-        bits.append("ウェブ検索も試しましたが、使える記述は取れませんでした。"
-                    if tried else
-                    "ここではウェブ検索が使えない設定なので、推測で語義は埋めません。")
-    if frame.entities:
-        ent = frame.entities[0]
-        bits.append(f"対象は「{ent.surface}」としてそのまま扱います")
-    asks = ("何を答えたいですか（定義・手順・比較・値段のどれか）を一言で教えてください",
-            "どれを欲しがっていますか。意味・使い方・数量のどれかを一語でどうぞ",
-            "何が分かっていれば前に進めますか。切り口を一言ください")
-    bits.append(asks[int(turn) % len(asks)])
+    bits.append(shape_line(t))
+    if known and sum(len(p) for p in known) >= max(4, int(len(t) * 0.35)):
+        bits.append("読める部品は " + "、".join(f"「{p}」" for p in known[:3]) + " なので、そこを軸に組みます")
+    if not any(x in bits[0] for x in ("もらえれば", "ください", "どうぞ", "教えてください")):
+        asks = ("何を答えたいですか（定義・手順・比較・値段のどれか）を一言で教えてください",
+                "どれを欲しがっていますか。意味・使い方・数量のどれかを一語でどうぞ",
+                "何が分かっていれば前に進めますか。切り口を一言ください")
+        bits.append(asks[int(turn) % len(asks)])
     return [Claim(kind="note", content=_join_bits(bits), source="lex", weight=0.46)]
 
 
@@ -1155,5 +1218,6 @@ def _solve_claims(frame, text: str, *, tasks=None, thought: Thought | None = Non
     return out
 
 
-__all__ = ["think", "Thought", "capability_claims", "identity_claims", "opaque_claims",
+__all__ = ["think", "Thought", "capability_claims", "identity_claims", "intro_claims",
+           "shape_line", "opaque_claims",
            "play_turn", "propose_activity_claims"]

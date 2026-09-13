@@ -71,6 +71,52 @@ def question_subject(question: str) -> str:
     return m3.group(1) if m3 else body[:12]
 
 
+def normalized_word(word: str, *, kb=None) -> tuple[str, str]:
+    """知らない語を、*読める部品を組み替えた語* に寄せます（表記揺れ・語順の対策）。
+
+    「申年休假」のような語は、塊では索引にありません。ただ語順を入れ替えた
+    「休暇」は実在するので、そこだけ寄せてから引きに行きます。当たったときは
+    推測ではなく表記の組み替えとして扱うので、答えの根拠が崩れません。
+    """
+    from ..lang import lex
+
+    w = str(word or "").strip()
+    if len(w) < 2:
+        return "", ""
+    bank = lex.bank()
+    cands: list[str] = []
+    body = re.sub(r"[\s「」『』（）()。、・]+$", "", w)
+    # 語幹の 2〜4 文字を取り出して *並べ替え* た形（休假 → 休暇、利用状 → 利用）
+    tail = re.sub(r"(を|が|は|の|に|で|へ|と)$", "", body)
+    for i in range(len(tail) - 1):
+        seg = tail[i:i + 2]
+        if not re.fullmatch(r"[一-龯]{2}", seg) or bank.has(seg):
+            continue
+        # 漢字 2 文字の *語順が逆* の形だけ（「争闘」→「闘争」）。片方が知らない字なら
+        # 諦めます。ここでカタカナ語や部分文字列に手を出すと、知らない語が別語に化ける
+        # （v3 の辞書引きより悪いでたらめになります）。
+        rev = seg[::-1]
+        if bank.has(rev) and all(bank.has(ch) for ch in seg):
+            cands.append(rev)
+    seen: set[str] = set()
+    for c in cands:
+        if not c or c in seen or c == tail:
+            continue
+        seen.add(c)
+        if len(c) < 2:
+            continue
+        if len(c) != 2:
+            continue
+        try:
+            if bank.has(c):
+                return c, f"語の組み替え: 「{tail}」→「{c}」"
+            if kb is not None and kb.exact_topic(c) is not None:
+                return c, f"語の組み替え: 「{tail}」→「{c}」"
+        except Exception:  # noqa: BLE001
+            continue
+    return "", ""
+
+
 def _frame_for(question: str, *, kb=None, history=None):
     from ..mind.parse import build_frame
     from ..mind.state import ConversationState
@@ -116,18 +162,39 @@ def gather_claims(d: "Directive", *, kb=None, web=None, history=None, lm=None,
         dossier = gather(frame, kb=kb, web=web, tool_claims=[], history_text=question)
     except Exception as exc:  # noqa: BLE001
         notes.append(f"証拠集め: {type(exc).__name__}")
+    def _content(cl) -> list:
+        return [x for x in (getattr(cl, "claims", []) or [])
+                if x.kind in ("answer", "definition", "fact", "reason", "step", "list", "evidence")
+                and str(x.source) != "lex"]
+
     if subject and (dossier is None or float(getattr(dossier, "coverage", 0.0) or 0.0) < 0.5):
-        # 問いの文（「…とは何ですか？」）で話題が引けなかったときは、*語そのもの* で引き直す
+        # 問いの文（「…とは何ですか？」）で話題が引けなかったときは、*語そのもの* で引き直す。
+        # ただし引き直し側は「語＝話題名」なので網羅率が上がり、*定義文だけ* を持ってきても
+        # 差し替わってしまいます。答え・理由として使える文の数が本当に増えたときだけ採用します。
         try:
             alt = _frame_for(subject, kb=kb, history=history)
             alt.raw = subject
             got2 = gather(alt, kb=kb, web=web, tool_claims=[], history_text=subject)
-            if got2 is not None and float(getattr(got2, "coverage", 0.0) or 0.0) > float(
-                    getattr(dossier, "coverage", 0.0) or 0.0):
+            if got2 is not None and len(_content(got2)) > len(_content(dossier)):
                 dossier, frame = got2, alt
                 notes.append(f"証拠: 語「{subject}」で引き直した")
         except Exception:  # noqa: BLE001
             pass
+    if not [c for c in (getattr(dossier, "claims", []) or [])
+            if c.kind in ("answer", "definition", "fact", "reason", "step", "list")]:
+        # 知っている部品に組み替えられる語なら、その語で引き直します
+        variant, note = normalized_word(subject, kb=kb)
+        if variant:
+            try:
+                alt = _frame_for(variant, kb=kb, history=history)
+                alt.raw = f"{variant} は？"
+                got3 = gather(alt, kb=kb, web=web, tool_claims=[], history_text=variant)
+                if got3 is not None and len(_content(got3)) > len(_content(dossier)):
+                    dossier, frame = got3, alt
+                    notes.append(note)
+                    notes.append(f"証拠: 組み替えた語「{variant}」で引いた")
+            except Exception:  # noqa: BLE001
+                pass
     claims: list[Claim] = list(getattr(dossier, "claims", []) or [])
     sources: list[dict] = list(getattr(dossier, "sources", []) or [])
     via = str(getattr(dossier, "via", "") or "")
@@ -277,13 +344,17 @@ def fallback_claims(question: str, frame, *, subject: str, web=None, kb=None,
         out.extend(rebuilt)
         notes.append("材料が薄い: 発話の語を割り直して本文を引いた")
         return out
-    out.append(Claim(kind="note",
-                     content=f"{subject or 'その話'}は、こちらの扱う範囲の語に割り直して組み立てます。",
-                     subject=subject, source="local:meta", weight=0.5))
-    out.append(Claim(kind="ask",
-                     content=f"{subject or 'この語'}について、どの切り口（意味・利点・手順・比較）で"                             "必要かを一言もらえれば、その形に組み替えます。",
-                     subject=subject, source="local:meta", weight=0.48))
-    notes.append("材料が薄い: 問いの形を数え直して切り口を聞いた")
+    from ..mind.think import shape_line
+
+    shape = shape_line(f"{subject or ''} {question}")
+    out.append(Claim(kind="inference", content=shape, subject=subject,
+                     source="local:meta", weight=0.56))
+    if len(shape) < 60:
+        out.append(Claim(kind="ask",
+                         content=f"{subject or 'この語'}について、どの切り口（意味・利点・手順・比較）で"
+                                 "必要かを一言もらえれば、その形に組み替えます。",
+                         subject=subject, source="local:meta", weight=0.48))
+    notes.append("材料が薄い: 問いの形を数え直して方針から書いた")
     return out
 
 
@@ -368,9 +439,16 @@ def _overlap(a: str, b: str, n: int = 6) -> float:
     return len(ga & gb) / min(len(ga), len(gb))
 
 
-def opening_line(d: "Directive", subject: str, *, tone: str, register: str) -> str:
-    """役割を与えられたときの 1 文目（指示の語から作り、口調に合わせて組み替える）。"""
+def opening_line(d: "Directive", subject: str, *, tone: str, register: str,
+                 target: int = 0, have: int = 0) -> str:
+    """役割を与えられたときの 1 文目（指示の語から作り、口調に合わせて組み替える）。
+
+    字数に余裕の無い指定（例: 200 字）で材料が足りているときは、前置きを *削る* ほうが
+    中身が伝わります。役割の名乗りは本文の語彙にすでに現れているためです。
+    """
     if d.fmt.no_greeting or d.fmt.strict:
+        return ""
+    if target and have >= int(target * 0.5) and subject:
         return ""
     role = (d.role or "").strip()
     subject = (subject or "").strip(" 　。、？?！!")
@@ -383,6 +461,9 @@ def opening_line(d: "Directive", subject: str, *, tone: str, register: str) -> s
     elif role:
         base = f"{role}の立場から答えます"
     elif subject:
+        # 「空が青いのはなぜ」のような問い文を主語にすると、意味の無い前置きになります。
+        if len(subject) > 12 or re.search(r"(なぜ|どうして|いくら|いつ|どこ|どの|いくつ|か)", subject):
+            return ""
         base = f"{subject}について答えます"
     else:
         return ""
@@ -427,6 +508,51 @@ def _expand_to_target(sentences: list[str], target: int, *, hard_max: int = 0) -
     return out, notes
 
 
+_EXTRA_FIELDS = ("why", "how", "tips", "example", "facts", "cost", "when", "opinion")
+
+
+def same_topic_extra(question: str, subject: str, *, kb, exclude: list[str], limit: int = 4) -> list[str]:
+    """目標字数に足りないとき、*同じ話題の使っていない欄* を足します。
+
+    別話題を引っ張ると指示の的がずれるので、ここでは KB の同じ項目 (why / how / tips /
+    example など) だけを見ます。辞書引きの欄（読み・拍・品詞）は問い返しません。
+    """
+    if kb is None:
+        return []
+    name = ""
+    for probe in (subject, question):
+        if not probe:
+            continue
+        try:
+            got = kb.answer(probe)
+        except Exception:  # noqa: BLE001
+            got = None
+        if got and (got.get("coverage") or 0) >= 0.3:
+            name = str(got.get("topic") or "")
+            break
+    if not name:
+        return []
+    # `kb.answer()` は選ばれた 1 欄だけ返すので、*同じ話題の他の欄* は item を引きます。
+    item = next((x for x in kb.items if str(x.get("topic") or "") == name), None)
+    if not item:
+        return []
+    out: list[str] = []
+    fields = item
+    for key in _EXTRA_FIELDS:
+        vals = fields.get(key)
+        vals = [str(x).strip() for x in vals] if isinstance(vals, list) else ([str(vals).strip()] if vals else [])
+        for s in vals:
+            s = s.strip()
+            if len(s) < 12 or any(s == x or s in x or x in s for x in exclude):
+                continue
+            if any(_overlap(s, x, 7) > 0.55 for x in exclude):
+                continue
+            out.append(s if s.endswith(("。", "！", "？")) else s + "。")
+            if len(out) >= limit:
+                return out
+    return out
+
+
 def answer(d: "Directive", *, kb=None, web=None, history=None, lm=None, core=None,
            turn: int = 0) -> dict:
     """問いに答える。返るのは {text, sentences, sources, notes, confidence, meta}。"""
@@ -451,7 +577,8 @@ def answer(d: "Directive", *, kb=None, web=None, history=None, lm=None, core=Non
         dup = re.compile(rf"^{re.escape(subject)}\s*[、,・:]?\s*{re.escape(subject)}")
         sentences = [dup.sub(subject, s.strip(), count=1) for s in sentences]
 
-    opening = opening_line(d, subject, tone=tone, register=register)
+    opening = opening_line(d, subject, tone=tone, register=register,
+                           target=target, have=sum(len(x) for x in sentences))
     if opening:
         sentences = [opening] + sentences
 
@@ -469,8 +596,14 @@ def answer(d: "Directive", *, kb=None, web=None, history=None, lm=None, core=Non
             notes.extend(f2)
             body, f3 = _expand_to_target(keep or body, target, hard_max=cap)
             notes.extend(f3)
-        else:
-            body = body
+            if target and count_chars("\n".join(body)) < int(target * 0.75):
+                # 足りないぶんは *同じ話題の他の欄* で埋めます（別話題には逃げない）
+                extra = same_topic_extra(question, subject, kb=kb, exclude=body,
+                                         limit=max(1, int(target / 60)))
+                if extra:
+                    body, f4 = _expand_to_target(body + extra, target, hard_max=cap)
+                    notes.extend(f4)
+                    notes.append(f"字数: 同じ話題の {len(extra)} 文を足した")
 
     styled, fixes = restyle("\n".join(body), tone=tone, register=register)
     notes.extend(fixes)

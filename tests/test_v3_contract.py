@@ -233,7 +233,8 @@ def test_safety_net_is_content_derived_too(composer) -> None:
 def test_capability_answer_uses_measured_numbers(composer) -> None:
     r = _compose(composer, "なにができますか", web=False)
     assert re.search(r"\d", r.text), r.text                  # 実測の語彙数・項目数など
-    assert "語" in r.text or "件" in r.text
+    # 数を *何の個数か* 付きで言うこと（語彙の語数を自慢する形は v4 で禁止しました）
+    assert re.search(r"\d+[,,\d]*\s*(語|件|話題|問答|事実|エントリ)", r.text), r.text
 
 
 # --------------------------------------------------------------------------- #

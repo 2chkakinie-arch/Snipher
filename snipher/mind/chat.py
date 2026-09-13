@@ -232,6 +232,66 @@ def observe(text: str) -> dict:
 # --------------------------------------------------------------------------- #
 # 知識ベースからの手
 # --------------------------------------------------------------------------- #
+# 判定に使うのは *名詞* だけです。「する」「教え」のような動詞・接尾的語は
+# どの話題の文にも出るうえ、索引側は 2 文字の n-gram（「る手」「順を」）を
+# そのまま返してくるので、そのまま許すと別話題が答えになります。
+_CONTENT_POS = ("名詞", "固有名詞", "接尾辞")
+_content_cache: dict[str, bool] = {}
+
+
+def _content_word(tok: str) -> bool:
+    """索引が *内容語として知っている語* かどうか（「る手」「順を」のような n-gram を除く）。"""
+    tok = str(tok or "")
+    if tok in _content_cache:
+        return _content_cache[tok]
+    ok = False
+    try:
+        from ..lang import lex
+
+        ent = lex.bank().entry(tok)
+        if ent is not None:
+            pos = str(getattr(ent, "pos", "") or "")
+            ok = any(pos.startswith(x) for x in _CONTENT_POS) and len(tok) >= 2
+    except Exception:  # noqa: BLE001
+        ok = False
+    _content_cache[tok] = ok
+    return ok
+
+
+#: どの話題の文にも顔を出す *足場のような語* 。これで一致すると「手順を尋ねたのに
+#: アルゴリズムの話が来る」になるので、材料の判定には使いません。
+_GENERIC = frozenset("""
+手順 方法 やり方 理由 場合 もの こと ため 使い方 注意 注意点 設定 状態 結果 情報
+ポイント 例 例子 場面 時 もの ひと 自分 相手 今回 いつも たいへん 大事 重要 基本
+定義 意味 説明 質問 回答 話題 項目 一覧 単位 数量 程度 範囲 時間 日 年 月 順位
+""".split())
+
+
+def _grounded(item: dict, obs: dict, text: str) -> bool:
+    """KB の話題を会話に置いてよいか。
+
+    発話側の語が *話題の名前（か別名）に刺さっている* ときだけ通します。語 1 文字の
+    縁で別話題に飛ぶ（「生態」→「水族館」）取り違えは、会話では誤答より始末が悪いので、
+    受け取りの相槌に素材を混ぜるこの経路では特に Strict にします。
+    """
+    topic = str(item.get("topic") or "")
+    if not topic:
+        return False
+    if topic in text:
+        return True
+    blob = topic + "".join(str(x) for x in (item.get("aliases") or []))
+    words = [str(obs.get("focus") or "")] + [str(x) for x in (obs.get("nouns") or []) if len(str(x)) >= 2]
+    for w in words:
+        if not w:
+            continue
+        if w in blob:
+            return True
+        shared = sum(1 for ch in set(w) if ch in blob and "\u4e00" <= ch <= "\u9fff")
+        if shared >= 2:
+            return True
+    return False
+
+
 def topic_items(text: str, *, kb, limit: int = 3, min_score: float = 0.42) -> list[dict]:
     """発話に *実際に引っかかった* 話題だけ返す（スコアが低い物は使わない）。"""
     if kb is None:
@@ -244,12 +304,23 @@ def topic_items(text: str, *, kb, limit: int = 3, min_score: float = 0.42) -> li
     for h in hits:
         if float(h.get("score") or 0.0) < min_score:
             continue
-        # スコアだけだと「雨降り → 火山」のように薄い取り違えが起きます。
-        # *発話に出てきた語* を実際に踏んだ話題だけを材料にします。
-        if not (h.get("topic_hit") or (h.get("word_hits") or [])):
-            continue
         item = h.get("item") or {}
-        if item.get("def") or item.get("facts"):
+        if not (item.get("def") or item.get("facts")):
+            continue
+        # 「雨降り → 火山」のような薄い取り違えは、*発話の語が相手の本文に実在しない*
+        # とき起きます。逆に「休暇 申請 手順」は話題名に当たらなくても本文に語が並ぶので、
+        # 語が本当に本文へ刺さっているかで通します（v4 で索引語数の門番を外した理由）。
+        probe = [str(x) for x in (h.get("matched") or [])
+                 if len(str(x)) >= 2 and str(x) not in _GENERIC and _content_word(str(x))]
+        probe += [str(x) for x in (h.get("word_hits") or [])
+                  if len(str(x)) >= 2 and str(x) not in _GENERIC]
+        if h.get("topic_hit"):
+            out.append(item)
+            continue
+        blob = " ".join([str(item.get("topic") or ""), str(item.get("def") or "")]
+                        + [str(x) for k in ("facts", "why", "how", "tips", "when", "cost")
+                           for x in (item.get(k) or [])])
+        if any(tok in blob for tok in probe):
             out.append(item)
     return out
 
@@ -333,8 +404,11 @@ def _react_line(obs: dict, items: list[dict], *, turn: int = 0) -> str:
     if not _verb_ok(v):
         v = ""
     p_ = str(obs.get("predicate") or "")
-    if not n and p_:
-        pool = list(_REACT_PRED.get(obs["act"], ()))
+    # 疲れ・うれしさのような *述語で来る発話* は、話題名に差し替えると相手の言葉が
+    # 消えます。「疲れた」→「それは重たい目の疲れですね。」では会話として外れるので、
+    # 述語がある回は述語の型を使います。
+    if p_ and obs["act"] in _REACT_PRED:
+        pool = list(_REACT_PRED[obs["act"]])
     usable = [x for x in pool if (("{n}" not in x) or n) and (("{v}" not in x) or v)
               and (("{p}" not in x) or p_)]
     if not usable:
@@ -446,12 +520,16 @@ def claims_for(text: str, *, frame=None, kb=None, history: list[dict] | None = N
                             subject=obs["nouns"][0] if obs["nouns"] else "",
                             source="local:chat", weight=0.62))
     # 事実を積むとき、*最初の話題から順に* 取ります（別話題に流れていくのを防ぐ）
+    items = [it for it in items if _grounded(it, obs, text)]
     lines: list[tuple[str, dict]] = []
     for it in items:
         for line in _fact_lines(it, want=2, turn=turn):
             if line and line not in said:
                 lines.append((line, it))
-    for line, it in lines[:2]:
+    # 相槌を先に置いた回は事実を 1 枚に絞ります。助言を 3 枚並べると
+    # 助言を並べすぎると説教みたいになって、会話として不自然になります。
+    cap = 1 if claims else 2
+    for line, it in lines[:cap]:
         claims.append(Claim(kind="fact", content=line, subject=str(it.get("topic") or ""),
                             source="local:kb", weight=0.82,
                             extra={"topic": it.get("topic"), "id": it.get("id")}))
@@ -459,10 +537,18 @@ def claims_for(text: str, *, frame=None, kb=None, history: list[dict] | None = N
         for it in items[:1]:
             steps = [str(x).strip() for x in (it.get("how") or []) if str(x or "").strip()]
             tips = [str(x).strip() for x in (it.get("tips") or []) if str(x or "").strip()]
-            pick = (steps[int(turn) % len(steps)] if steps else "") or \
-                   (tips[int(turn) % len(tips)] if tips else "")
-            if len(pick) >= 6:
-                body = pick if pick.endswith(("。", "！", "？")) else f"{pick}、の順で進めると早いです。"
+            seq = steps or tips
+            if not seq:
+                continue
+            idx = int(turn)
+            a = seq[idx % len(seq)]
+            b = seq[(idx + 1) % len(seq)].rstrip("。") if len(seq) > 1 else ""
+            if b:
+                # 「順で」は *2 つ以上* 並んで初めて成立する言い回しです。
+                body = f"{a.rstrip('。')}、{b}の順で進めると早いです。"
+            else:
+                body = a if a.endswith(("。", "！", "？")) else f"{a}。"
+            if len(body) >= 8:
                 claims.append(Claim(kind="advice", content=body, subject=str(it.get("topic") or ""),
                                     source="local:kb", weight=0.74))
                 break

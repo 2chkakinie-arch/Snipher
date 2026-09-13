@@ -646,7 +646,7 @@ class Composer:
         if unknown and len(out) < 170:
             out += f"「{unknown[0]}」は辞書に無い語なので、そのままの固有名として扱います。"
         elif not cand and not u.is_question and len(out) < 170:
-            out += "質問の形にはなっていませんが、上の語で調べられることは調べます。"
+            out += "続きも一緒に見ます。"
         if prev and out in prev:
             out = body + "でした。"
         return out

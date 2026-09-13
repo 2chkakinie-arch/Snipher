@@ -784,7 +784,17 @@ def parse_question(text: str) -> str:
     t = str(text or "")
     m = _QUESTION.search(t)
     if m:
-        return m.group(1).strip("「」『』 　。")
+        got = m.group(1).strip("「」『』 　。")
+        # 「質問：X とは？200文字程度で。」→ 出力指定は問いの *外* に置かれたものです。
+        for _ in range(3):        # 「200文字程度、である調で。」のように *重ねて* 書かれるので回します
+            cut = re.sub(r"\s*(?:次の|上記の)?\s*[0-9０-９]+\s*(?:文字|字|語)\s*(?:程度|ぐらい|くらい)?\s*"
+                         r"(?:で|に|にて|で答えて|で出力して|にまとめて)?\s*(?:ください|下さい|ね)?\s*[。.、,]*\s*$", "", got)
+            cut = re.sub(r"\s*(?:である調|ですます調|です・ます調|カジュアルな口調|口調で?)"
+                         r"\s*(?:で)?\s*[。.、,]*\s*$", "", cut)
+            if cut == got:
+                break
+            got = cut
+        return got.strip("「」『』 　。、:")
     # 指示文の中に *問いの形* の 1 文があれば、それが答え的对象
     for line in [x.strip() for x in t.split("\n") if x.strip()]:
         m2 = _BARE_QUESTION_LINE.search(line)
@@ -982,6 +992,12 @@ def parse(text: str, *, min_score: float = 0.55) -> Directive | None:
     if fmt.target_chars or fmt.max_chars:
         score += 0.12
         signals.append(f"length:{fmt.target_chars or fmt.max_chars}")
+    if (fmt.target_chars or fmt.max_chars or fmt.bullets or fmt.lines or fmt.tone
+            or fmt.register) and (question or payload):
+        # 出力の形を *数字や口調で指定している* のが指示の本質です。問いだけの場合より
+        # 強くします（v3 はここで閾値に届かず、知識ベースの引き当てに流れていました）。
+        score += 0.24
+        signals.append("spec+question")
     if fmt.extra_rules:
         kinds = sorted({str(r.kind) for r in fmt.extra_rules if getattr(r, "value", "")})
         if kinds:

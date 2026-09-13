@@ -31,7 +31,7 @@ _CONNECT = {
     "step": ["まず、", "次に、", "そのあとに、", "最後に、"],
     "evidence": ["調べた範囲では、", "開けたページが言うのは、", "複数ソースの一致は、", ""],
     "correction": ["", "惜しいのですが、", "ただ、"],
-    "note": ["", "参考までに、"],
+    "note": ["", "なお、"],
     "answer": ["", "答えは、", "まず、"],
     "lexical": ["辞書を引くと、", "表記を確認すると、", "言葉として、", ""],
     "advice": ["コツは、", "気をつけたいのは、", "実務的には、"],
@@ -183,7 +183,16 @@ def render(dossier, frame, *, turn: int = 0, lm=None, core=None, polisher=None,
                     continue
             conn = ""
         elif lines:
+            # 接続語は *この返答の中で 1 回* に抑える。素材文のほうが先に同じ接続語を
+            # 含んでいることもあるので、その場合は繋がない（二重の定型口癖に見える）。
             conn = _rot(rel, turn + len(lines))
+            already = "".join(lines) + body
+            step = 0
+            while conn and conn in already and step < 3:
+                step += 1
+                conn = _rot(rel, turn + len(lines) + step)
+            if conn and conn in already:
+                conn = ""
         sent = _tidy(conn + body)
         if c.kind == "step" and seen_steps and len([x for x in claims if x.kind == "step"]) <= 1:
             sent = _tidy(f"{conn}{body}")

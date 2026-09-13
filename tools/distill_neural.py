@@ -22,6 +22,10 @@ sys.path.insert(0, str(ROOT))
 OUT_DEFAULT = ROOT / "snipher" / "data" / "neural" / "core.npz"
 
 PROFILES = {
+    # v4    … SFT（指示追従）と実素材を主、文型生成は補助に落とした本番プロファイル
+    "v4": {"d_model": 320, "n_layers": 8, "n_heads": 8, "conv_kernel": 4, "epochs": 2,
+           "batch": 40, "seq_len": 96, "docs": 9000, "max_vocab": 3200,
+           "authored_repeat": 10, "kb_repeat": 5, "sft_repeat": 8, "corpus_docs": 12000},
     # v3big … v3 より語彙と幅を広げた最終候補（d=384 / L=8 / 語彙 3,000）
     "v3big": {"d_model": 384, "n_layers": 8, "n_heads": 8, "conv_kernel": 4, "epochs": 3,
               "batch": 40, "seq_len": 112, "docs": 14000, "max_vocab": 3000,
@@ -104,12 +108,15 @@ def main(argv: list[str] | None = None) -> int:
             lines = lines[: args.corpus_docs]
         grammar = [f"<asst>{' '.join(lines[i:i + 3])}" for i in range(0, len(lines) - 2, 3)] + grammar
         print(f"corpus: {args.corpus} → {len(grammar):,} docs")
-    ar, kr = int(prof.get("authored_repeat", 4)), int(prof.get("kb_repeat", 2))
-    docs = authored * ar + kb_docs * kr + grammar
+    sft = builder.sft_docs() if hasattr(builder, "sft_docs") else []   # 指示追従の型
+    ar = int(prof.get("authored_repeat", 4))
+    kr = int(prof.get("kb_repeat", 2))
+    sr = int(prof.get("sft_repeat", 6))
+    docs = authored * ar + kb_docs * kr + sft * sr + grammar
     docs = [d for d in docs if d and d.strip()]
     print(f"corpus: authored {len(authored)}x{ar} + kb {len(kb_docs)}x{kr} + "
-          f"grammar {len(grammar)} = {len(docs)} docs / {sum(len(d) for d in docs)} chars "
-          f"({time.time() - t0:.1f}s)")
+          f"sft {len(sft)}x{sr} + grammar {len(grammar)} = {len(docs)} docs / "
+          f"{sum(len(d) for d in docs)} chars ({time.time() - t0:.1f}s)")
 
     tok = CharTokenizer.from_text("\n".join(docs), max_vocab=prof["max_vocab"])
     print(f"vocab: {tok.size()} chars")
@@ -190,7 +197,7 @@ def main(argv: list[str] | None = None) -> int:
         "params": net.n_params(),
         "docs": len(docs),
         "corpus_mix": {"authored": len(authored) * ar, "kb": len(kb_docs) * kr,
-                       "grammar": len(grammar)},
+                       "sft": len(sft) * sr, "grammar": len(grammar)},
         "kv_cache": True,
         "train_tokens": len(train_ids),
         "metrics": res,

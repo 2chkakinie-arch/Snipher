@@ -1051,6 +1051,18 @@ class SnipherCore:
 
             authoritative = bool((reply.notes or {}).get("authoritative"))
             ok, _why = (True, "authoritative") if authoritative else _validate(reply.text, max_len=220)
+            if not ok and reply.sentences:
+                # 組み上げた文が *長さだけ* で通らないときは、先頭から文単位で
+                # 減らして使います。ここで古い定型棚に引っ込むのが一番まずいので。
+                keep: list[str] = []
+                for sent in reply.sentences:
+                    trial = "\n".join(keep + [sent])
+                    if len(trial) > 220:
+                        break
+                    keep.append(sent)
+                if keep and _validate("\n".join(keep), max_len=220)[0]:
+                    reply.text = "\n".join(keep)
+                    ok, _why = True, "trimmed"
             if ok and len(reply.text) >= 4:
                 text = reply.text
                 lm_info = None

@@ -595,7 +595,7 @@ def gather(frame, *, kb=None, web: WebGrounding | None = None,
             d.coverage = max(d.coverage, 0.72)
             d.notes.append(f"ウェブ裏取り: {len(evidence)} 文 / 出典 {len(sources)} 件")
         else:
-            d.notes.append("ウェブは繋がったが使える文が無かった（または未接続）")
+            d.notes.append("ウェブは開けたが、問いに答える本文は見つからなかった")
     elif need_web:
         d.notes.append("web 無効")
     return d
