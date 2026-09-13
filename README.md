@@ -30,7 +30,7 @@ v3 はそこを置き換えました。
 
 | 層 | 仕事 | 規模 |
 |---|---|---|
-| `snipher/instruction/` | 指示文を *仕事として* 読む→実行する→検証する（JSON 抽出・要約・コード・応答） | 8 モジュール、出力仕様の検査 11 種 |
+| `snipher/instruction/` | 指示文を *仕事として* 読む→実行する→検証する（JSON/CSV/表 抽出・要約・コード・応答・翻訳） | 9 モジュール、出力仕様の検査 25 種 |
 | `snipher/mind/` | 見る→集める→決める→書く→検べる の 1 本道（`think()`） | 6 層のパイプライン、固定の返し文はゼロ |
 | `snipher/lang/` | 実辞書（15 万語・読み・拍・品詞・活用 16,389 行）と文体の組み替え | Janome/IPADIC からビルド |
 | `snipher/ground/` | 知識ベース → 辞書 → **ウェブ裏取り**（検索→html-fetch→証拠文） | 220 話題・686 事実・471 問答 |
@@ -80,8 +80,11 @@ v3 はそこを置き換えました。
 指示文には「テキスト」「文章」「JSON」という **材料を指す語** が入っています。v3 まで
 Snipher はその語に反応して「テキストを読みました」を返していました。指示層
 （`snipher/instruction/`、詳細は `docs/instruction.md`）は指示部と材料部を分けて読み、
-出力仕様（JSON スキーマ・件数・文字数・口調・役割）を *契約* として受け取り、
-実行してから **機械的に検証** します。
+出力仕様（JSON スキーマ・CSV ヘッダ・件数・文字数・口調・役割・`必ず「…」を含めて` /
+`「…」は使わない` の規則）を *契約* として受け取り、実行してから **機械的に検証** します。
+欄名は材料からも読みます（`氏名: 山田太郎` → `name`、`りんごは1個120円。みかんは…` → 表 2 行）。
+翻訳（英訳・和訳）は文を節に割って役割（は/が/を/に/で/と）を訳先の語順に並べ替え、
+対応表に無い語は読みで残して `notes` に書きます。
 
 **JSON 抽出（`JSON 形式のみで出力`）** — 値は材料の文字列そのもの、装飾はゼロ:
 
@@ -224,25 +227,29 @@ SNIPHER_EDGE_SEARCH_URL=...  # エンドポイント差し替え
 ## 9. テストと計測
 
 ```bash
-.venv/bin/python -m pytest -q               # 469 passed, 3 skipped
+.venv/bin/python -m pytest -q               # 480 passed, 3 skipped
 .venv/bin/python tools/bench.py             # 速度・常駐・規模・文章の健全性
 .venv/bin/python tools/bench_instruction.py # 指示追従率・誤検出・逃げ（合格線で exit code）
 ```
 
-`tools/bench_instruction.py --runs 2` の実測（12 種の指示 × 2 回、`SNIPHER_WEB=off`）:
+`tools/bench_instruction.py --runs 2` の実測（20 種の指示 × 2 回、`SNIPHER_WEB=off`）:
 
 | 指標 | 値 |
 |---|---|
 | 指示追従率 | **100%**（extract / summarize / code / answer / list / transform すべて 1.0） |
-| 1 指示 | 中央値 9.2 ms / p95 28.8 ms / 最大 444 ms（33.6 指示/秒） |
-| タスク別中央値 | extract 0.9 ms・list 0.6 ms・transform 1.2 ms・answer 4.2 ms・summarize 12.7 ms・code 24.5 ms（実行込み） |
-| 誤検出 | **0 / 20**（会話を指示と読まない。読み取り中央値 0.05 ms） |
+| 1 指示 | 中央値 5.05 ms / p95 35.1 ms / 最大 547 ms（40.2 指示/秒） |
+| タスク別中央値 | extract 0.95 ms・list 1.37 ms・transform 2.04 ms・answer 10.23 ms・summarize 16.8 ms・code 26.68 ms（実行込み） |
+| 誤検出 | **0 / 20**（会話を指示と読まない。読み取り中央値 0.071 ms） |
 | 禁止表現（「できません」系） | **0** |
+
+中身の期待も機械判定します（`expect.contains` / `expect.absent`）: CSV のヘッダ行、
+表の 2 行、`必ず「α-β枝刈り」` の語、`「です・ます」は使わない` の不在、英訳の
+`weather/park/walk`、`コードのみ` のときにコードブロックの外に文字が無いこと。
 
 新規に足したテスト（v3 の契約）: `tests/test_lang.py`（辞書・音・活用）、
 `tests/test_mind.py`（frame/state/rules/play）、`tests/test_solve.py`（計算・コード・文字）、
 `tests/test_web_grounding.py`（検索と fetch）、`tests/test_v3_contract.py`（上の受け入れ条件）、
-`tests/test_instruction.py`（指示の読み取り・実行・検証・経路、32 本）。
+`tests/test_instruction.py`（指示の読み取り・実行・検証・経路、43 本）。
 
 ## 10. 同梱データのライセンス
 

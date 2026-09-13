@@ -389,5 +389,173 @@ def verify_json(text: str, schema: list[tuple[str, str]]) -> tuple[bool, str, di
     return True, "ok", got
 
 
+# --------------------------------------------------------------------------- #
+# ラベル付きの値（`氏名: 山田太郎`）と、文ごとの記録（`りんごは1個120円`）
+# --------------------------------------------------------------------------- #
+_LABEL_KEY = re.compile(r"([一-龯ァ-ヶーぁ-んA-Za-z][一-龯ァ-ヶーぁ-んA-Za-z0-9_ ()（）]{0,14})"
+                        r"\s*[:：]")
+_SUBJECT_VALUE = re.compile(r"^([一-龯ァ-ヶーぁ-んA-Za-z][一-龯ァ-ヶーぁ-んA-Za-z0-9_]{1,14})"
+                            r"(?:は|が|って|とは)\s*(.{1,60}?)\s*(?:です|だ|である)?[。！？!?]?$")
+
+
+def label_values(text: str) -> dict[str, str]:
+    """`氏名: 山田太郎, 年齢: 34` のような *ラベル: 値* をそのまま読む。
+
+    ラベルは指示に書かれた欄名と突き合わせる材料になります（欄名をでっち上げない）。
+    値は *次のラベルの手前* まで（区切りのカンマは落としません）。
+    """
+    src = str(text or "")
+    hits = list(_LABEL_KEY.finditer(src))
+    out: dict[str, str] = {}
+    for i, m in enumerate(hits):
+        key = m.group(1).strip(" 　、。,，")
+        start = m.end()
+        end = hits[i + 1].start() if i + 1 < len(hits) else len(src)
+        val = src[start:end].strip(" 　、。,，\n「」\"'")
+        # 直後の文（別の材料）まで飲み込まない
+        val = re.split(r"[。\n]", val)[0].strip(" 　、。,，")
+        if key and val and key not in out:
+            out[key] = val
+    return out
+
+
+def subject_values(text: str) -> list[tuple[str, str]]:
+    """`開始は10時、終了は17時です。` を [(開始, 10時), (終了, 17時)] と読む。
+
+    欄名が指示に無いとき、材料の主語を欄名にします（field1 のような名前は作りません）。
+    """
+    out: list[tuple[str, str]] = []
+    for sent in sentences(str(text or "")):
+        for part in re.split(r"[、,]\s*", sent.strip()):
+            m = _SUBJECT_VALUE.match(part.strip())
+            if m and m.group(1).strip() and m.group(2).strip():
+                out.append((m.group(1).strip(), _clean(m.group(2))))
+    # 文を区切りで割った断片も拾う（`開始は10時、終了は17時です。`）
+    return out
+
+
+def extract_records(payload: str, schema: list[tuple[str, str]]) -> list[dict[str, str]]:
+    """材料を *文単位の記録* として読む（`りんごは1個120円。みかんは1個80円。` → 2 行）。
+
+    各行はスキーマの欄を材料の文字列で埋めたものです。埋まらない欄は空文字のまま
+    （ここで値を作ると、材料に無いことを書いたことになります）。
+    """
+    src = str(payload or "")
+    rows: list[dict[str, str]] = []
+    labels = label_values(src)
+    if labels and schema:
+        # `name: 山田太郎, age: 34` は 1 行の記録
+        row: dict[str, str] = {}
+        pool = dict(labels)
+        for key, hint in schema:
+            hit = ""
+            for lab, val in list(pool.items()):
+                if _same_field(lab, key, hint):
+                    hit = val
+                    pool.pop(lab, None)
+                    break
+            row[key] = hit
+        if any(row.values()):
+            rows.append(row)
+        return rows
+
+    keys = [k for k, _ in schema]
+    if len(keys) < 2:
+        return rows
+    for sent in sentences(src):
+        m = _SUBJECT_VALUE.match(sent.strip())
+        if not m:
+            continue
+        subject, rest = m.group(1).strip(), m.group(2).strip()
+        row = {}
+        rest_labels = label_values(rest)
+        for key, hint in schema:
+            val = ""
+            for lab, v in rest_labels.items():
+                if _same_field(lab, key, hint):
+                    val = v
+                    break
+            if not val:
+                concept = concept_of(key, hint)
+                kinds = KIND2CONCEPT.get(concept, ()) if concept else ()
+                cands = [c for c in candidates(rest) if not kinds or c["kind"] in kinds]
+                if cands:
+                    val = cands[0]["surface"]
+            row[key] = val
+        # 主語を入れる欄（name / 名前 / 品名 …）が空なら、文の主語を使う
+        for key, hint in schema:
+            if row.get(key) or not _is_subject_field(key, hint):
+                continue
+            row[key] = subject
+        if any(row.values()):
+            rows.append(row)
+    return rows
+
+
+def _norm_field(word: str) -> str:
+    return normalize(str(word or "")).lower().replace(" ", "").replace("_", "")
+
+
+_SUBJECT_WORDS = ("name", "名前", "名称", "品名", "商品", "item", "product", "title", "題",
+                  "人名", "氏名", "label")
+_PRICE_WORDS = ("price", "値段", "価格", "金額", "fare", "cost", "円")
+
+
+def _is_subject_field(key: str, hint: str) -> bool:
+    w = _norm_field(key) or _norm_field(hint)
+    return any(x in w for x in _SUBJECT_WORDS)
+
+
+def _same_field(label: str, key: str, hint: str) -> bool:
+    """材料のラベル（氏名）と指示の欄名（name / 名前）が同じ欄かを判定する。"""
+    lab = _norm_field(label)
+    for w in (_norm_field(key), _norm_field(hint)):
+        if not w:
+            continue
+        if lab == w or lab in w or w in lab:
+            return True
+    concept = concept_of(key, hint)
+    if concept and concept_of(label, label) == concept:
+        return True
+    pairs = (("氏名", "name"), ("名前", "name"), ("名称", "name"), ("年齢", "age"),
+             ("住所", "city"), ("住所", "address"), ("都道府県", "city"), ("値段", "price"),
+             ("価格", "price"), ("金額", "price"), ("料金", "fare"), ("所要", "duration"),
+             ("時間", "time"), ("開始", "start"), ("終了", "end"), ("行き先", "destination"),
+             ("出発", "origin"), ("品名", "item"))
+    for a, b in pairs:
+        if (a in lab and b in _norm_field(key)) or (b in lab and a in _norm_field(hint) + _norm_field(key)):
+            return True
+    return False
+
+
+def render_rows(rows: list[dict[str, str]], schema: list[tuple[str, str]], kind: str, *,
+                indent: int = 2) -> str:
+    """複数行の記録を指定の形式に並べる（表 / CSV は行が増やせる、JSON は配列にする）。"""
+    keys = [k for k, _ in schema] or list(rows[0] if rows else {})
+    kind = (kind or "table").lower()
+    if not rows:
+        return ""
+    if kind == "csv":
+        buf = io.StringIO()
+        w = csv.writer(buf, lineterminator="\n")
+        w.writerow(keys)
+        for row in rows:
+            w.writerow([row.get(k, "") for k in keys])
+        return buf.getvalue().strip()
+    if kind in ("table", "markdown", "keyvalue", "kv"):
+        if kind in ("keyvalue", "kv") and len(rows) == 1:
+            return "\n".join(f"{k}: {rows[0].get(k, '')}" for k in keys)
+        head = "| " + " | ".join(keys) + " |"
+        sep = "| " + " | ".join("---" for _ in keys) + " |"
+        body = ["| " + " | ".join(str(r.get(k, "")).replace("|", "\\|") for k in keys) + " |"
+                for r in rows]
+        return "\n".join([head, sep, *body])
+    if len(rows) == 1:
+        return json.dumps({k: rows[0].get(k, "") for k in keys}, ensure_ascii=False, indent=indent)
+    return json.dumps([{k: r.get(k, "") for k in keys} for r in rows], ensure_ascii=False,
+                      indent=indent)
+
+
 __all__ = ["extract_fields", "candidates", "concept_of", "render_table", "verify_json",
-           "sentences", "CONCEPTS", "PATTERNS"]
+           "sentences", "CONCEPTS", "PATTERNS", "label_values", "subject_values",
+           "extract_records", "render_rows"]

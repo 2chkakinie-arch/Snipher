@@ -26,7 +26,8 @@ v3 までの Snipher は「テキストを読みました」という **語彙�
 |---|---|---|
 | 材料が差し出されている | `テキスト: 「…」` / ``` フェンス / `文章：` | 0.30（8 字以上）/ 0.22（ラベルあり） |
 | 出力スキーマ | `{"origin": "出発地", …}` | 0.35 |
-| 形式の指定 | `JSON 形式のみ` `CSV` `表形式` | 0.18（+ strict 0.12） |
+| 形式の指定 | `JSON 形式のみ` `CSV 形式` `表形式` `key: value 形式` | 0.18（+ strict 0.12） |
+| 出力ルール（引用された語） | `必ず「α-β枝刈り」を含めて` `「です・ます」は使わない` | 0.16 |
 | 命令の述語 | `〜してください` `〜せよ` | 0.12〜0.18 |
 | 仕事を名指しする動詞 | `要約` `抽出` `作成` `列挙` `変換` | 0.14 |
 | 件数 / 文字数 / 口調 / 役割 | `3つの箇条書き` `200文字程度` `〜だよ` `あなたは〜です` | 0.12 / 0.12 / 0.10 / 0.12 |
@@ -36,7 +37,13 @@ v3 までの Snipher は「テキストを読みました」という **語彙�
 `kind`（json/csv/table/keyvalue）`strict` `only_output` `no_greeting` `no_explanation`
 `schema_fields` `bullets` `numbered` `bullet_char` `lines` `max_chars` `target_chars`
 `length_kind`（brief/normal）`tone`（friendly/polite/plain…）`register` `language`
-`extra_rules`（`必ず` `〜のみ` `〜しないこと` の硬い制約）。
+`extra_rules`（`必ず「…」を含めて` `「…」は使わない` の硬い制約＝`Directive.rules`）。
+
+欄名（スキーマ）は *材料と指示の両方* から読みます。優先順は
+(1) JSON テンプレート、(2) `CSVフォーマット:` のヘッダ行、(3) `項目: 名前と値段` の欄名列、
+(4) 材料のラベル（`氏名: 山田太郎`）です。`100文字以内 / 以下 / まで / を超えない` は
+**上限**（`max_chars`）、`200文字程度` は目標（`target_chars`）として読み分けます。
+`「です・ます」は使わない` のような *打ち消し* は敬体の指定とは読みません（常体として扱う）。
 
 `Directive` は `task`（extract/summarize/code/answer/list/transform/write）と
 `instruction`（指示部）`payload`（材料部）`question`（問い）`role`（役割）を持ちます。
@@ -47,10 +54,11 @@ v3 までの Snipher は「テキストを読みました」という **語彙�
 
 | モジュール | 仕事 | ねつ造を防ぐ仕掛け |
 |---|---|---|
-| `extract.py` | 材料から値を抜き、スキーマの欄に埋める | 値は **材料の文字列そのもの**。距離・所要時間・料金は正規表現のパターンで拾い、欄に足りなければ `missing` として残す（埋めない） |
+| `extract.py` | 材料から値を抜き、スキーマの欄に埋める。`label_values`（`氏名: 山田太郎`）と `extract_records`（`りんごは1個120円。みかんは…` → 2 行）で **材料の形に合わせて行を増やす** | 値は **材料の文字列そのもの**。距離・所要時間・料金は正規表現のパターンで拾い、欄に足りなければ `missing` として残す（埋めない）。欄名が無いときは `field1` をでっち上げず、材料のラベルを欄名にする |
 | `summarize.py` | 文を単位に割り、内容語の重みで上位を points にする | `coverage`（材料の語をどれだけ使ったか）を返し、**材料に無い語で文を作らない**。点が足りなければ足りないまま返す |
 | `code.py` | 操作の動詞から関数を組み、**実際に実行**する | `node` / `python3` / `go run` で走らせて結果を `notes` に残す。実行できない言語は構文の自己点検まで、と明記する |
 | `answer.py` | 役割・口調・文字数を守って答える | 材料は 知識ベース → 実辞書 → ウェブ裏取り → **指示文が差し出した資料** → 数えられる事実 の順。推測で語義を作らない |
+| `translate.py` | 英訳・和訳。文を節に割り、役割（は/が/を/に/で/と）を英語の語順に並べ替える | 対応表に無い語は語彙バンクの **読み（ローマ字）** で残し `notes` に書く。材料に無い事実を足さない |
 | `style.py` | 口調（〜だよ/です・ます/常体）と長さの組み替え | 文末の語を実辞書で引いて辞書形に戻し、活用表で組み直す。語尾の文字差し替えはしない |
 
 コードの実行例（`uniqueSort(arr)`）:
@@ -81,8 +89,13 @@ TypeScript の型注釈（`nums: number[]`）は `strip_ts_types()` で外して
 | `tone_friendly` / `tone_polite` | 指定の語尾（だよ・だね / です・ます）が入っているか |
 | `code_fence` / `code_executed` / `function_name` | コードブロック、**実行が通ったか**、指定の関数名 |
 | `coverage` | 要約が材料の語をどれだけ使ったか（0.6 未満は不合格） |
+| `rule_require` / `rule_forbid` | 指示が `必ず含めて` と書いた語が入っているか、`使わない` と書いた語が無いか |
+| `line_count` / `no_extra_prose` | 行数の指定、`解説は不要` のときコードブロックの外に文字が無いか |
 | `well_formed` / `shape_ok` | 文章なら `composer.validate()`、データなら形の健全性 |
 
+検査の前に `apply_rules()` が規則を出力に当てます。`必ず「α-β枝刈り」を含めて` に対して
+語が無ければ最初の文の話題として入れ、その分だけ長くなるので **上限に収め直します**
+（`「です・ます」は使わない` は `style.restyle(register="plain")` で常体に組み替える）。
 落ちたら *組み直します*（要約は文字数予算を緩めて再構成、応答は材料を集め直す）。
 それでも落ちたら `ok=False` のまま返し、`checks` に理由を残します。
 **「できた」と嘘をつかない**ための仕組みです。
@@ -103,7 +116,7 @@ TypeScript の型注釈（`nums: number[]`）は `strip_ts_types()` で外して
 ## 5. 実測
 
 ```bash
-.venv/bin/python -m pytest -q tests/test_instruction.py     # 32 passed
+.venv/bin/python -m pytest -q tests/test_instruction.py     # 43 passed
 .venv/bin/python tools/bench_instruction.py                 # 判定 PASS
 ```
 
@@ -111,11 +124,16 @@ TypeScript の型注釈（`nums: number[]`）は `strip_ts_types()` で外して
 
 ```
 指示追従率 100.0%（extract / summarize / code / answer / list / transform すべて 1.0）
-1 指示: 中央値 9.2ms / p95 28.8ms / 最大 444ms（33.6 指示/秒）
-タスク別中央値: extract 0.9ms / list 0.6ms / transform 1.2ms / answer 4.2ms
-              summarize 12.7ms / code 24.5ms（実行込み）
-誤検出 0/20（読み取り 中央値 0.05ms） / 禁止表現 0
+1 指示: 中央値 5.05ms / p95 35.1ms / 最大 547ms（40.2 指示/秒）
+タスク別中央値: extract 0.95ms / list 1.37ms / transform 2.04ms / answer 10.23ms
+              summarize 16.8ms / code 26.68ms（実行込み）
+誤検出 0/20（読み取り 中央値 0.071ms） / 禁止表現 0
 ```
+
+指示のバッテリーは 20 種（40 実行）。CSV ヘッダからの欄読み、材料 2 件 → 表 2 行、
+`key: value`（ラベルを欄名に）、`必ず「…」を含めて` + `100文字以内`、`「です・ます」は使わない`、
+英訳 / 和訳、`コードのみ（解説は不要）` を含みます。中身の期待（必ず入る語 / 入ってはいけない語）も
+`expect.contains` / `expect.absent` で機械判定します。
 
 合格線は「全指示が仕様どおり・誤検出ゼロ・逃げゼロ」で、1 つでも外すと exit code 1 です。
 
@@ -128,3 +146,8 @@ TypeScript の型注釈（`nums: number[]`）は `strip_ts_types()` で外して
   **数えられる事実**を返します（`answer.py::fallback_claims`）。
 - 実行系の検査（`code_executed`）は `node` / `python3` / `go` が無い環境では
   構文の自己点検までに落ちます。そのときは `checks` にそう書いてあります。
+- 翻訳は「文型 + 語彙対応」の訳です。対応表（時間・場所・食べ物・移動・日常の動詞 約 250 語）に
+  無い語は読み（ローマ字）で残し、`notes` に *どの語が残ったか* を書きます。
+  専門分野の長文を文学的に訳すことはしません（材料の語を落とさないことを優先）。
+- 指示に名前が無い関数（「配列の合計を返す関数」）は操作から名前を付けます
+  （JS `sumValues` / Python `sum_values` / Go `SumValues`）。`notes` にそう書いた上で実行します。

@@ -364,6 +364,11 @@ def run(d: Directive, *, explain: bool = True) -> dict:
     ops = operations(text)
     notes: list[str] = []
     arg = _arg_name(args)
+    if not name and ops:
+        # 名前を書かない指示（「配列の合計を返す関数を書いて」）でも、操作から名前を付ける
+        name = _name_from_ops(ops, lang)
+        arg = _arg_from_ops(ops)
+        notes.append(f"関数名: 指示に名前が無いので {_op_label(ops[0])} から {name} と付けました")
     if lang == "ts":
         lang = "typescript"
 
@@ -435,6 +440,29 @@ def run(d: Directive, *, explain: bool = True) -> dict:
             "snippet": built}
 
 
+_NUMERIC_OPS = ("sum", "max", "min", "filter_even", "filter_odd", "average", "median")
+_NAME_PART = {"dedupe": "unique", "sort_asc": "sorted", "sort_desc": "sorted_desc",
+              "reverse": "reversed", "count": "count", "unique_count": "unique_count",
+              "sum": "sum", "max": "max", "min": "min", "filter_even": "evens",
+              "filter_odd": "odds"}
+
+
+def _name_from_ops(ops: list[str], lang: str) -> str:
+    """操作から関数名を作る（`sum` → JS/TS `sumValues`, Python `sum_values`, Go `SumValues`）。"""
+    parts = [_NAME_PART.get(o, o) for o in ops[:2]] or ["solve"]
+    if lang == "python":
+        return "_".join(parts)
+    if lang == "go":
+        return "".join(p[:1].upper() + p[1:] for p in parts) + "Values"
+    head, *rest = parts
+    return head + "".join(p[:1].upper() + p[1:] for p in rest) + "Values" \
+        if len(parts) > 1 else head + "Values"
+
+
+def _arg_from_ops(ops: list[str]) -> str:
+    return "numbers" if any(o in _NUMERIC_OPS for o in ops) else "items"
+
+
 def _op_label(op: str) -> str:
     return {"dedupe": "重複除去", "sort_asc": "昇順", "sort_desc": "降順", "reverse": "反転",
             "count": "件数", "unique_count": "種類数", "sum": "合計", "max": "最大",
@@ -443,6 +471,8 @@ def _op_label(op: str) -> str:
 
 def _format_existing(res, *, explain: bool = True) -> str:
     parts = [f"```{res.language}\n{res.code}\n```"]
+    if not explain:
+        return parts[0]                       # コードのみ（解説も実行メモも付けない）
     if res.ran and res.stdout:
         first = res.stdout.splitlines()[0]
         rest = len(res.stdout.splitlines()) - 1

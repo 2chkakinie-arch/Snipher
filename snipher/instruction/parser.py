@@ -88,9 +88,10 @@ _JSON_ONLY = re.compile(
 )
 _JSON_WORD = re.compile(r"\bjson\b|ｊｓｏｎ|ジェイソン", re.IGNORECASE)
 _JSON_AS_OUTPUT = re.compile(r"json\s*(?:形式|フォーマット|記法|で|に|として|のみ|だけ)", re.IGNORECASE)
-_CSV_WORD = re.compile(r"\bcsv\b|カンマ区切り|コンマ区切り", re.IGNORECASE)
-_TABLE_WORD = re.compile(r"表形式|テーブルで|markdown\s*の?表|マークダウンの表|\btable\b", re.IGNORECASE)
-_KEYVALUE_WORD = re.compile(r"キーと値|key\s*[:：]?\s*value|項目\s*[：:]\s*値", re.IGNORECASE)
+_CSV_WORD = re.compile(r"(?<![A-Za-z])csv(?![A-Za-z])|カンマ区切り|コンマ区切り", re.IGNORECASE)
+_TABLE_WORD = re.compile(r"表形式|テーブルで|markdown\s*の?表|マークダウンの表|(?<![A-Za-z])table(?![A-Za-z])", re.IGNORECASE)
+_KEYVALUE_WORD = re.compile(r"キーと値|key\s*[:：\-]?\s*value|keys?\s*and\s*values?|"
+                            r"項目\s*[：:]\s*値|k\s*[:：]\s*v|ラベルと値", re.IGNORECASE)
 
 _N = r"(?:[0-9０-９]+|[一二三四五六七八九十]+)"
 _BULLETS = re.compile(
@@ -307,11 +308,35 @@ def schema_fields(template: str) -> list[tuple[str, str]]:
     return out
 
 
+_CSV_HEADER_LABEL = re.compile(
+    r"(?:csv|カンマ区切り|コンマ区切り)\s*(?:フォーマット|形式|ヘッダー|の形|で)?\s*[：:]\s*([^\n]+)",
+    re.IGNORECASE)
+_FIELD_LIST_LABEL = re.compile(
+    r"(?:項目|欄|キー|フィールド|columns?|fields?)\s*[：:]\s*([^\n]+)", re.IGNORECASE)
+_LATIN_HEADER = re.compile(
+    r"^\s*([A-Za-z_][A-Za-z0-9_]*(?:\s*,\s*[A-Za-z_][A-Za-z0-9_]*)+)\s*$")
+
+
+def _split_field_names(body: str) -> list[str]:
+    """欄名の列を割る（`name,age,city` / `名前と値段` / `名前・値段`）。"""
+    src = str(body or "")
+    # 日本語の「名前と値段」は空白が無いので、*名詞をつなぐ と* で割る
+    src = re.sub(r"(?<=[一-龯ァ-ヶーA-Za-z0-9])と(?=[一-龯ァ-ヶーA-Za-z])", "、", src)
+    parts = [x.strip(" 　。、,.・/") for x in re.split(r"[,、・]", src)]
+    return [p for p in parts if p and len(p) <= 24][:12]
+
+
 def parse_schema(text: str) -> tuple[list[tuple[str, str]], list[tuple[int, int]]]:
-    """指示文中の JSON テンプレートを全部探し、スキーマ（キーと日本語ヒント）を作る。"""
+    """出力スキーマ（キーと日本語ヒント）を読む。
+
+    読む順番は (1) JSON テンプレート (2) `CSVフォーマット: name,age,city` のヘッダ行
+    (3) `項目: 名前と値段` の欄名リスト (4) 単独の欧文ヘッダ行。
+    どれも *指示文に書かれていた形* そのままなので、欄名をでっち上げません。
+    """
+    t = str(text or "")
     spans: list[tuple[int, int]] = []
     fields_: list[tuple[str, str]] = []
-    for body, a, b in find_json_templates(text):
+    for body, a, b in find_json_templates(t):
         got = schema_fields(body)
         if not got:
             continue
@@ -319,6 +344,27 @@ def parse_schema(text: str) -> tuple[list[tuple[str, str]], list[tuple[int, int]
         for k, v in got:
             if k not in [x for x, _ in fields_]:
                 fields_.append((k, v))
+    if fields_:
+        return fields_, spans
+
+    m = _CSV_HEADER_LABEL.search(t)
+    if m:
+        names = _split_field_names(m.group(1))
+        if len(names) >= 2:
+            spans.append((m.start(1), m.end(1)))
+            return [(n, "") for n in names], spans
+    m = _FIELD_LIST_LABEL.search(t)
+    if m:
+        names = _split_field_names(m.group(1))
+        if names:
+            spans.append((m.start(1), m.end(1)))
+            return [(n, n) for n in names], spans
+    for line in t.split("\n"):
+        mline = _LATIN_HEADER.match(line)
+        if mline:
+            names = [x.strip() for x in mline.group(1).split(",")]
+            if len(names) >= 2:
+                return [(n, "") for n in names], spans
     return fields_, spans
 
 
@@ -334,22 +380,25 @@ def parse_format(text: str, *, schema: list[tuple[str, str]] | None = None) -> F
         f.schema_fields = list(schema)
 
     # ---- 形式 ---- #
-    has_json = bool(_JSON_WORD.search(t)) or bool(f.schema_fields) or bool(_JSON_AS_OUTPUT.search(t))
-    if has_json:
-        f.kind = "json"
-    elif _CSV_WORD.search(t):
+    # 明示された形式（CSV / 表 / key: value）を *先に* 読みます。JSON テンプレートが
+    # 無い指示でもスキーマ欄は読めるので、ここで JSON 扱いにすると出力が化けます。
+    has_json_template = bool(f.schema_fields) and bool(_JSON_WORD.search(t)) \
+        or bool(_JSON_AS_OUTPUT.search(t)) or bool(_JSON_ONLY.search(t))
+    if _CSV_WORD.search(t):
         f.kind = "csv"
     elif _TABLE_WORD.search(t):
         f.kind = "table"
     elif _KEYVALUE_WORD.search(t):
         f.kind = "keyvalue"
+    elif bool(_JSON_WORD.search(t)) or has_json_template or bool(f.schema_fields):
+        f.kind = "json"
 
     # 「JSON 形式のみで出力」「余計な挨拶や解説は不要」→ strict
     only = bool(_ONLY_OUTPUT.search(t))
     needless = bool(re.search(r"(?:不要です|不要|いらない|無しで|なしで|without|省略して|省いて)", t))
-    if f.kind == "json" and (bool(_JSON_AS_OUTPUT.search(t)) or needless
-                             or re.search(r"(?:のみ|だけ)", t)
-                             or re.search(r"json\s*(?:形式|フォーマット)?\s*(?:のみ|だけ)", low)):
+    if f.kind and (bool(_JSON_AS_OUTPUT.search(t)) or needless
+                   or re.search(r"(?:のみ|だけ)", t)
+                   or re.search(r"json\s*(?:形式|フォーマット)?\s*(?:のみ|だけ)", low)):
         f.strict = True
         f.only_output = True
     if re.search(r"(?:余計な|他の|ほかの|それ以外の)?\s*(?:挨拶|前置き|解説|説明|注釈)\s*(?:は|も)?\s*(?:不要|いらない|なし|無し|しないで|添えない)", t):
@@ -383,7 +432,9 @@ def parse_format(text: str, *, schema: list[tuple[str, str]] | None = None) -> F
         if not n or n > 100000:
             continue
         tail = t[m.end():m.end() + 4]
-        if re.match(r"\s*(?:以内|以下)", tail):
+        # `_LEN_KIND` が「以内」まで飲み込むので、*一致した文字列自体* でも判定する
+        if re.search(r"(?:以内|以下|まで|を超えない|以内に収め)", m.group(0)) \
+                or re.match(r"\s*(?:以内|以下)", tail):
             f.length_kind, f.max_chars = "max", n
         elif re.match(r"\s*(?:程度|くらい|ぐらい|前後|ほど|を目安|を目標)", tail):
             f.length_kind, f.target_chars = "approx", n
@@ -405,8 +456,14 @@ def parse_format(text: str, *, schema: list[tuple[str, str]] | None = None) -> F
                       (_TONE_FRIENDLY, "friendly"), (_TONE_PRO, "professional")):
         m = pat.search(t)
         if m:
-            tones.append(name)
             word = m.group(0)
+            tail = t[m.end():m.end() + 14]
+            if name == "polite" and re.search(
+                    r"^(?:[」』\"”]\s*)?(?:調|口調)?\s*(?:は|も|を)?\s*"
+                    r"(?:使わ|使うな|使っては|禁止|ダメ|だめ|避け|なく|不要|抜き|やめ)", tail):
+                tones.append("plain")     # 「「です・ます」は使わない」＝常体で書く指示
+                continue
+            tones.append(name)
             # 「ベテランエンジニアのアシスタント」のような *名詞の一部* は口調の指定ではない
             if _PRO_WORD.fullmatch(word) and not re.search(r"(?:な|の|に|だ|である|口調|風|さ)", t[m.end():m.end() + 3]):
                 continue
@@ -438,13 +495,62 @@ def parse_format(text: str, *, schema: list[tuple[str, str]] | None = None) -> F
     if m:
         f.language = m.group(1)
 
-    # ---- 既存の規則コンパイラも取り込む（start/end/forbid/require/charset） ---- #
+    # ---- 出力ルール: 指示層の厳密な読みを先に、既存コンパイラは形の話だけ ---- #
+    # `compile_rules` の require/forbid は緩く拾うので（「〜を要約してください」まで
+    # 含めてしまう）、ここでは *引用符基準* の読みを優先し、向こうからは
+    # start / end / charset / lang だけ取り込みます。
+    rules = read_output_rules(t)
     try:
-        f.extra_rules = [r for r in compile_rules(t) if r.kind in
-                         ("start", "end", "forbid", "require", "charset", "lang")]
+        rules += [r for r in compile_rules(t) if r.kind in ("start", "end", "charset", "lang")]
     except Exception:  # noqa: BLE001
-        f.extra_rules = []
+        pass
+    seen: set[tuple[str, str]] = set()
+    f.extra_rules = []
+    for r in rules:
+        key = (r.kind, str(r.value))
+        if key in seen:
+            continue
+        seen.add(key)
+        f.extra_rules.append(r)
     return f
+
+
+# --------------------------------------------------------------------------- #
+# 出力ルール（「必ず「X」を含めて」「Xは書かないこと」）
+# --------------------------------------------------------------------------- #
+#: 含める指定。引用符の中身をそのまま値にする（引用符が無ければ「Xという語」の X）
+_REQUIRE = re.compile(
+    r"(?:必ず|かならず|絶対|絶対に|must)?\s*"
+    r"(?:[「『\"']([^」』\"'\n]{1,40})[」』\"']"
+    r"|([^「」『』\"'\s\n]{1,24}?)(?:という語|という単語|の語|という文字列))\s*"
+    r"(?:という(?:語|単語|文字列))?\s*(?:を|は|も)?\s*(?:含め|入れ|使い|使用し|記載|書く|入れよ)")
+#: 含めない指定
+_FORBID = re.compile(
+    r"(?:[「『\"']([^」』\"'\n]{1,40})[」』\"']"
+    r"|([^「」『』\"'\s\n]{1,24}?)(?:という語|という単語|の語))\s*"
+    r"(?:という(?:語|単語|文字列))?\s*(?:を|は|も)?\s*"
+    r"(?:含めな|入れな|使わ|使用しな|書か|書くな|禁じ|なしで|無しで|不要|"
+    r"入れない|含めない)")
+
+
+def read_output_rules(text: str) -> list[Rule]:
+    """「必ず「X」を含めて」「Xは書かない」を *引用符の中身そのもの* として読む。
+
+    `mind.rules.compile_rules` は遊びの条件（文字数・音数・語の連鎖）用に緩く拾うので、
+    「〜を要約してください」のような指示の一部まで require に入れてしまいます。
+    指示層では引用符を基準に読み直し、検証（`run.verify`）で実際に照合します。
+    """
+    t = str(text or "")
+    out: list[Rule] = []
+    for pat, kind in ((_REQUIRE, "require"), (_FORBID, "forbid")):
+        for m in pat.finditer(t):
+            val = (m.group(1) or m.group(2) or "").strip(" 　。、,.!?！？")
+            if not val:
+                continue
+            if any(r.kind == kind and r.value == val for r in out):
+                continue
+            out.append(Rule(kind=kind, value=val, raw=m.group(0), hard=True))
+    return out
 
 
 # --------------------------------------------------------------------------- #
@@ -757,6 +863,11 @@ def parse(text: str, *, min_score: float = 0.55) -> Directive | None:
     if fmt.target_chars or fmt.max_chars:
         score += 0.12
         signals.append(f"length:{fmt.target_chars or fmt.max_chars}")
+    if fmt.extra_rules:
+        kinds = sorted({str(r.kind) for r in fmt.extra_rules if getattr(r, "value", "")})
+        if kinds:
+            score += 0.16
+            signals.append("rules:" + "/".join(kinds))
     if fmt.tone:
         score += 0.10
         signals.append(f"tone:{fmt.tone}")
@@ -816,4 +927,5 @@ def explain(d: Directive | None) -> str:
 
 __all__ = ["Directive", "FormatSpec", "parse", "parse_format", "parse_schema", "split_payload",
            "classify_task", "detect_language", "function_spec", "find_json_templates",
-           "schema_fields", "parse_role", "parse_question", "explain", "PAYLOAD_MARKERS"]
+           "schema_fields", "parse_role", "parse_question", "explain", "PAYLOAD_MARKERS",
+           "read_output_rules"]
