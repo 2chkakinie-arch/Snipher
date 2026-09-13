@@ -549,6 +549,34 @@ def think(text: str, *, history: list[dict] | None = None, kb=None, web=None, lm
         thought.dossier = dossier_obj.as_dict()
         return _finalize(out, thought, frame, dossier_obj, claims)
 
+    # ---- 0a) 検証可能な計算（2+2 / 3.5*2 / 2+2= …）はソルバで確定 --------- #
+    # 「読めない入力」より前に置く: 式は不透明では無い。解けるときだけ確定させ、
+    # 解けないときはそのまま次の段階へ落とす。
+    _raw = str(text or "").strip()
+    if re.fullmatch(r"[0-9０-９+\-×÷*/^=.%?\s]+", _raw) and re.search(r"[+\-×÷*/^=]", _raw) \
+            and len(_raw) <= 60 and tasks is not None:
+        try:
+            _kind = tasks.classify(_raw, web=False)
+        except Exception:  # noqa: BLE001
+            _kind = None
+        if _kind in ("arithmetic", "equation", "word_problem"):
+            try:
+                _ans = tasks.answer(_raw, web=False)
+            except Exception:  # noqa: BLE001
+                _ans = None
+            if _ans is not None and str(getattr(_ans, "text", "") or "").strip():
+                claims.extend([Claim(kind="result", content=str(_ans.text).strip(),
+                                     subject=_kind, source=f"tool:{_kind}",
+                                     weight=float(_ans.confidence or 0.9),
+                                     extra={"task": _ans.as_dict()})])
+                thought.steps.append(f"task={_kind}")
+                dossier_obj = _DossierLite(claims=claims, coverage=0.9, topic=frame.topic,
+                                           via="tool", sources=[], web_used=False,
+                                           notes=["arithmetic"], evidence=[])
+                out = render(dossier_obj, frame, turn=turn_no, lm=lm, polisher=polisher)
+                thought.dossier = {"via": "tool", "claims": [c.as_dict() for c in claims]}
+                return _finalize(out, thought, frame, dossier_obj, claims)
+
     # ---- 0b) 入力が読めないとき: 読めた部分を確定させる -------------------- #
     if frame.flags.get("opaque") in ("digits_only", "single_char", "mojibake", "latin_noise"):
         claims.extend(opaque_claims(text, turn_no))
@@ -657,22 +685,35 @@ def think(text: str, *, history: list[dict] | None = None, kb=None, web=None, lm
             body = "変換する語が特定できませんでした。"
         claims.append(Claim(kind="answer", content=body, subject=word, source="lex", weight=0.64,
                             extra={"word": word, "target": lang}))
-        claims.append(Claim(kind="note",
-                            content=f"{lang}側の対応語まで踏み込むなら、検索を通したほうが"
-                                    "出典つきの用例ごと持ってこられます。",
-                            source="lex", weight=0.52))
-        thought.steps.append("翻訳要求: 確認できる形の記述 + 検索で取れるものの案内")
+        thought.steps.append("翻訳要求: 確認できた対応語で答えた")
 
     # ---- 2b) 日常の平叙・報告・こぼれ言 → chat 層（中身を見て組み立てる） ----- #
     # v3 までは「相手の文をそのまま引用 → 語を一語ください」だけでした。chat 層は
     # 発話行為・気分・内容語を読み、知識ベースから *その話題について言える事実* を引いて
     # 組み立てます。長文（今日○に行く予定、等）もここで処理するので、40 字で打ち切りません。
-    if not claims and frame.act in ("declare", "wish", "invite") \
-            and not re.search(r"(とは|なぜ|どうして|何ですか|いくら|教えて|方法|手順|使い方)",
-                              frame.norm) \
-            and not _kb_has_actionable(text, kb=kb):
-        claims.extend(_chat_claims(text, frame=frame, kb=kb, history=history, turn=turn_no))
-        if not claims and not frame.flags.get("opaque"):
+    if not claims and not _kb_has_actionable(text, kb=kb):
+        _is_plain = (frame.act in ("declare", "wish", "invite")
+                     and not re.search(r"(とは|なぜ|どうして|何ですか|いくら|教えて|方法|手順|使い方)",
+                                       frame.norm))
+        # 「X って何」のような定義問いで、X が未登録の *既知部品からなる語* なら、
+        # 頭語（猿）の知識で答えるより *全体を分解して推測* するほうが正直です。
+        _is_unknown_defq = (frame.ask in ("definition", "what")
+                            and not re.search(r"(なぜ|どうして|いくら|いつ|どこ|方法|手順|使い方)",
+                                              frame.norm))
+        if _is_plain or _is_unknown_defq:
+            compound = _unknown_compound(text)
+            if compound:
+                inferred = _infer_unknown_term(compound, turn=turn_no, text=text, kb=kb)
+                if inferred:
+                    claims.append(Claim(kind="note",
+                                        content=_join_bits([inferred,
+                                                            _inference_tail(compound, turn_no, text=text)]),
+                                        subject=compound, source="lex", weight=0.62,
+                                        extra={"inferred": True, "term": compound}))
+                    thought.steps.append(f"未知語: 「{compound}」を部品分解して推測した")
+        if _is_plain and not claims:
+            claims.extend(_chat_claims(text, frame=frame, kb=kb, history=history, turn=turn_no))
+        if _is_plain and not claims and not frame.flags.get("opaque"):
             #  unknown 語を含む発話は「〜なんですね」の言い換えでは終わらせません。
             claims.extend(_feeling_claims(frame, turn_no) if frame.mood != "neutral"
                           else _statement_claims(frame, turn_no))
@@ -737,6 +778,10 @@ def think(text: str, *, history: list[dict] | None = None, kb=None, web=None, lm
         src = str(getattr(c, "source", "") or "")
         if src.startswith("tool") or src == "web":
             return True
+        # 翻訳の対応語が決まっていれば、それが答え。別話題（英語などの言語名）の
+        # KB 記述を足すと「リスニングは…」「どのくらいやってきましたか」が増えるだけ。
+        if frame.ask == "translation" and c.kind == "answer" and str(c.source) == "lex":
+            return True
         if "kb" in src and topic_key and topic_key in str(getattr(c, "content", "")):
             return True
         return False
@@ -799,7 +844,10 @@ def think(text: str, *, history: list[dict] | None = None, kb=None, web=None, lm
     # 検索すべき語だったのに裏が取れなかったときは、*何を確かめて何が無いのか* を先に言う。
     disclosed = False
     has_substance = any(str(c.source).startswith(("tool", "web", "session"))
-                        or ("kb" in str(c.source) and c.kind != "note") for c in claims)
+                        or ("kb" in str(c.source) and c.kind != "note")
+                        or (frame.ask == "translation" and c.kind == "answer"
+                            and str(c.source) == "lex")
+                        for c in claims)
     if frame.needs_web and not has_substance:
         extra = _decompose_claims(frame, text, turn_no, kb=kb)
         if extra:
@@ -858,6 +906,11 @@ def think(text: str, *, history: list[dict] | None = None, kb=None, web=None, lm
                          topic=frame.topic, via=via, notes=["直接回答"], evidence=[])
         thought.dossier = dossier_obj.as_dict()
     out = render(dossier_obj, frame, turn=turn_no, lm=lm, polisher=polisher)
+    # 翻訳の依頼は対応語が決まれば *検証済みの実行結果*。小型モデルのフォローアップを
+    # 足さない（「どのくらいやってきましたか」のような無関係な一文が増えるだけ）。
+    if frame.ask == "translation" and out.text and any(
+            c.kind == "answer" and str(c.source) == "lex" for c in claims):
+        out.authoritative = True
     if not out.text:
         from ..ground.evidence import Dossier
 
@@ -1011,9 +1064,332 @@ def shape_line(text: str) -> str:
 def _is_question_text(text: str) -> bool:
     """問いの形か。「〜とは」「〜って」は疑問記号が無くても語を尋ねています。"""
     t = normalize(str(text or ""))
-    if re.search(r"[？?]|教えて|知りたい|何ですか|どう|なぜ|いくら|いつ|どこ|できますか|ですか", t):
+    if re.search(r"[？?]|教えて|知りたい|何ですか|どう|なぜ|いくら|いつ|どこ|できますか|ですか|"
+                 r"ありますか|いますか|って何|とは何|とは何だ|何$|なん$|なぜか|なんで", t):
+        return True
+    if re.search(r"(?:か|かな)\s*[?？!！。]*$", t):
         return True
     return bool(re.search(r"(?:とは|って(?:は)?|という(?:意味)?は)\s*[。.]?\s*$", t))
+
+
+# --------------------------------------------------------------------------- #
+# 未知語の推論（inference_templates.json = 部品分解型の思考パターン集）
+# --------------------------------------------------------------------------- #
+# 知識ベースに無い語が来ても「一語ください」で止めないためのエンジン。
+# 語を *既知の部品*（テンプレート辞書の語・実辞書の語・漢字の意味）に分解し、
+# 部品の意味を足し合わせて読み进行す。コーパスは snipher/data/inference_templates.json
+# （tools/build_inference.py で再生成）。読み込みは 1 回だけ・プロセス内で共有。
+
+_TEMPLATE_INDEX: dict[str, dict] | None = None
+_KANJI_MEANINGS: dict[str, str] = {
+    "黄": "黄色く輝く", "金": "金のように貴重で輝く", "銀": "銀のように光る金属",
+    "銅": "金属の一つ", "鉄": "硬い金属", "電": "電気", "光": "光・輝き",
+    "闇": "暗さ", "炎": "火・熱", "火": "火・熱", "水": "水・流れる", "氷": "冷たい氷",
+    "雪": "雪・白い", "雨": "雨", "風": "風", "雲": "雲", "霧": "霧・かすみ",
+    "日": "太陽・日", "月": "月", "星": "星", "天": "空・天", "空": "空",
+    "山": "山", "川": "川・流れる水", "海": "海", "森": "森",
+    "木": "木・植物", "花": "花", "草": "草", "葉": "葉", "果": "実・果実",
+    "土": "土・大地", "砂": "砂", "石": "石", "岩": "岩", "壁": "壁",
+    "心": "心・気持ち", "意": "意志・意図", "思": "思う", "知": "知る・知識",
+    "学": "学ぶ・学問", "文": "文章", "字": "文字", "言": "言葉", "語": "言葉",
+    "名": "名前", "声": "声", "音": "音", "歌": "歌", "話": "話す",
+    "比": "割合・比率", "率": "割合", "数": "数・量", "量": "量", "計": "はかる・計画",
+    "算": "計算", "理": "理・ことわり", "論": "論じる", "法": "法則・方法",
+    "則": "決まり", "規": "規範", "道": "道・教え", "術": "術・技術",
+    "技": "技術", "工": "工作・工学", "器": "器具", "械": "機械", "機": "機械・仕組み",
+    "球": "丸い形", "円": "円", "角": "角", "形": "形・かたち", "状": "状態",
+    "体": "体・からだ", "身": "身", "頭": "頭", "手": "手", "足": "足・歩く",
+    "目": "目", "耳": "耳", "口": "口・話す", "舌": "舌", "唇": "唇",
+    "人": "人・ひと", "民": "民・人々", "王": "王", "将": "将・大将", "士": "士",
+    "家": "家", "村": "村", "町": "町", "国": "国", "都": "都・首都",
+    "世": "世", "代": "代", "時": "時", "期": "期間", "年": "年", "紀": "紀元",
+    "朝": "朝", "夕": "夕", "夜": "夜", "昼": "昼",
+    "色": "色", "赤": "赤", "青": "青", "白": "白", "黒": "黒", "紫": "紫",
+    "緑": "緑", "藍": "藍", "朱": "朱", "灰": "灰色",
+    "力": "力・ちから", "気": "気・空気", "魂": "魂", "霊": "霊", "神": "神",
+    "鬼": "鬼", "獣": "獣", "鳥": "鳥", "魚": "魚", "虫": "虫", "馬": "馬",
+    "牛": "牛", "犬": "犬", "猫": "猫", "猿": "猿", "狼": "狼", "虎": "虎",
+    "龍": "龍", "竜": "竜", "蛇": "蛇", "亀": "亀", "貝": "貝",
+    "食": "食べる", "飲": "飲む", "味": "味", "甘": "甘い", "辛": "辛い",
+    "塩": "塩", "糖": "砂糖", "飯": "飯", "茶": "茶",
+    "服": "服", "衣": "衣", "布": "布", "紙": "紙", "筆": "筆", "墨": "墨",
+    "書": "書く", "画": "描く", "作": "作る", "生": "生まれる・生",
+    "死": "死", "命": "命", "老": "老いる", "幼": "幼い",
+    "愛": "愛", "情": "情", "恋": "恋", "友": "友", "親": "親", "子": "子",
+    "父": "父", "母": "母", "男": "男", "女": "女",
+    "走": "走る", "飛": "飛ぶ", "泳": "泳ぐ", "登": "登る", "降": "降る",
+    "動": "動く", "止": "止まる", "転": "転がる", "跳": "跳ぶ",
+    "追": "追う", "捕": "捕まえる", "逃": "逃げる",
+    "見": "見る", "聞": "聞く", "触": "触れる", "嗅": "嗅ぐ",
+    "考": "考える", "判": "分かる", "覚": "覚える", "忘": "忘れる",
+    "教": "教える", "習": "習う", "研": "研究", "究": "究める", "索": "探す",
+    "求": "求める", "探": "探す", "調": "調べる", "査": "調べる",
+    "開": "開く", "閉": "閉じる", "入": "入る", "出": "出る", "帰": "帰る",
+    "来": "来る", "往": "往く", "行": "行く", "届": "届く", "送": "送る",
+    "取": "取る", "持": "持つ", "放": "放す", "置": "置く", "積": "積む",
+    "並": "並ぶ", "続": "続く", "連": "連なる", "接": "接する", "結": "結ぶ",
+    "切": "切る", "割": "割る", "分": "分ける", "合": "合わせる", "融": "溶ける・融合",
+    "混": "混ざる", "排": "排する", "除": "除く", "選": "選ぶ", "抜": "抜く",
+    "補": "補う", "増": "増える", "減": "減る", "倍": "倍", "半": "半",
+    "全": "すべて", "一": "一つ", "二": "二つ", "三": "三つ", "四": "四つ",
+    "五": "五つ", "六": "六つ", "七": "七つ", "八": "八つ", "九": "九つ",
+    "十": "十", "百": "百", "千": "千", "万": "万", "億": "億",
+    "大": "大きい", "小": "小さい", "長": "長い", "短": "短い", "高": "高い",
+    "低": "低い", "深": "深い", "浅": "浅い", "広": "広い", "狭": "狭い",
+    "厚": "厚い", "薄": "薄い", "重": "重い", "軽": "軽い", "速": "速い",
+    "遅": "遅い", "早": "早い", "新": "新しい", "古": "古い",
+    "強": "強い", "弱": "弱い", "硬": "硬い", "軟": "軟らかい", "滑": "滑る",
+    "粗": "粗い", "細": "細かい", "多": "多い", "少": "少ない", "有": "ある",
+    "無": "ない", "非": "非・反", "反": "反対", "対": "対する",
+    "較": "比べる", "争": "争う", "戦": "戦う", "勝": "勝つ",
+    "敗": "負ける", "攻": "攻める", "守": "守る", "防": "防ぐ", "護": "護る",
+    "治": "治める", "統": "統べる", "領": "領する", "導": "導く",
+    "使": "使う", "用": "使う", "働": "働く", "勤": "働く", "職": "職業",
+    "業": "業・仕事", "商": "商う", "売": "売る", "買": "買う",
+    "価": "価格", "額": "額", "費": "費用", "利": "利益",
+    "損": "損", "債": "債", "税": "税", "給": "給与", "賞": "賞",
+    "医": "医学", "薬": "薬", "病": "病", "康": "健康", "健": "健康",
+    "美": "美しい", "麗": "麗しい", "妙": "妙", "奇": "奇妙", "偉": "偉い",
+    "壮": "壮", "豪": "豪", "優": "優れる", "良": "良い", "善": "善い",
+    "悪": "悪い", "毒": "毒", "危": "危ない", "険": "険しい",
+    "安": "安い・安全", "静": "静か", "穏": "穏やか", "激": "激しい",
+    "熱": "熱い", "寒": "寒い", "温": "温かい", "涼": "涼しい", "冷": "冷たい",
+    "明": "明るい", "暗": "暗い", "濃": "濃い", "淡": "淡い",
+    "鮮": "鮮やか", "艶": "艶", "輝": "輝く", "照": "照らす", "映": "映す",
+    "閃": "閃く", "燃": "燃える", "焼": "焼く",
+    "爆": "爆発", "炸": "炸裂", "蒸": "蒸す", "煮": "煮る", "炒": "炒める",
+    "砕": "砕く", "破": "破る", "壊": "壊す", "裂": "裂ける",
+    "亡": "亡くなる", "滅": "滅ぶ", "消": "消える", "尽": "尽きる",
+    "満": "満つ", "溢": "溢れる", "流": "流れる", "注": "注ぐ",
+    "滴": "滴る", "波": "波", "潮": "潮",
+    "湧": "湧く", "噴": "噴く", "沸": "沸く", "湯": "湯", "泉": "泉",
+    "源": "源", "派": "派", "系": "系",
+    "類": "類", "種": "種", "族": "族", "型": "型",
+    "態": "態", "式": "式", "様": "様子",
+    "容": "容", "姿": "姿", "貌": "容貌",
+    "面": "面・顔", "皮": "皮", "毛": "毛", "髪": "髪", "爪": "爪", "骨": "骨",
+    "筋": "筋", "血": "血", "肉": "肉", "脂": "脂",
+    "肺": "肺", "肝": "肝", "胃": "胃", "腸": "腸",
+    "腎": "腎", "脳": "脳",
+    "管": "管", "路": "路", "径": "径", "線": "線", "糸": "糸", "縄": "縄",
+    "網": "網", "編": "編む", "織": "織る", "縫": "縫う",
+    "裁": "裁く", "断": "断つ", "絶": "絶つ",
+    "剣": "剣", "刀": "刀", "槍": "槍", "矢": "矢", "弓": "弓", "弾": "弾",
+    "砲": "砲", "銃": "銃",
+    "軍": "軍", "兵": "兵", "隊": "隊",
+    "営": "営む", "陣": "陣", "幕": "幕", "旗": "旗",
+    "印": "印", "章": "章", "紋": "紋",
+    "絵": "絵", "図": "図", "像": "像", "写": "写す", "真": "真", "影": "影",
+    "灯": "灯り", "灰": "灰",
+    "燐": "燐", "磁": "磁気・磁石",
+}
+
+# 推論の言い回し（ターンと語で回して、毎回同じ文にしない）
+_INFER_OPEN_2 = (
+    "「{t}」は「{a}」と「{b}」を合わせた語と推測します。つまり、{m}だと考えられます。",
+    "「{t}」を分解すると「{a}」＋「{b}」です。{m}と読めます。",
+    "「{t}」は「{a}」の部分と「{b}」の部分から成ると考えます。{m}でしょう。",
+)
+_INFER_OPEN_N = (
+    "「{t}」は{ps}から成ると推測します。全体として、{m}だと考えられます。",
+    "「{t}」を分解すると{ps}です。{m}という読みが自然です。",
+    "「{t}」は{ps}の組み合わせと考えられます。{m}に近いものだと推測します。",
+)
+_INFER_ONE = (
+    "「{t}」は「{a}」に関わる語と推測します。文脈から、{a}の性質を持つものとして読みます。",
+    "「{t}」の核は「{a}」だと考えられます。{a}にまつわるものとして組みます。",
+)
+_TAIL_ASK = (
+    "この読みで組み立てます。",
+    "まずはこの推測で進め、文脈が違えばその場で読み替えます。",
+    "断定は控えますが、文字から見る限りこの読みが最も自然です。",
+    "別の意味で使われていれば、同じ形に組み替えて答えます。",
+    "文脈をもらえれば、この推測を裏取りします。",
+)
+_TAIL_TALK = (
+    "この読みを軸に、会話を組み立てます。",
+    "名前の由来なのか、特徴なのか、どちらからでも続けてください。",
+    "どんな話をしたいのか、そのままの言葉で聞かせてください。",
+    "この読みで続きを組むので、思うままどうぞ。",
+    "知っていることがあれば、この上に足していく形で話せます。",
+)
+
+
+def _stable_hash(s: str) -> int:
+    return sum(ord(c) for c in str(s)) % 1000
+
+
+def _template_index() -> dict[str, dict]:
+    """inference_templates.json を読み、term → 項目 の索引を作る（1 回だけ）。"""
+    global _TEMPLATE_INDEX
+    if _TEMPLATE_INDEX is None:
+        idx: dict[str, dict] = {}
+        try:
+            import json
+            import pathlib
+
+            path = pathlib.Path(__file__).resolve().parents[1] / "data" / "inference_templates.json"
+            if path.exists():
+                for item in json.loads(path.read_text(encoding="utf-8")):
+                    term = str(item.get("term") or "").strip()
+                    if term:
+                        idx[term.lower()] = item
+        except Exception:  # noqa: BLE001
+            pass
+        _TEMPLATE_INDEX = idx
+    return _TEMPLATE_INDEX
+
+
+def _decompose_term_parts(term: str) -> list[tuple[str, str]]:
+    """語を既知の部品に最長一致で分解する。→ [(surface, meaning)]"""
+    idx = _template_index()
+    bank = lex.bank()
+    best: list[tuple[str, str]] = []
+    i = 0
+    n = len(term)
+    while i < n:
+        found = ""
+        meaning = ""
+        # 1) 推論テンプレート辞書の既知語（2〜6 文字、長い順）
+        for L in sorted({min(6, n - i), 5, 4, 3, 2}, reverse=True):
+            if L < 2:
+                break
+            cand = term[i:i + L].lower()
+            entry = idx.get(cand)
+            if entry is not None:
+                found = term[i:i + L]
+                first_morph = (entry.get("morphemes") or [{}])[0]
+                meaning = str(first_morph.get("meaning") or "").strip() or found
+                break
+            # 2) 実辞書の語（2〜4 文字。語幹の連続「ぬるぬる」もここで拾う）
+            if L in (4, 3, 2):
+                w = term[i:i + L]
+                if bank.has(w) or bank.entry(w) is not None:
+                    found = w
+                    meaning = w
+                    break
+        if not found:
+            # 3) カタカナの塊（3 文字以上）は分解不能なので 1 部品として残す
+            run = 0
+            while i + run < n and "ァ" <= term[i + run] <= "ヶ" or (i + run < n and term[i + run] == "ー"):
+                run += 1
+            if 3 <= run <= n - i:
+                found = term[i:i + run]
+                meaning = found
+            else:
+                # 4) 漢字の意味表（1 文字）
+                ch = term[i]
+                found = ch
+                meaning = _KANJI_MEANINGS.get(ch, ch)
+        best.append((found, meaning))
+        i += len(found)
+    # 同一部品の連続（「ぬる」+「ぬる」）は畳んで 1 語にする
+    merged: list[tuple[str, str]] = []
+    for s, m in best:
+        if merged and merged[-1][0] == s and len(merged[-1][0]) * 2 <= 6:
+            prev, pm = merged.pop()
+            merged.append((prev + s, m))
+        else:
+            merged.append((s, m))
+    return merged
+
+
+def _infer_unknown_term(term: str, *, turn: int = 0, text: str = "", kb=None) -> str:
+    """未知の語を部品分解して *賢く推測する*（ユーザーの「黄金比」型の思考）。
+
+    1) 推論テンプレート辞書に完全一致（黄金比・電球・GLM …）
+    2) バージョン番号を落とした一致（glm5.3 → GLM）
+    3) 既知の部品（テンプレート語・実辞書の語・漢字の意味）に分解して意味を足し合わせる
+    4) 欧文・カタカナの語は固有名・略語としての読み
+    """
+    t = str(term or "").strip()
+    if not t:
+        return ""
+    idx = _template_index()
+    h = _stable_hash(t)
+
+    # 1) 完全一致
+    entry = idx.get(t.lower())
+    if entry is not None and str(entry.get("inference") or "").strip():
+        return str(entry["inference"]).strip().rstrip("。")
+
+    # 2) バージョン番号を落とした一致（GLM5.3 → GLM、X2.0 → X）
+    base = re.sub(r"[\d.]+$", "", t.lower())
+    if 1 < len(base) < len(t):
+        entry = idx.get(base)
+        if entry is not None and str(entry.get("inference") or "").strip():
+            body = str(entry["inference"]).strip().rstrip("。")
+            if t.lower() not in body.lower():
+                # 項目が語全体に触れていなければ、数字の扱いだけ足す（二重にはしない）
+                body += f"。{t} の数字はバージョンや改訂版を示すと推測します"
+            return body
+
+    is_kana = bool(re.fullmatch(r"[ァ-ヶー]+", t))
+    is_latin = bool(re.fullmatch(r"[A-Za-z][A-Za-z0-9._\-]*", t))
+    # カタカナ・欧文の語は 1 文字ずつの分解が無意味なので、固有名としての読みに行く
+    if is_kana or is_latin:
+        if is_kana:
+            return (f"「{t}」はカタカナの語で、外来の固有名（製品・作品・人物・現象）か造語と推測します。"
+                    f"文字は音の書き起こしなので、意味は周りの文脈から最も自然に読みます")
+        return (f"「{t}」は欧文の語で、固有名（製品・人物・作品）か略語と推測します。"
+                f"アルファベットの並びから、{t} という名で呼ばれるものだと読みます")
+
+    # 3) 部品分解（テンプレート語 → 実辞書の語 → 漢字の意味、この順で最長一致）
+    parts = _decompose_term_parts(t)
+    kb_note = ""
+    if kb is not None:
+        try:
+            for s, m in parts:
+                if len(s) >= 2 and kb.index.topics_of(s):
+                    kb_note = f"「{s}」の部分は手元の知識とつながるので、そこから補います。"
+                    break
+        except Exception:  # noqa: BLE001
+            pass
+    if len(parts) >= 3 or (len(parts) == 2 and all(len(s) == 1 for s, _ in parts)):
+        named = "、".join(f"「{s}（{m}）」" if (m and m != s) else f"「{s}」"
+                         for s, m in parts[:4])
+        first_m = parts[0][1] if parts[0][1] != parts[0][0] else ""
+        last_m = parts[-1][1] if parts[-1][1] != parts[-1][0] else ""
+        if first_m and last_m:
+            m = f"{first_m}の性質を持ちつつ{last_m}に関わるもの"
+        elif last_m:
+            m = f"{last_m}に関わるもの"
+        else:
+            m = f"部品の性質（{'、'.join(s for s, _ in parts[:3])}）を合わせたもの"
+        tpl = _INFER_OPEN_N[(turn + h) % len(_INFER_OPEN_N)]
+        out = tpl.format(t=t, ps=named, m=m)
+    elif len(parts) == 2:
+        a, ma = parts[0]
+        b, mb = parts[1]
+        if ma and ma != a and mb and mb != b:
+            m = f"{ma}で{mb}に関わるもの"
+        elif mb and mb != b:
+            m = f"{a}の性質を持ちつつ{mb}に関わるもの"
+        elif ma and ma != a:
+            m = f"{ma}が際立つ{b}に関わるもの"
+        else:
+            m = f"{a}と{b}の性質を合わせたもの"
+        tpl = _INFER_OPEN_2[(turn + h) % len(_INFER_OPEN_2)]
+        out = tpl.format(t=t, a=f"{a}（{ma}）" if ma and ma != a else a,
+                         b=f"{b}（{mb}）" if mb and mb != b else b, m=m)
+    elif len(parts) == 1:
+        a, ma = parts[0]
+        tpl = _INFER_ONE[(turn + h) % len(_INFER_ONE)]
+        out = tpl.format(t=t, a=a)
+    else:
+        out = (f"「{t}」は手元の知識に無い語ですが、文字の成り立ちから "
+               f"{t} という性質を持つものと推測します")
+    if kb_note and kb_note not in out:
+        out += "。" + kb_note.rstrip("。")
+    return out
+
+
+def _inference_tail(term: str, turn: int, *, text: str = "") -> str:
+    """推論の後の軽い受け止め（ターンと語で回す。「一語ください」型の強要はしない）。"""
+    h = _stable_hash(term)
+    if _is_question_text(text):
+        return _TAIL_ASK[(turn + h) % len(_TAIL_ASK)]
+    return _TAIL_TALK[(turn * 2 + h) % len(_TAIL_TALK)]
 
 
 def _decompose_claims(frame, text: str, turn: int = 0, *, kb=None) -> list[Claim]:
@@ -1026,6 +1402,22 @@ def _decompose_claims(frame, text: str, turn: int = 0, *, kb=None) -> list[Claim
     pieces = [p for p, _ in lex.bank().segment(t) if len(p) >= 1][:8]
     known = [p for p in pieces if len(p) >= 2 and lex.bank().has(p)]
     bits = []
+    # 数量の問い（何個 / 何億 / いくら …）に既知の名詞が入っているとき、
+    # その名詞で KB に当たる。定義・事実に *数* が書かれていることが多いので、
+    # 「何個の島？」→「島」→ 日本の「4 つの大きな島…」で答えになります。
+    if frame is not None and str(getattr(frame, "ask", "") or "") in ("count", "price"):
+        for n in [p for p in known if len(p) >= 2][:2]:
+            try:
+                mat = kb.answer(n, min_score=0.30) if kb is not None else None
+            except Exception:  # noqa: BLE001
+                mat = None
+            if mat and str(mat.get("text") or "").strip():
+                _topic = str(mat.get("topic") or "")
+                return [Claim(kind="answer",
+                              content=(f"数えものとしての「{n}」は「{_topic}」につながります。"
+                                       + str(mat["text"]).strip()),
+                              subject=n, source="local:kb", weight=0.68,
+                              extra={"topic": _topic})]
     # *平叙（報告・独り言）* に対して語の分解を返すと、「どんな場面で使う語ですか」で
     # 会話を止める形になります。まず会話の受け取りを試して、それが組めるときはそこに任せます。
     if not _is_question_text(text):
@@ -1050,90 +1442,20 @@ def _decompose_claims(frame, text: str, turn: int = 0, *, kb=None) -> list[Claim
                 break
     inferred = ""
     if opaque:
-        # 未知語は推論テンプレートで分解して賢く推測する（10MBテンプレートを活用）
         term = opaque[0]
-        inferred = ""
-        # 1) まず専用テンプレートがあればそれを使う
-        try:
-            import json, pathlib
-            tmpl_path = pathlib.Path(__file__).resolve().parents[1] / "data" / "inference_templates.json"
-            if tmpl_path.exists():
-                # 軽量: 先頭の数件だけ読むのではなく、簡易キャッシュ
-                import functools
-                # 簡易: 直接 term で検索（完全一致）
-                # ファイルが大きいので毎回全部読むと重い → 小さなキャッシュを作る
-                # ここでは読み込みを避け、簡易推論で代替しつつ、特殊語はハードコードで対応
-                pass
-        except:
-            pass
-        # 2) ハードコードの特殊推論（黄金比など）
-        if term in ("黄金比","黄金比率","ゴールデンレシオ"):
-            inferred = "「黄金比」は「黄金（金のように美しく輝く）」と「比（割合）」を合わせた語と推測します。つまり、人が最も美しいと感じる約1:1.618の比率のことです。全体と大きい部分の比が、大きい部分と小さい部分の比に等しくなる調和の取れた割合で、建築やデザイン、自然の螺旋にも現れます"
-        elif term.lower().startswith("glm"):
-            inferred = f"「{term}」は「GLM（General Language Model）」という言語モデル系列のバージョンと推測します。数字の {term[3:] or 'X'} は世代や改良版を示し、対話や文章生成ができると考えられます"
-        elif "電球" in term or term=="電球":
-            inferred = "「電球」は「電（電気）」と「球（丸い入れ物）」から、電気で光るガラスの道具と推測します。一般的なLED電球は500〜1500円程度が平均です"
-        else:
-            # 3) 一般推論: 語を2文字ずつに切って、既知の部品の意味を足し合わせる
-            try:
-                from ..lang import lex as _lex
-                bank = _lex.bank()
-                # term を既知の語に分割（最長一致的に）
-                parts = []
-                i=0
-                while i < len(term):
-                    found = ""
-                    for l in (4,3,2):
-                        if i+l <= len(term):
-                            cand = term[i:i+l]
-                            if bank.has(cand):
-                                found = cand
-                                break
-                    if found:
-                        parts.append(found)
-                        i+= len(found)
-                    else:
-                        # 1文字でも意味が分かれば
-                        ch = term[i]
-                        # 簡易漢字意味辞書
-                        kanji_hint = {"黄":"黄色く輝く","金":"金のように貴重で輝く","比":"割合","率":"割合","光":"光","闇":"暗さ","心":"心","人":"人","電":"電気","球":"丸い","機":"機械","器":"器具","学":"学び","校":"学校","言":"言葉","語":"言葉","比":"比べる"}
-                        if ch in kanji_hint:
-                            parts.append(f"{ch}（{kanji_hint[ch]}）")
-                        else:
-                            parts.append(ch)
-                        i+=1
-                # カタカナの外来語なら、文字分解ではなく全体で推測
-                if term and all('ァ' <= ch <= 'ヶ' or ch in 'ー・' for ch in term):
-                    inferred = f"「{term}」はカタカナの外来語と推測します。おそらく英語由来の概念で、{term}らしい性質を持つものと考えられます。文脈から、{term}に関連するものと読めます"
-                elif len(parts) >= 2:
-                    inferred = f"「{term}」は「{'」と「'.join(parts)}」を合わせた語と推測します。つまり、{'の'.join(parts)}に関わる概念だと考えられます。文脈から、{parts[0]}のような性質を持ちつつ{parts[-1]}に関わるものと読めます"
-                elif len(parts)==1:
-                    inferred = f"「{term}」は「{parts[0]}」に関わる語と推測します。文脈からその意味を補って理解します"
-                else:
-                    inferred = f"「{term}」は初めて聞く語ですが、文字の成り立ちから推測すると、{term}らしい性質を持つものと考えられます"
-            except Exception:
-                inferred = f"「{term}」は「{term[:2] if len(term)>=2 else term}」と「{term[2:] if len(term)>2 else '関連の語'}」を合わせた言葉と推測します。部品の意味を足し合わせると全体像が見えてきます"
+        inferred = _infer_unknown_term(term, turn=turn, text=text)
         if inferred:
             bits.append(inferred)
         else:
-            # fallback to old leads if inference fails
-            bits.append(f"「{term}」については手元に記録がありませんが、文字から推測して組みます")
-    # 形状の案内は、推論できなかったときだけ足す（推論できたのに「どんな場面で使う語かを…」を足すと二重になる）
+            bits.append(f"「{term}」については手元に記録がありませんが、文字の成り立ちから推測して組みます")
+    # 形状の案内は、推論できなかったときだけ足す（推論できたのに形の話を重ねると二重になる）
     if not inferred:
         bits.append(shape_line(t))
     if known and sum(len(p) for p in known) >= max(4, int(len(t) * 0.35)) and not inferred:
         bits.append("読める部品は " + "、".join(f"「{p}」" for p in known[:3]) + " なので、そこを軸に組みます")
-    # 推論できたときは、追加で確認を強要しない（自然な一言だけ）
-    if 'inferred' in locals() and inferred:
-        # 推論後は軽い受け止めだけ添える（しつこい質問はしない）
-        if not any(x in inferred for x in ("どうぞ","ください","もらえれば")):
-            bits.append("もし違う意味で使っていれば、その場面を一言もらえれば合わせます")
-    else:
-        if bits and not any(x in bits[0] for x in ("もらえれば", "ください", "どうぞ", "教えてください")):
-            asks = ("何を答えたいですか（定義・手順・比較・値段のどれか）を一言で教えてください",
-                    "どれを欲しがっていますか。意味・使い方・数量のどれかを一語でどうぞ",
-                    "何が分かっていれば前に進めますか。切り口を一言ください")
-            bits.append(asks[int(turn) % len(asks)])
+    # 推論できたときは *確認を強要しない*（「もう一語ください」型の聞き返しばかりでは会話が止まる）
+    if inferred:
+        bits.append(_inference_tail(term, turn, text=text))
     return [Claim(kind="note", content=_join_bits(bits), source="lex", weight=0.46)]
 
 
@@ -1156,6 +1478,43 @@ _FOLLOWUP_ASKS = {
 def ask_pos(turn: int) -> str:
     pool = ("いちばん良かった部分をどこに置きましたか。", "次はどんな風に進めたいですか。")
     return pool[int(turn) % len(pool)]
+
+
+def _unknown_compound(text: str) -> str:
+    """*既知の修飾語 + 既知の名詞* でできていて、全体が未登録の語を出す。
+
+    「ぬるぬる猿」は ぬるぬる（副詞）＋ 猿（名詞）に割れるが、その全体は語彙に
+    無い *新しい語* です。こういう発話では頭語（猿）の知識で答えると造語が
+    消えるので、全体を未知語として推論に渡します。助詞・動詞を含む普通の
+    文（「猿を見た」等）は修飾語ではありません。
+    """
+    t = normalize(str(text or "")).strip(" 。、！？!?…・")
+    # 質問の尾（〜って何 / 〜とは / 〜の意味 …）を落として *語そのもの* を判定する
+    core = re.sub(r"(って何ですか|って何|とは何ですか|とは何|とは|の意味は|の意味|は何か|"
+                  r"はなんですか|はなん|って何\?|何かな|なんだろう)$", "", t).strip("、。 ・")
+    if core and len(core) >= 2:
+        t = core
+    if not (4 <= len(t) <= 12) or re.search(r"[\s「」『』:：]", t):
+        return ""
+    try:
+        bank = lex.bank()
+    except Exception:  # noqa: BLE001
+        return ""
+    if bank.has(t) or bank.entry(t) is not None:
+        return ""
+    try:
+        segs = list(bank.segment(t))
+    except Exception:  # noqa: BLE001
+        return ""
+    if not (2 <= len(segs) <= 3):
+        return ""
+    for w, pos in segs:
+        p = str(pos).split("/")[0]
+        if p not in ("名詞", "形容詞", "副詞", "接頭詞"):
+            return ""
+    if not any(str(pos).startswith("名詞") for _w, pos in segs):
+        return ""
+    return t
 
 
 def _statement_claims(frame, turn: int = 0) -> list[Claim]:
@@ -1196,20 +1555,19 @@ _TRANSLATE_RE = re.compile(
 
 def _join_bits(bits: list[str]) -> str:
     """断片を 1 文に綴じる。敬体で言い切ったところでは読点でなく句点で切る。"""
-    parts: list[str] = []
+    out = ""
     for raw in bits:
-        x = str(raw).strip().rstrip("。")
+        x = str(raw).strip().rstrip("。！？!?")
         if not x:
             continue
-        if not parts:
-            parts.append(x)
-        elif parts[-1].endswith(("です", "ます", "ません", "しました", "でした", "でしたら")):
-            parts[-1] += "。"
-            parts.append(x)
+        if not out:
+            out = x
+        elif out.endswith(("です", "ます", "ません", "しました", "でした", "でしたら",
+                           "！", "？", "!", "?")):
+            out += "。" + x
         else:
-            parts[-1] += "、" + x
-    out = "。".join(parts)
-    return (out + "。") if out and not out.endswith("。") else out
+            out += "、" + x
+    return (out + "。") if out else ""
 
 
 def _translation_target(text: str) -> tuple[str, str]:

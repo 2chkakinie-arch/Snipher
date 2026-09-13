@@ -84,8 +84,25 @@ _SENTENCES = re.compile(r"(?:([0-9０-９]+|[一二三四五六七八九十]+)\s
                         re.IGNORECASE)
 _ARTIFACT = re.compile(r"(?:メール|電子メール|記事|レポート|報告書|文案|コピー|手紙|案内文|お詫び|"
                        r"説明文|議事録|スピーチ|プレゼン|ポエム|詩|短文|作文|スローガン|見出し|タイトル|"
+                       r"挨拶|あいさつ|自己紹介|メッセージ|返事|"
                        r"essay|article|email|report|memo|paragraph|headline|slogan|speech)",
                        re.IGNORECASE)
+
+# 成果物の *形* を指定する語（語尾・長さ・口調）。成果物の名 + 形指定 が揃うと
+# 「X の挨拶」という名詞句でも、それは指示（生成依頼）です。
+_STYLE_SPEC = re.compile(
+    r"(語尾|つける|suffix|終わる|で終わ|[0-9０-９]+\s*(?:文字|字|文|語)|一言|ひとこと|"
+    r"である調|ですます|です・ます|カジュアル|フレンドリー|専門的|フォーマル|口調)")
+# 形指定に *具体値* が無いと artifact+style は加点しない。裸の「語尾」だと
+# 「あの挨拶の語尾はどうする？」のような *メタ質問* を生成依頼と誤認する。
+# 具体値 = 長さ（N文字）・口調（である調等）・引用符で示された語（「〜ロボ」）。
+# 語尾指定の実体値: 「語尾に「X」」「語尾に〜ロボ」(角括弧は必須ではない・〜付き/なし)。
+_SUFFIX_SPEC = re.compile(
+    r"(?:語尾|語末|末尾)に[「『]?(?:〜|~)?[A-Za-z０-９一-龯ぁ-んァ-ヶー]{1,12}[」』]?")
+_STYLE_VALUE = re.compile(
+    r"[0-9０-９]+\s*(?:文字|字|文|語)|一言|ひとこと|"
+    r"(?:である調|ですます|です・ます|カジュアル|フレンドリー|専門的|フォーマル)|"
+    r"(?:語尾|語末|末尾)に[「『]?(?:〜|~)?[A-Za-z０-９一-龯ぁ-んァ-ヶー]{1,12}[」』]?")
 _ROLE = re.compile(
     r"(?:あなた|君|きみ|お前|そちら|assistant|ai)\s*(?:は|って|として)\s*"
     r"[「『\"']?([^」』\"'。\n]{2,40})[」』\"']?\s*(?:という|の)?\s*"
@@ -758,6 +775,15 @@ def split_payload(text: str) -> tuple[str, str, list[tuple[int, int]], list[str]
                 marks.append("continuation-quote")
                 spans.append((m.start(), m.end()))
                 break
+    if not payload and re.search(r"続き", t):
+        # 引用なしの「X、の続きを1文で」→ 「の続き」より前が材料
+        m2 = re.search(r"^(.{4,}?)[、,]\s*の続き", t)
+        if m2:
+            body = m2.group(1).strip()
+            if body:
+                payload = body
+                marks.append("continuation-prefix")
+                spans.append((m2.start(1), m2.end(1) + 1))
     if not payload:
         m = re.search(r"(?:してください|して下さい|してください。|お願いします|せよ|しろ)[。！!?]?\s*", t)
         if m:
@@ -806,7 +832,7 @@ def parse_role(text: str) -> str:
     return ""
 #: ラベルの無い問い（「〜とは何ですか？」/ `What is …?`）も行として拾う
 _BARE_QUESTION_LINE = re.compile(r"([^\n]{4,80}?(?:とは何ですか|とはなんで|は何ですか|って何ですか|"
-                                 r"とは何ですか|ですか|でしょうか)[？?]?)")
+                                 r"とは何ですか|ですか|でしょうか|[?？]))")
 _EN_QUESTION_LINE = re.compile(
     r"((?:what|why|how|who|when|where|which|is|are|can|could|does|do|did|will|should)\b"
     r"[^\n]{2,90}\?)", re.IGNORECASE)
@@ -838,7 +864,7 @@ def parse_question(text: str) -> str:
     for line in [x.strip() for x in t.split("\n") if x.strip()]:
         m2 = _BARE_QUESTION_LINE.search(line)
         if m2 and not re.search(r"(?:してください|して下さい|ください|せよ|しろ)$", m2.group(1)):
-            return m2.group(1).strip("「」『』 　。、")
+            return m2.group(1).strip("「」『』 　。、?？")
     # 英語の 1 通（`What is photosynthesis? Answer in English in 2 sentences.`）
     for line in [x.strip() for x in re.split(r"(?<=[.!?])\s+", t) if x.strip()]:
         m3 = _EN_QUESTION_LINE.match(line)
@@ -882,7 +908,45 @@ def function_spec(text: str) -> tuple[str, list[str]]:
 # --------------------------------------------------------------------------- #
 # タスク判定
 # --------------------------------------------------------------------------- #
+# *変換の操作語*（成果物が「材料を加工した文字列」であることを決める語）。
+# これらが *最後の命令* のとき、成果物は変換結果であり、文書・リスト・回答にならない。
+_TRANSFORM_OPS = re.compile(
+    r"(?:取り除|重複|逆順|並び替|ソート|変換|大文字|小文字|ローマ字|カタカナ|ひらがな|"
+    r"全角|半角|置き換え|整形|文字数|翻訳|訳して|英訳|和訳|translate|reverse|sort|dedupe|"
+    r"uniq|uppercase|lowercase|format|convert)(?![a-z])", re.IGNORECASE)
+# コード成果物の形（関数名・言語+関数・コードブロック）。これがある変換語は *コードの話*。
+_CODE_ARTIFACT_HARD = re.compile(
+    r"```|function\s+\w+\s*\(|def\s+\w+\s*\(|class\s+\w+|関数|メソッド|実装|プログラム|コード",
+    re.IGNORECASE)
+
+
+def _last_verb_is_transform(instruction: str, *, payload: str) -> bool:
+    """指示の *最後の命令* が変換の操作語なら True（「リストの重複を取り除いて」= 変換）。
+
+    「次のリストを…してください」のように *材料を指す語*（リスト・テキスト）が命令語より
+    前にあるだけで文書・列挙タスクに読まれないための構造規則。
+    """
+    t = str(instruction or "")
+    if not str(payload or "").strip():
+        return False
+    if _CODE_ARTIFACT_HARD.search(t) or function_spec(t)[0]:
+        return False
+    m = _TRANSFORM_OPS.search(t)
+    if not m:
+        return False
+    # 変換語より後に、抽出・要約・列挙・回答の命令が来ていたらそちらが成果物
+    later = t[m.end():]
+    if re.search(r"(?:抽出|抜出し?て|要約|まとめ|列挙|リストアップ|回答|答えて|書いて|作成して)",
+                 later):
+        return False
+    return True
+
+
 def classify_task(instruction: str, fmt: FormatSpec, *, payload: str = "", question: str = "") -> str:
+    # 構造が明確な変換依頼は、学習分類器より先に確定させる
+    # （「次のリストの重複を取り除いてください」をメール文書に読ませない）
+    if _last_verb_is_transform(instruction, payload=payload):
+        return "transform"
     # 高次元分類器を最優先で試す（全文脈で判定し、単一キーワードに引っ張られない）
     try:
         from .highdim_classifier import classify_full as _hd_classify
@@ -1100,9 +1164,24 @@ def parse(text: str, *, min_score: float = 0.55) -> Directive | None:
         if verbs:
             score += 0.20
             signals.append("role+imperative")
+    if task in ("classify", "list"):
+        # 項目（2 語以上）＋ 操作（分類・列挙）は指示の形（「りんご、トマト、バナナを分類して」）
+        n_items = len(re.findall(r"[ぁ-んァ-ヶ一-龯A-Za-z0-9]{2,6}", str(instruction or "")))
+        if n_items >= 2:
+            score += 0.30
+            signals.append(f"items:{n_items}")
     if _ARTIFACT.search(instruction or raw):
         score += 0.12
         signals.append("artifact")
+    if _ARTIFACT.search(instruction or raw) and _STYLE_VALUE.search(instruction or raw):
+        # 「成果物の名 + 形の具体値（語尾「X」・N文字・口調）」が揃うと名詞句でも生成依頼
+        # （「語尾に〜ロボの挨拶」＝ 挨拶の形を指定した依頼）
+        score += 0.30
+        signals.append("artifact+style")
+    if _SUFFIX_SPEC.search(instruction or raw):
+        # 語尾に具体語（「X」/ 〜X）を指定しているのは明確な形指定
+        score += 0.25
+        signals.append("suffix-spec")
     if task == "write":
         score += 0.20                       # 成果物（メール/記事/報告書）を名指しした依頼
         signals.append("write:deliverable")

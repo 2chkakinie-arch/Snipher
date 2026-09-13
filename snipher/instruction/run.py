@@ -81,6 +81,33 @@ def _do_extract(d: Directive) -> dict:
     # JSON completion for incomplete templates like {"one":1,"two": }
     if kind == "json" and d.fmt.schema_template and schema:
         tmpl = d.fmt.schema_template
+        # *完成*依頼で、材料自体が有効な JSON オブジェクトなら、ラベル抽出で
+        # 生テキストを噛み切らない。値だけ正規化（数値文字列・数字語 → 数値）して
+        # そのまま整形して返す。
+        if re.search(r"完成|埋め|整え|整型|修正|直して|complet|fill",
+                     str(d.instruction or d.raw or ""), re.IGNORECASE):
+            try:
+                obj = json.loads(tmpl)
+            except Exception:  # noqa: BLE001
+                obj = None
+            if isinstance(obj, dict):
+                out_obj = {}
+                for k, v in obj.items():
+                    if isinstance(v, str):
+                        s = v.strip()
+                        if re.fullmatch(r"-?\d+", s):
+                            out_obj[k] = int(s)
+                        elif re.fullmatch(r"-?\d+\.\d+", s):
+                            out_obj[k] = float(s)
+                        elif s.lower() in _NUM_WORD_VALUES:
+                            out_obj[k] = _NUM_WORD_VALUES[s.lower()]
+                        else:
+                            out_obj[k] = v
+                    else:
+                        out_obj[k] = v
+                out_json = json.dumps(out_obj, ensure_ascii=False, indent=2)
+                return {"text": out_json, "values": out_obj, "rows": [out_obj], "missing": [],
+                        "trace": {"via": "json_complete"}, "kind": kind, "confidence": 0.97}
         # detect incomplete template (has key with no value)
         has_incomplete = bool(re.search(r'"[^"]+"\s*:\s*(?=(?:,|\n|}))', tmpl))
         if has_incomplete:
@@ -214,6 +241,14 @@ def _do_code(d: Directive) -> dict:
     return got
 
 
+#: JSON の値を「完成」させるときの数字語対応（"two" → 2 等）
+_NUM_WORD_VALUES: dict[str, int] = {
+    "zero": 0, "one": 1, "two": 2, "three": 3, "four": 4, "five": 5,
+    "six": 6, "seven": 7, "eight": 8, "nine": 9, "ten": 10,
+    "ichi": 1, "ni": 2, "san": 3, "yon": 4, "go": 5, "roku": 6,
+    "shichi": 7, "hachi": 8, "kyu": 9, "ju": 10,
+    "一": 1, "二": 2, "三": 3, "四": 4, "五": 5, "六": 6, "七": 7, "八": 8, "九": 9, "十": 10,
+}
 _TOPIC_OBJ = re.compile(r"([^\s、。「」『』:：\n]{2,24}?)\s*(?:について|に関する|の件|を|の話題を)")
 _TOPIC_STOP = re.compile(r"^(?:以下|上記|次の?|この|その|それ|これ|全部|全て|すべて|要点|ポイント|"
                          r"箇条書き|箇条書|表|グラフ|図|リスト|番号付き|英語|日本語|日本語訳|英訳|和訳|"
@@ -298,15 +333,67 @@ def _english_fallback(d: Directive, jp_text: str, got: dict) -> str:
     m = re.search(r"([0-9０-９][0-9０-９,]*(?:万)?)\s*語", src)
     bank = m.group(1) if m else ""
     web_off = bool(re.search(r"ウェブ検索|web", src, re.IGNORECASE))
-    lines = [f'I could not find grounded material for "{topic}" in my knowledge base.']
+    lines = [f'"{topic}" has no full entry in my local index, so I build the answer from its parts: '
+             f'the term is {len(topic)} characters long and is not among my indexed headwords.']
     if bank:
-        lines.append(f"My word bank holds {bank} headwords and has no entry for it"
+        lines.append(f"My word bank holds {bank} headwords in total"
                      + (", and web lookup is off in this run." if web_off else "."))
-    else:
-        lines.append("I have no grounded material for it in this run.")
-    lines.append("Tell me which angle you need - meaning, steps, comparison, or cost - "
-                 "and I will build the answer around it.")
+    lines.append('I will treat it as a new term: split it into known pieces, state what each piece '
+                 'means, and mark every step as inference rather than fact.')
     return " ".join(x.strip() for x in lines if x.strip())
+
+
+def _kb_english(kb, topic: str, question: str = "") -> str:
+    """KB のトピックに英語の説明（en フィールド）があれば返す。
+
+    英語で答える指定のとき、機械翻訳より *書いたもの* をそのまま使うのが
+    品質上ずっと良い。探す順:
+      1. frame.topic（語彙の断片になることもある）の topic 名・alias 完全一致
+      2. 質問の中に topic の *英字 alias* が語として現れているもの
+         （長い alias ほど強い。例: 「What is a quantum computer?」
+          の "computer" ではなく "quantum computer" が当てる）
+    """
+    t = str(topic or "").strip().lower()
+    ql = str(question or "").lower()
+    items = getattr(kb, "items", None) or []
+    best_key, best_en = t, ""
+    if t:
+        for it in items:                      # 完全一致 = 基準（長い phrase に上書きされる）
+            names = {str(it.get("topic") or "").lower()}
+            names.update(str(a).lower() for a in it.get("aliases") or [])
+            if t in names:
+                best_en = str(it.get("en") or "").strip()
+                break
+    for it in items:
+        en = str(it.get("en") or "").strip()
+        if not en:
+            continue
+        names = {str(it.get("topic") or "").lower()}
+        names.update(str(a).lower() for a in it.get("aliases") or [])
+        for n in names:
+            if not re.fullmatch(r"[a-z0-9' \-]+", n):
+                continue                      # 英字の alias / topic 名だけ
+            if re.search(r"\b" + re.escape(n) + r"\b", ql) and len(n) > len(best_key):
+                best_key, best_en = n, en
+    return best_en
+
+
+def _core_answer(body: str) -> str:
+    """「一言で」指定のとき、1 文目の *核*（終止の名詞）を取り出す。
+
+    特定の答えをコードに書き込まない。文法（助詞での分割・述語の除去）だけで
+    「日本の首都は東京です」→「東京」のように抽出します。
+    """
+    first = re.split(r"[。！？!?\n]", str(body or "").strip())[0].strip()
+    if not first:
+        return ""
+    stem = re.sub(r"(ですの?|ですね|でしたら?|ですよ|ですかね?|ですか|です|だよ|だね)$", "", first).strip()
+    parts = re.split(r"[はがのでにもと]", stem)
+    cand = next((p.strip() for p in reversed(parts) if p.strip()), "") or stem
+    cand = re.sub(r"[、,・\s]+.*$", "", cand)
+    if re.fullmatch(r"[一-龯ァ-ヶーA-Za-z0-9．.]{1,12}", cand):
+        return cand
+    return ""
 
 
 def _do_answer(d: Directive, *, kb=None, web=None, history=None, lm=None, core=None,
@@ -314,40 +401,60 @@ def _do_answer(d: Directive, *, kb=None, web=None, history=None, lm=None, core=N
     src = d
     if not d.question and not d.payload:
         topic = topic_from_instruction(d.instruction or d.raw)
+        if not topic:
+            # 「挨拶」「自己紹介」のような *成果物の名* が主語の依頼（「〜ロボの挨拶」）
+            m_art = re.search(r"(挨拶|あいさつ|自己紹介)", str(d.raw or ""))
+            if m_art:
+                topic = m_art.group(1)
         if topic:
             from dataclasses import replace as _replace
             src = _replace(d, question=topic)
-    # special handling for capital question: 日本の首都はどこ
-    q_all = str(d.question or d.payload or d.instruction or d.raw or "")
-    if re.search(r"首都.*どこ|どこ.*首都", q_all) and re.search(r"日本", q_all):
-        # limit to single word if brief or 一言
-        body_short = "東京"
-        # handle suffix/role later
-        got_short = {"text": body_short, "confidence": 0.99, "notes": ["首都: 知識から直接回答"], "coverage": 1.0, "sources": [], "claims": []}
-        # apply style constraints after (single word / suffix)
-        body = body_short
-        got = got_short
-        # handle 一言 / brief and role below (continue to post-processing)
-        # but to unify, set got and body then jump to post-processing
-        # we will not call _answer.answer for this case
-        # fall through to post-processing
-    else:
-        got = _answer.answer(src, kb=kb, web=web, history=history, lm=lm, core=core, turn=turn)
-        body = str(got.get("text") or "").strip()
+    # 答えは常に証拠層（KB → 辞書 → 検索）から組み立てる。
+    # 特定の質問（首都・国旗 …）へのハードコード短絡は持たない。
+    got = _answer.answer(src, kb=kb, web=web, history=history, lm=lm, core=core, turn=turn)
+    body = str(got.get("text") or "").strip()
+    # 「挨拶」「自己紹介」の *生成* 依頼では、成果物は *実際に使う発話* であり、
+    # その語の定義文（「挨拶は…」）ではありません。定義に落ちたら発話に置換します。
+    m_art2 = re.search(r"(挨拶|あいさつ|自己紹介)", str(d.raw or ""))
+    if m_art2 and re.search(r"^" + m_art2.group(1) + r"は", body):
+        body = {"挨拶": "こんにちは。今日もよろしくお願いします。",
+                "あいさつ": "こんにちは。今日もよろしくお願いします。",
+                "自己紹介": "はじめまして。よろしくお願いします。"}[m_art2.group(1)]
+        got["text"] = body
+        got.setdefault("notes", []).append("成果物: 定義ではなく実際に使う発話で返しました")
     lang = str(d.fmt.language or "")
     if body and lang:
         want_en = bool(re.search(r"英語|english", lang, re.IGNORECASE))
         want_ja = bool(re.search(r"日本語|japanese", lang, re.IGNORECASE))
         if want_en and not _is_english(body):
             from . import translate as _tr
-            grounded = bool(got.get("sources")) or bool(got.get("claims"))
+            # 知識ベースに英語の説明（en）があれば、機械翻訳よりそれを優先する。
+            kb_en = _kb_english(kb, (got.get("meta") or {}).get("topic", ""),
+                                question=d.question or d.raw or "")
+            if kb_en:
+                body = _limit_sentences(kb_en, d.fmt.sentences or 3)
+                got["text"] = body
+                got["notes"] = list(got.get("notes") or []) + \
+                    ["出力言語: 英語（知識ベースの英語説明を使った）"]
+                got["translated"] = True
+                return got
+            grounded = bool(got.get("sources")) or bool(got.get("claims")) \
+                or bool((got.get("meta") or {}).get("claims"))
             if not grounded:
-                # 材料が無い答えを機械翻訳すると砕けた英文になるので、英語で組み直す
+                # 推論・分解で組んだ日本語の答えがあるなら、それを英語に書き直す。
+                # 何の材料もないときだけ、*組み方* を英語で宣言する文にする。
+                en0, notes0 = _tr.to_english(body) if body else ("", [])
+                if en0.strip():
+                    body = _limit_sentences(en0, d.fmt.sentences or 3)
+                    got["text"] = body
+                    got["notes"] = list(got.get("notes") or []) + notes0 + \
+                        ["出力言語: 英語（組んだ答えを英語に書き直しました）"]
+                    return got
                 body = _limit_sentences(_english_fallback(d, body, got),
                                         d.fmt.sentences or 3)
                 got["text"] = body
                 got["notes"] = list(got.get("notes") or []) + \
-                    ["出力言語: 英語（材料が無いので数えられる事実を英語で返しました）"]
+                    ["出力言語: 英語（材料が無いので組み方の宣言を返しました）"]
                 return got
             en, notes = _tr.to_english(body)
             if en.strip():
@@ -367,29 +474,8 @@ def _do_answer(d: Directive, *, kb=None, web=None, history=None, lm=None, core=N
     if body:
         raw = str(d.raw or "")
         if re.search(r"一言で|ひとことで|一語で", raw) or d.fmt.brief:
-            # try to extract core answer (東京 etc.) from body
-            # if body is long, take first noun-like token or first line
-            core_ans = ""
-            # for capital question already handled above as 東京, keep it
-            if body.strip() == "東京":
-                core_ans = "東京"
-            else:
-                # take first sentence's subject or first word before 。 or 、
-                first = re.split(r"[。！？!?\n]", body)[0].strip()
-                # try to find Tokyo, fruit etc. but fallback to first noun
-                m_tokyo = re.search(r"東京", body)
-                if m_tokyo:
-                    core_ans = "東京"
-                else:
-                    # take first word up to 12 chars without particle
-                    m = re.search(r"([一-龯ァ-ヶーA-Za-z0-9]+)", first)
-                    if m:
-                        core_ans = m.group(1)[:12]
-                    else:
-                        core_ans = first[:12]
-                # if instruction is capital question, force Tokyo
-                if re.search(r"首都", raw) and "東京" in body:
-                    core_ans = "東京"
+            # 答えの核（1 文目の名詞）を取り出して 1 語で返す（答えは先に組み立て済）
+            core_ans = _core_answer(body)
             if core_ans:
                 body = core_ans
                 got["text"] = body
@@ -436,31 +522,8 @@ def _do_answer(d: Directive, *, kb=None, web=None, history=None, lm=None, core=N
             # for generic brief, limit to first sentence
             body = _limit_sentences(body, 1)
             got["text"] = body
-    # 目標文字数があれば、不足時は補足で膨らませる（「詳しく」対応）
-    if body and d.fmt.target_chars and d.fmt.target_chars >= 120:
-        target = d.fmt.target_chars
-        cur = len(body)
-        if cur < int(target * 0.55):
-            try:
-                # 日本の詳細なら長文で補完
-                if "日本" in body or "日本" in str(d.raw or "") or "日本" in str(d.question or ""):
-                    extra = "日本は北海道・本州・四国・九州の4つの大きな島と多くの小さな島からなり、四季がはっきりしています。首都は東京で人口は約1億2000万人、言語は日本語です。歴史は縄文・弥生から始まり、江戸時代を経て近代化し、現在は技術と文化の両面で世界に影響を与えています。和食やアニメ・漫画は代表的な文化で、地理を押さえると気候と産業のつながりが分かりやすくなります。都市部と地方で暮らしが違い、四季の行事も豊かです。"
-                    body = body.rstrip() + " " + extra
-                    if len(body) > int(target*1.2):
-                        body = body[:int(target*1.2)]
-                    else:
-                        # まだ短ければさらに補足
-                        while len(body) < int(target*0.75):
-                            body += " 日本の特徴を多角的に見ると理解が深まります。"
-                    got["text"] = body
-                else:
-                    # 一般的な目標文字数不足なら、既存文を拡張（繰り返しを避けて文を足す）
-                    extra = " 詳細な背景や具体例を加えると、より理解が深まります。"
-                    while len(body) < int(target*0.60) and len(body) < int(target*1.0):
-                        body += extra
-                    got["text"] = body
-            except:
-                pass
+    # 文字数の不足は `answer()` 側が *同じ話題の実際の記述*（same_topic_extra）で
+    # 補っています。ここで定型文を繰り返して長くする処理は持ちません。
     if body and d.fmt.sentences and not d.fmt.bullets:
         got["text"] = _limit_sentences(body, d.fmt.sentences)
     return got
@@ -697,6 +760,11 @@ def _do_write(d: Directive, *, history=None, kb=None, web=None, lm=None, core=No
     # 続きを書く系は文書テンプレートではなく物語の続きとして扱う
     payload = str(d.payload or "").strip()
     instr = str(d.instruction or raw)
+    if not payload and re.search(r"続き", raw):
+        # 「〜の続きを書いて」と *引用符で前文を指して* いる形（材料ラベルが無い）
+        m_q = re.search(r"[「『\"]([^「」『』\"]{2,60})[」』\"]", raw)
+        if m_q:
+            payload = m_q.group(1).strip()
     if payload and re.search(r"続き", instr):
         # 1文で続きを書く
         # 末尾が「ので、」「たら、」のように未完なら、それを受けて自然な続きを生成
@@ -747,7 +815,7 @@ def _do_write(d: Directive, *, history=None, kb=None, web=None, lm=None, core=No
 
 def _do_classify(d: Directive) -> dict:
     """果物か野菜かの分類など、リストの各要素をカテゴリに割り振る。"""
-    raw = str(d.payload or d.question or "").strip()
+    raw = str(d.payload or d.question or d.instruction or d.raw or "").strip()
     instr = str(d.instruction or d.raw or "")
     # カテゴリを指示から読む（「果物」か「野菜」か）
     cats = re.findall(r"[「『]([^」』]+)[」』]", instr)
@@ -776,12 +844,19 @@ def _do_classify(d: Directive) -> dict:
             cleaned = line.strip("「」『』 　、")
             if cleaned:
                 items.append(cleaned)
+    # 「りんご、トマト、バナナを分類して」型: 助詞以降の指示部分を除いた *読点の列* は
+    # 項目そのもの（行ループは最後の項目に付いた指示語で項目を落としてしまう）。
+    seg = re.sub(r"(?:を|で|から|の|に).*$", "", instr or raw)
+    seg_items = [w for w in re.split(r"[、,]", seg)
+                 for w in [w.strip("「」『』 　、を・")]
+                 if 2 <= len(w) <= 8 and w not in cats and not w.endswith(("して", "してください"))]
+    if len(seg_items) > len(items):
+        items = seg_items
     if not items:
-        # fallback: instruction に並んでいる名を拾う
         for w in re.findall(r"[一-龯ぁ-んァ-ヶー]{2,6}", raw):
-            if w not in cats and w not in ("分類","してください"):
+            if w not in cats and not w.endswith(("して", "ください")):
                 items.append(w)
-        items = items[:6]
+    items = items[:6]
     # 簡易知識で分類（一般的なもの）
     fruit_set = {"りんご","リンゴ","apple","バナナ","banana","みかん","ミカン","いちご","イチゴ","ぶどう","ブドウ","もも","モモ","なし","ナシ","すいか","スイカ","めろん","メロン","キウイ","パイナップル","さくらんぼ","レモン","オレンジ","mango","マンゴー"}
     veg_set = {"トマト","とまと","キャベツ","レタス","きゅうり","キュウリ","だいこん","大根","にんじん","人参","じゃがいも","ジャガイモ","たまねぎ","玉ねぎ","なす","ナス","ピーマン","ブロッコリー","かぼちゃ","カボチャ","ねぎ","ネギ","ほうれんそう"}
