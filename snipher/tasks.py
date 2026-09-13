@@ -544,6 +544,17 @@ class TaskRouter:
             return None
         if "夜" in t and any(x in t for x in ("挨拶", "あいさつ", "なんという", "何と言う", "言う")):
             return "greeting_name"
+        # 指示（プロンプト）は他のどの分野より先に読む。「〜してください」「JSON 形式で」
+        # がある入力は *仕事* なので、計算・コード・創作の棚に振り分ける前に確定させる。
+        try:
+            from .instruction import parse as _parse_instruction
+
+            directive = _parse_instruction(text)
+            if directive is not None:
+                # コードの依頼は従来どおり "code"（実行と検証は指示層が同じ部品で行う）
+                return "code" if directive.task == "code" else "instruction"
+        except Exception:  # noqa: BLE001
+            pass
         if "node.js" in t or "nodejs" in t:
             if "next" in t and any(x in t for x in ("どちら", "おすすめ", "違い", "比較", "か")):
                 return "compare"
@@ -574,6 +585,22 @@ class TaskRouter:
     def answer(self, text: str, *, web: bool | None = None,
                history: list[dict] | None = None) -> TaskAnswer | None:
         kind = self.classify(text, web=web)
+        if kind == "instruction":
+            # 指示層が実行と検証まで済ませた結果をそのまま返す（定型文は挟まない）
+            try:
+                from .instruction import run as _run_instruction
+
+                res = _run_instruction(text, kb=self.kb, web=None, history=history)
+            except Exception:  # noqa: BLE001
+                return None
+            if res is None or not res.text:
+                return None
+            return TaskAnswer(res.text, res.plan, float(res.confidence), "instruction",
+                              {"checks": res.checks[:8], "ok": bool(res.ok),
+                               "task": res.task, "chars": (res.meta or {}).get("chars"),
+                               "directive": (res.directive.as_dict()
+                                             if res.directive is not None else {})},
+                              authoritative=bool(res.authoritative))
         if kind == "greeting_name":
             return TaskAnswer("夜の挨拶は「こんばんは」です。朝は「おはようございます」、昼は「こんにちは」と言います。", "greeting:name", 0.999, "language", {"answer": "こんばんは"})
         if kind == "word_problem":

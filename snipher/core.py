@@ -885,8 +885,22 @@ class SnipherCore:
         except Exception:  # noqa: BLE001
             pass
 
-        # 2) 高速コアの下書き（数ミリ秒）
+        # 2) 指示（プロンプト）の実行 — 下書きより前に行う
+        #    「JSON 形式のみで出力」「3 つの箇条書きで要約」「関数を書いて」は
+        #    *仕事* であって会話ではありません。ここで指示部と材料部を分けて読み、
+        #    実行 → 検証まで済んだ結果をそのまま返します（定型文・読み上げは出さない）。
         t0 = time.time()
+        if mode != "neural":
+            try:
+                events = self._instruction_reply(messages, web=web, t0=t0)
+            except Exception:  # noqa: BLE001
+                log.debug("指示層が失敗（通常経路へ続行）", exc_info=True)
+                events = None
+            if events:
+                yield from events
+                return
+
+        # 3) 高速コアの下書き（数ミリ秒）
         draft = self.assist.draft(last_user)
         route = self.route_of(draft, mode, user_text=last_user, web=web)
 
@@ -903,8 +917,98 @@ class SnipherCore:
             yield from self._light_reply(messages, draft, route, mode=mode, web=web)
             return
 
-        # 3) instant / fallback: ニューラルを 1 トークンも使わず、その場で文を組み立てる
+        # 4) instant / fallback: ニューラルを 1 トークンも使わず、その場で文を組み立てる
         yield from self._fast_reply(messages, draft, route, t0=t0, web=web)
+
+    def _instruction_reply(self, messages: list[dict], *, web: bool | None = None,
+                           t0: float | None = None) -> list[dict] | None:
+        """📋 指示経路: 指示文を *仕事として実行* し、検証を通した結果だけを返す。
+
+        指示でなければ None（呼び出し側が通常経路へ進みます）。返すイベント列は
+        他の経路と同じ形（assist / start / delta / done）なので、UI 側は変更不要です。
+        """
+        t0 = time.time() if t0 is None else t0
+        last_user = last_user_of(messages)
+        if not last_user or len(last_user.strip()) < 4:
+            return None
+        try:
+            from .instruction import run as _run_instruction
+
+            res = _run_instruction(last_user, kb=self.kb, web=self._instruction_web(web),
+                                   history=messages, lm=self.lm(), core=self.light_core(),
+                                   turn=len([m for m in messages if m.get("role") == "user"]))
+        except Exception:  # noqa: BLE001
+            log.debug("指示層の実行に失敗", exc_info=True)
+            return None
+        if res is None or not str(res.text or "").strip():
+            return None
+        text = str(res.text)
+        knowledge: dict = {
+            "via": "instruction", "task": res.task, "topic": (res.meta or {}).get("topic") or None,
+            "chars": (res.meta or {}).get("chars"), "signals": (res.meta or {}).get("signals") or [],
+            "checks": [f"{c['name']}={'ok' if c['ok'] else 'ng'}" for c in res.checks[:8]],
+            "attempts": res.attempts, "authoritative": bool(res.authoritative),
+            "coverage": (res.meta or {}).get("coverage"),
+        }
+        srcs = [s for s in ((res.meta or {}).get("sources") or []) if isinstance(s, dict)][:4]
+        if srcs:
+            knowledge["sources"] = [{"title": str(s.get("title") or s.get("url"))[:80],
+                                     "url": str(s.get("url") or "")} for s in srcs]
+        if res.task == "code":
+            knowledge["code"] = {k: (res.meta or {}).get(k)
+                                 for k in ("language", "ran", "ok", "notes", "function")
+                                 if (res.meta or {}).get(k) is not None}
+        lm_info = None
+        lm = self.lm()
+        if lm is not None:
+            try:
+                sc = lm.score(text)
+                lm_info = {"confidence": sc["confidence"], "perplexity": sc["perplexity"],
+                           "bad_ratio": sc["bad_ratio"]}
+            except Exception:  # noqa: BLE001
+                lm_info = None
+        stats = {
+            "engine": f"Snipher instruction ({res.task})",
+            "template_mode": "instruction", "new_tokens": None, "tokens_per_second": None,
+            "assist": "instruction", "draft": text[:120], "draft_confidence": res.confidence,
+            "draft_seconds": round(time.time() - t0, 5), "intent": "instruction",
+            "fixes": ["instruction"], "route": ROUTE_INSTANT, "plan": res.plan,
+            "confidence": round(float(res.confidence), 4), "source": "instruction",
+            "task": {"kind": res.task, "verified": bool(res.ok), "checks": res.checks[:8],
+                     "directive": (res.directive.as_dict() if res.directive is not None else {})},
+            "seconds": round(time.time() - t0, 4), "knowledge": knowledge,
+        }
+        if lm_info:
+            stats["lm"] = lm_info
+        _srcs = _extract_sources(knowledge)
+        if _srcs:
+            stats["sources"] = _srcs
+        if not res.ok:
+            stats["note"] = "指示の検証で仕様を満たせない欄が残りました（checks を参照）"
+        return [
+            {"type": "assist", "mode": "instruction", "confidence": res.confidence,
+             "route": ROUTE_INSTANT, "plan": res.plan, "reason": "instruction_result",
+             "task": res.task},
+            {"type": "start", "engine": stats["engine"], "template_mode": "instruction"},
+            *[{"type": "delta", "text": piece} for piece in _chunk_for_stream(text)],
+            {"type": "done", "text": text, "stats": stats},
+        ]
+
+    def _instruction_web(self, web: bool | None = None):
+        """指示経路で使う Web 裏取りの窓（無効指定なら None = 検索に出ない）。"""
+        if web is False:
+            return None
+        try:
+            composer = self.composer()
+            grounding = composer.web_grounding() if composer is not None else None
+        except Exception:  # noqa: BLE001
+            return None
+        if grounding is None:
+            return None
+        try:
+            return grounding if grounding.available() else None
+        except Exception:  # noqa: BLE001
+            return None
 
     def _fast_reply(self, messages: list[dict], draft: dict, route: str, *,
                     t0: float | None = None, web: bool | None = None):

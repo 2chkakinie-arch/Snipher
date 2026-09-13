@@ -30,6 +30,7 @@ v3 はそこを置き換えました。
 
 | 層 | 仕事 | 規模 |
 |---|---|---|
+| `snipher/instruction/` | 指示文を *仕事として* 読む→実行する→検証する（JSON 抽出・要約・コード・応答） | 8 モジュール、出力仕様の検査 11 種 |
 | `snipher/mind/` | 見る→集める→決める→書く→検べる の 1 本道（`think()`） | 6 層のパイプライン、固定の返し文はゼロ |
 | `snipher/lang/` | 実辞書（15 万語・読み・拍・品詞・活用 16,389 行）と文体の組み替え | Janome/IPADIC からビルド |
 | `snipher/ground/` | 知識ベース → 辞書 → **ウェブ裏取り**（検索→html-fetch→証拠文） | 220 話題・686 事実・471 問答 |
@@ -73,6 +74,60 @@ v3 はそこを置き換えました。
 **手元に無い話題でも同じ発話を繰り返さない** — 「ぬるぬる猿について話したい」を 8 ターン投げると、
 複合語の在庫・音の連なり・拍数・KB の隣接話題・質問返し、と *数えられる事実の別々の手* を使い、
 8 通り全部が違う文になります（`test_repeated_statement_does_not_repeat_the_reply`）。
+
+## 2b. 指示（プロンプト）の実物 — 「読んでいます」ではなく *やった結果* を返す
+
+指示文には「テキスト」「文章」「JSON」という **材料を指す語** が入っています。v3 まで
+Snipher はその語に反応して「テキストを読みました」を返していました。指示層
+（`snipher/instruction/`、詳細は `docs/instruction.md`）は指示部と材料部を分けて読み、
+出力仕様（JSON スキーマ・件数・文字数・口調・役割）を *契約* として受け取り、
+実行してから **機械的に検証** します。
+
+**JSON 抽出（`JSON 形式のみで出力`）** — 値は材料の文字列そのもの、装飾はゼロ:
+
+```json
+{
+  "origin": "東京",
+  "destination": "京都",
+  "duration": "約2時間15分",
+  "fare": "約14,000円"
+}
+```
+
+**要約（`3つの箇条書きで短く`）** — 材料の語だけで 3 点（`coverage` 0.87）:
+
+> ・オセロや将棋などの完全情報ゲームにおいて、AIは探索アルゴリズムを用いて最適な手を選択します。
+> ・α-β枝刈りを組み合わせることで無駄な探索を削減できます。
+> ・評価関数を工夫することで、深い読みを行わなくても強い着手を実現できます。
+
+**コード（`JavaScriptで uniqueSort(arr)`）** — 書いた関数を **実際に node で走らせて** から返します
+（`ran=True, ok=True`、`notes` に「node で実行: 2/2 件が期待通り」）:
+
+```javascript
+function uniqueSort(arr) {
+  const out = Array.from(new Set(arr));
+  out.sort((a, b) => (a < b ? -1 : a > b ? 1 : 0));
+  return out;
+}
+```
+
+**応答（役割 + 口調 + 文字数）** — 「あなたは〜です」「〜だよ、〜だね で 200 文字程度」を
+全部守ります。知識ベースに無い語（WebAssembly）は推測で埋めず、*確かめられたこと* だけを
+212 字で返します（裏取りが使える設定なら検索に出ます）:
+
+> 頼れるベテランエンジニアのアシスタントの立場から、WebAssembly(Wasm)についてだよ。
+> 問われている WebAssembly(Wasm) は、手元の語彙バンク 150,000 語の見出しには無い語だね。
+> この設定ではウェブ検索に出られないので、推測で語義は埋めないんだよ。
+> WebAssembly（Wasm）について、どの切り口（意味・利点・手順・比較・値段）が必要かを一言もらえれば、
+> その欄を狙って組み立てるんだよ。
+
+出力は返す前に検査されます（`json_schema` / `bullet_count` / `max_chars` / `tone_friendly` /
+`code_executed` / `coverage` … 11 種）。落ちたら *組み直し*、それでも落ちたら
+`ok=False` と理由を `checks` に残します。「できた」と嘘をつきません。
+
+```bash
+.venv/bin/python tools/bench_instruction.py    # 指示追従率・誤検出・逃げを数字で出す
+```
 
 ## 3. 「できない」「分かりません」を出さない仕組み
 
@@ -151,6 +206,9 @@ SNIPHER_EDGE_SEARCH_URL=...  # エンドポイント差し替え
 | `今は西暦何年？` | 和暦・年内何日目・第何週・UNIX 時刻まで組んで返す |
 | `100 の素因数分解` | `100 = 2^2 × 5^2` |
 | `Pythonで素数判定を書いて` | コード生成 → *実際に走らせる* → 実行結果まで本文に添える |
+| `次のテキストから抽出して JSON のみで出力` | 材料の文字列だけを欄に埋め、JSON だけ返す（挨拶も解説も付けない） |
+| `3つの箇条書きで短く要約して` | 材料の語だけで 3 点。本数・長さ・述語を検査してから返す |
+| `〜だよ の口調で 200 文字程度で答えて` | 役割と語尾と文字数を契約として守る（文は途中で切らない） |
 | `「うれしい」を英語にして` | 読み・品詞・ローマ字を先に返し、対応語は検索で取れると明示する |
 | `しりとりしよ` / `回文を作って` | 索引から手を打ち、条件を実際に検算する（回文は左右対称を確認） |
 | `HTML で一覧を書いて` | タグの対応を `tag_balance()` で検査してから渡す |
@@ -166,13 +224,25 @@ SNIPHER_EDGE_SEARCH_URL=...  # エンドポイント差し替え
 ## 9. テストと計測
 
 ```bash
-.venv/bin/python -m pytest -q          # 437 passed, 3 skipped
-.venv/bin/python tools/bench.py        # 速度・常駐・規模・文章の健全性
+.venv/bin/python -m pytest -q               # 469 passed, 3 skipped
+.venv/bin/python tools/bench.py             # 速度・常駐・規模・文章の健全性
+.venv/bin/python tools/bench_instruction.py # 指示追従率・誤検出・逃げ（合格線で exit code）
 ```
+
+`tools/bench_instruction.py --runs 2` の実測（12 種の指示 × 2 回、`SNIPHER_WEB=off`）:
+
+| 指標 | 値 |
+|---|---|
+| 指示追従率 | **100%**（extract / summarize / code / answer / list / transform すべて 1.0） |
+| 1 指示 | 中央値 9.2 ms / p95 28.8 ms / 最大 444 ms（33.6 指示/秒） |
+| タスク別中央値 | extract 0.9 ms・list 0.6 ms・transform 1.2 ms・answer 4.2 ms・summarize 12.7 ms・code 24.5 ms（実行込み） |
+| 誤検出 | **0 / 20**（会話を指示と読まない。読み取り中央値 0.05 ms） |
+| 禁止表現（「できません」系） | **0** |
 
 新規に足したテスト（v3 の契約）: `tests/test_lang.py`（辞書・音・活用）、
 `tests/test_mind.py`（frame/state/rules/play）、`tests/test_solve.py`（計算・コード・文字）、
-`tests/test_web_grounding.py`（検索と fetch）、`tests/test_v3_contract.py`（上の受け入れ条件）。
+`tests/test_web_grounding.py`（検索と fetch）、`tests/test_v3_contract.py`（上の受け入れ条件）、
+`tests/test_instruction.py`（指示の読み取り・実行・検証・経路、32 本）。
 
 ## 10. 同梱データのライセンス
 
