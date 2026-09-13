@@ -38,6 +38,9 @@ _OPINION = re.compile(r"(と思う|って思う|だと思います|な気がす�
 _INVITE = re.compile(r"(しよ|しよう|しませんか|ません？|一緒に|話そ|語ろ|遊ぼ|付き合って|教えてよ|"
                      r"聞かせて|しゃべろ|話そう)")
 _QUESTION = re.compile(r"(？|\?|ですか|ますか|かな$|どれ|いつ|どこ|なぜ|どうして|いくら|何回)")
+# 「X について話したい」は *話題の依頼* です。「たい」だけで予定と読むと、
+# 予定の話でもないのに「何時頃を予定していますか」を返しに行きます。
+_TOPIC_WANT = re.compile(r"(話|語|しゃべ|相談)(したい|させて|聞きたい)|聞きたい")
 
 # 発話から読み取れる *情報の枠*。無い枠だけを名指しで聞く（「語を一語ください」は使わない）
 _TIME_WORDS = ("今日", "昨日", "明日", "一緒", "いま", "今")
@@ -161,6 +164,22 @@ def _rot(*, salt: str, pool, turn: int = 0) -> str:
     return pool[(h + int(turn) * 7) % len(pool)]
 
 
+def _opaque_topic(obs: dict) -> bool:
+    """発話に、語彙にも索引にも無い *まとまった語* があるか（未知語の名指しに譲るため）。"""
+    body = str(obs.get("text") or "")
+    if obs.get("known_nouns"):
+        return False
+    # 助詞で割った *名詞らしき塊* を見ます（文ごと語として扱うと誤爆します）。
+    for run in re.split(r"[がをにはへと]", body):
+        run = re.sub(r"(につ|につい|たい|たく|する|して|します|です|ます|だ|である|れる|られ"
+                     r"|[てたたいuる]+$)+", "", run).strip("。、!?！？「」『』 ")
+        if len(run) < 3 or run in _NOISE or run in _FORM_NOUNS:
+            continue
+        if not lex.bank().has(run) and lex.bank().entry(run) is None:
+            return True
+    return False
+
+
 def observe(text: str) -> dict:
     """発話行為・気分・内容語・抜けている枠を読む。"""
     body = re.sub(r"\s+", " ", normalize(text or "")).strip()
@@ -169,6 +188,8 @@ def observe(text: str) -> dict:
         act = "trouble"
     elif _INVITE.search(body):
         act = "invite"
+    elif _TOPIC_WANT.search(body):
+        act = "invite"           # 話題を出しているだけで、予定を語っているのではない
     elif _PLAN.search(body):
         act = "plan"
     elif _OPINION.search(body):
@@ -325,6 +346,9 @@ def topic_items(text: str, *, kb, limit: int = 3, min_score: float = 0.42) -> li
     return out
 
 
+#: 発話の主語として中身の薄い名詞。これしか読めないときは動詞を受け取るほうが情報が多い。
+_GENERIC_EVENT = frozenset("""作業 もの こと 用事 仕事 話 状態 状況 毎日 今日 昨日 時間 場面 系 化 性""".split())
+
 _LEX_TRIVIA = re.compile(r"(拍|索引|U\+|文字数|読み仮名|品詞)")
 
 
@@ -373,12 +397,38 @@ def _ask_line(obs: dict, items: list[dict], *, turn: int = 0) -> str:
         if kb_ask:
             return kb_ask
     slot_ask = ""
-    for name, _pat, pool in _SLOTS:
-        if name in obs["missing"]:
-            slot_ask = _rot(salt=f"{salt}:{name}", pool=pool, turn=turn)
-            break
+    # 枠の掘り方は *相手その枠に話を置いている* ときだけにします。何も出ていないのに
+    # 「何時頃ですか」と聞くのは、質問の形をした埋め草にすぎません。
+    if obs["have"]:
+        for name, _pat, pool in _SLOTS:
+            if name in obs["missing"]:
+                slot_ask = _rot(salt=f"{salt}:{name}", pool=pool, turn=turn)
+                break
     act_ask = _rot(salt=salt, pool=_ACT_ASK.get(obs["act"], ()), turn=turn)
     return slot_ask or act_ask
+
+
+def _past_surface(stem: str, text: str) -> str:
+    """ます幹（怒ら・追わ・終わ）を、*発話に実際に現れた形* からた形に組み直します。
+
+    語幹に直接 「られた」 を足すと、すでに受身を含んだ語幹で「怒らられた」のように
+    二重になります。なので発話側の活用語尾まで拾って、て→た だけを組み替えます。
+    """
+    v = str(stem or "").strip()
+    src = str(text or "")
+    # 語幹が平仮名だけ（「われ」「られ」）のときは *切り詰められた断片* なので使いません。
+    # その断片から文を作ると「われたのは…」のように語の頭が消えます。
+    if not v or len(v) < 2 or not re.match(r"[\u4e00-\u9fff\u30a1-\u30faA-Za-z]", v):
+        return ""
+    m = re.search(rf"{re.escape(v)}[ぁ-ゖ]{{0,4}}?(?:て|で|た)", src)
+    if not m:
+        return ""
+    got = m.group(0)
+    if "なく" in got or "ませ" in got:        # 否定・可能の崩れ方はここで組み替えない
+        return ""
+    if len(got) - len(v) > 6:
+        return ""
+    return got[:-1] + "た" if got.endswith(("て", "で")) else got
 
 
 def _verb_ok(v: str) -> bool:
@@ -404,6 +454,15 @@ def _react_line(obs: dict, items: list[dict], *, turn: int = 0) -> str:
     if not _verb_ok(v):
         v = ""
     p_ = str(obs.get("predicate") or "")
+    # 相手の出来事が *動詞で語られている* のに、名詞が「作業・こと」のような総称のときは、
+    # 総称を繰り返すより動詞を受け取ったほうが会話になります。
+    if obs["act"] in ("trouble", "feel") and v:
+        # 出来事が *動詞で語られている* のなら、名詞を繰り返すより動詞を受け取ります。
+        past = _past_surface(v, obs["text"])
+        verb_line = (f"{past}のは、その場がいちばん堪えますね。" if obs["act"] == "trouble"
+                     else f"{past}のは良かったです。きっかけを一言もらえますか。")
+        if past and 10 <= len(verb_line) <= 110 and not re.search(r"(っ|ぁ|ぃ|ぅ|ぇ|ぉ)$", past):
+            return verb_line
     # 疲れ・うれしさのような *述語で来る発話* は、話題名に差し替えると相手の言葉が
     # 消えます。「疲れた」→「それは重たい目の疲れですね。」では会話として外れるので、
     # 述語がある回は述語の型を使います。
@@ -494,6 +553,13 @@ def claims_for(text: str, *, frame=None, kb=None, history: list[dict] | None = N
         return repair_claims(obs, last_topic=topic, items=items, turn=turn)
 
     if obs["act"] == "invite" and not items:
+        # 話題として出された語が *手元に無い語* なら、汎用の案内より先に
+        # その語の名指しを返す道のほうが正直です（think の未知語経路に渡す）。
+        unknown = [n for n in obs["nouns"]
+                   if n not in obs.get("known_nouns", ()) and len(n) >= 3
+                   and n not in _FORM_NOUNS and n not in _NOISE]
+        if unknown or _opaque_topic(obs):
+            return []
         return [Claim(kind="answer",
                       content="一緒にやることなら、雑談・語を並べる遊び・手元の計算や下書きまで続けられます。",
                       source="local:chat", weight=0.6),

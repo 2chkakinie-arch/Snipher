@@ -230,9 +230,9 @@ def pick(prev: str, rules: list[Rule], *, used: list[str] | None = None,
     mv.reading = reading
     mv.candidates = [s for _p, s, _r in scored[:6]]
     if key:
-        why = [f"前の語「{prev}」の「{key}」から始められる語を、語彙バンク {len(lex.bank()):,} 語から探しました"]
+        why = [f"前の語「{prev}」の「{key}」から始められる語を実辞書から探しました"]
     else:
-        why = [f"先手なので、語彙バンク {len(lex.bank()):,} 語から一般的な名詞を選びました"]
+        why = ["先手なので、よく使う名詞から始めました"]
     if forbid_ends:
         why.append("「" + "」や「".join(forbid_ends) + "」で終わる語は除きました")
     if want_len:

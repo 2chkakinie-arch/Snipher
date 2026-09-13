@@ -619,20 +619,40 @@ def think(text: str, *, history: list[dict] | None = None, kb=None, web=None, lm
     # ---- 2a2) 翻訳の依頼: 確認できる形の話 + 取れた用例 -------------------------------- #
     if frame.ask == "translation" and not any(str(c.source) == "web" for c in claims):
         word, lang = _translation_target(text)
-        ent = lex.bank().entry(word) if word else None
-        if word and ent is not None:
-            read = ent.reading or to_hiragana(word)
-            bits = [f"「{word}」の読みは「{read}」"]
+        moved, romaji = "", ""
+        if word:
             try:
-                bits.append(f"ローマ字では {kana_to_ro(read)}")
+                from ..instruction.translate import translate as _tr
+
+                got, _nt = _tr(word, lang or "en")
+                moved = str(got or "").strip()
             except Exception:  # noqa: BLE001
-                pass
-            if ent.pos:
-                bits.append(f"品詞は {ent.pos}")
-            body = "、".join(bits) + "。"
+                moved = ""
+            # 一語の依頼では "It is a cat." のように枠が足されるので、核だけ拾います。
+            moved = re.sub(r"^(?:It is|This is|That is|It's|This is it)\s+(?:(?:a|an|the)\s+)?",
+                           "", moved)
+            moved = moved.strip().rstrip(".。").strip()
+            try:
+                romaji = kana_to_ro(to_hiragana(word))
+            except Exception:  # noqa: BLE001
+                romaji = ""
+            want_ja = "日本" in lang
+            if want_ja:
+                ok = bool(re.search(r"[ぁ-んァ-ヶ一-龯]", moved)) and moved != word
+            else:
+                ok = (bool(re.search(r"[A-Za-z]", moved)) and moved != word
+                      and moved.lower() not in (romaji.lower(), word.lower()))
+            moved = moved if ok else ""
+        if word and moved:
+            body = f"「{word}」は {lang} で {moved} です。"
+            if len(word) <= 4:
+                body += "文ごとなら、その文をどうぞ。"
+        elif word and romaji:
+            # 対応語が引けない語を「訳せた」とは言いません。音写にとどめます。
+            body = (f"「{word}」は音写して {romaji} と書きます。{lang} 側の対応語はまだ届いていないので、"
+                    f"文をもらえれば文脈から訳を組みます。")
         elif word:
-            body = (f"「{word}」は {mora_count(word)} 拍の列として読めました。"
-                    f"こちらの国語辞典の見出しには無い語なので、音のまま返します。")
+            body = f"「{word}」を {lang} に写すには、もう一言まわりの文をください。"
         else:
             body = "変換する語が特定できませんでした。"
         claims.append(Claim(kind="answer", content=body, subject=word, source="lex", weight=0.64,
@@ -652,7 +672,8 @@ def think(text: str, *, history: list[dict] | None = None, kb=None, web=None, lm
                               frame.norm) \
             and not _kb_has_actionable(text, kb=kb):
         claims.extend(_chat_claims(text, frame=frame, kb=kb, history=history, turn=turn_no))
-        if not claims:
+        if not claims and not frame.flags.get("opaque"):
+            #  unknown 語を含む発話は「〜なんですね」の言い換えでは終わらせません。
             claims.extend(_feeling_claims(frame, turn_no) if frame.mood != "neutral"
                           else _statement_claims(frame, turn_no))
         if claims:
@@ -760,16 +781,19 @@ def think(text: str, *, history: list[dict] | None = None, kb=None, web=None, lm
     if not claims:
         # 辞書の情報（読み・拍・品詞）は、*語そのものを尋ねる質問* の場合にだけ使います。
         # 「今日のニュースは？」に拍数を返すのが v3 の事故だったので、ここでは門番を通す。
-        from ..ground.evidence import exact_definition
+        from ..ground.evidence import exact_definition, lexical_claims
         from ..mind.parse import wants_word_info
 
         if wants_word_info(text, frame):
             claims.extend(lexical_claims(frame, limit=3))
         have = {str(c.content) for c in claims}
-        extra = [x for x in suggestion_claims(text, kb=kb) if str(x.content) not in have]
-        claims.extend(extra)
+        # *問いかけではない発話* に近い話題を被せると、報告が百科事典の一文に
+        # 化けます（「深夜になった」→「夜は、体温と覚醒が…」）。ここでは問いだけ。
+        if _is_question_text(text):
+            extra = [x for x in suggestion_claims(text, kb=kb) if str(x.content) not in have]
+            claims.extend(extra)
         if not claims:
-            claims.extend(_decompose_claims(frame, text, turn_no))
+            claims.extend(_decompose_claims(frame, text, turn_no, kb=kb))
             thought.steps.append("材料が薄いため、発話そのものの分析を返す")
 
     # 検索すべき語だったのに裏が取れなかったときは、*何を確かめて何が無いのか* を先に言う。
@@ -777,7 +801,7 @@ def think(text: str, *, history: list[dict] | None = None, kb=None, web=None, lm
     has_substance = any(str(c.source).startswith(("tool", "web", "session"))
                         or ("kb" in str(c.source) and c.kind != "note") for c in claims)
     if frame.needs_web and not has_substance:
-        extra = _decompose_claims(frame, text, turn_no)
+        extra = _decompose_claims(frame, text, turn_no, kb=kb)
         if extra:
             claims.extend(extra)
             disclosed = True
@@ -789,6 +813,9 @@ def think(text: str, *, history: list[dict] | None = None, kb=None, web=None, lm
 
     _lex_ok = _wants_word_info(text, frame) or frame.ask in ("reading", "word_property",
                                                               "synonym", "antonym", "word_list")
+    # 「しりとりしよ」のような *遊びの提案* は語を尋ねていません。ここで索引の手を
+    # 足すと、ゲームを始めた直後に「その語はどんな場面ですか」と聞き返します。
+    _lex_ok = _lex_ok and not frame.flags.get("propose_activity")
     if not disclosed and _lex_ok and frame.ask not in ("translation", "code", "compute") \
             and not any(str(c.source).startswith(("tool", "web", "session")) or
                         ("kb" in str(c.source) and topic_key and topic_key in str(c.content))
@@ -803,6 +830,22 @@ def think(text: str, *, history: list[dict] | None = None, kb=None, web=None, lm
                                                and any(f"「{t}」" in str(c.content) for t in named))]
             claims.extend(menu)
             thought.steps.append("手の選択: 索引から数えられる事実で一手足す")
+
+    # 翻訳・計算・コードのように *実行して返した* 回では、「〜の話ですね」の相槌を
+    # 前に足すと冗長です。実語の結果が既にあるなら、受け取りの一文だけを引きます。
+    if any(c.kind == "answer" and str(c.source) in ("lex", "tool") for c in claims):
+        def _is_ack(c) -> bool:
+            s = str(c.content).strip()
+            if c.kind not in ("note", "answer"):
+                return False
+            if c.kind == "answer" and str(c.source) != "local:chat":
+                return False
+            return bool(re.search(r"(の話ですね。|の話でした。|話をもらえました。"
+                                  r"|の話を受け取りました。|件、受け取りました。)$", s))
+
+        claims = [c for c in claims if not _is_ack(c)]
+        if dossier_obj is not None:
+            dossier_obj.claims = [c for c in dossier_obj.claims if not _is_ack(c)]
 
     if dossier_obj is not None and claims and not dossier_obj.claims:
         dossier_obj.claims = list(claims)
@@ -965,7 +1008,15 @@ def shape_line(text: str) -> str:
     return "どんな場面で使う語かを一言もらえれば、その場で同じ形に組みます。"
 
 
-def _decompose_claims(frame, text: str, turn: int = 0) -> list[Claim]:
+def _is_question_text(text: str) -> bool:
+    """問いの形か。「〜とは」「〜って」は疑問記号が無くても語を尋ねています。"""
+    t = normalize(str(text or ""))
+    if re.search(r"[？?]|教えて|知りたい|何ですか|どう|なぜ|いくら|いつ|どこ|できますか|ですか", t):
+        return True
+    return bool(re.search(r"(?:とは|って(?:は)?|という(?:意味)?は)\s*[。.]?\s*$", t))
+
+
+def _decompose_claims(frame, text: str, turn: int = 0, *, kb=None) -> list[Claim]:
     """語彙に無い語が来たとき、*読める断片と問いの形* から当たりを付けて先に進みます。
 
     索引の語数・読み・拍は答えとして出さない（v3 はここで辞書を引き返していました）。
@@ -975,6 +1026,34 @@ def _decompose_claims(frame, text: str, turn: int = 0) -> list[Claim]:
     pieces = [p for p, _ in lex.bank().segment(t) if len(p) >= 1][:8]
     known = [p for p in pieces if len(p) >= 2 and lex.bank().has(p)]
     bits = []
+    # *平叙（報告・独り言）* に対して語の分解を返すと、「どんな場面で使う語ですか」で
+    # 会話を止める形になります。まず会話の受け取りを試して、それが組めるときはそこに任せます。
+    if not _is_question_text(text):
+        try:
+            got = _chat_claims(text, frame=frame, kb=kb, turn=turn)
+        except Exception:  # noqa: BLE001
+            got = []
+        if got:
+            return list(got)
+    # 欧文・数字・カタカナの塊で、まだ語彙に無いもの。「それを聞かれている」ことを
+    # 最初に名のると、答えが相手の発話から離れて見えません（無関係の定型文に見える）。
+    opaque = [w for w in re.findall(r"[A-Za-z][A-Za-z0-9.＿_-]*|\d[\d.]*|[ァ-ヶー]{3,}", t)
+              if w not in ("って", "とは") and not lex.bank().has(w) and len(w) >= 2]
+    if not opaque:
+        # 和語・混成の語も「無い語は無い」と先に伝えると、答えが相手の発話から離れません。
+        # 助詞で割った塊のうち、語彙にも索引にも無い 3〜8 文字だけを語として数えます。
+        for run in re.split(r"[がをにはへと]", t):
+            run = re.sub(r"(につい|につ|たい|たく|する|して|します|です|ます|である|れる|られ)+$", "", run)
+            run = run.strip("。、!?！？「」『』 ・")
+            if 3 <= len(run) <= 8 and not lex.bank().has(run) and lex.bank().entry(run) is None:
+                opaque.append(run)
+                break
+    if opaque:
+        leads = (f"「{opaque[0]}」はこの場で初めて聞く語なので、推測では埋めません",
+                 f"「{opaque[0]}」については手元に記録がありません。問いの形だけを見て組みます",
+                 f"「{opaque[0]}」は初めて聞く言い回しです。中身を推測で埋めるのは避けました",
+                 f"「{opaque[0]}」が指すものはまだ絞れていないので、形の確認から入ります")
+        bits.append(leads[int(turn) % len(leads)])
     bits.append(shape_line(t))
     if known and sum(len(p) for p in known) >= max(4, int(len(t) * 0.35)):
         bits.append("読める部品は " + "、".join(f"「{p}」" for p in known[:3]) + " なので、そこを軸に組みます")
@@ -1070,6 +1149,31 @@ def _translation_target(text: str) -> tuple[str, str]:
     if not src:
         m2 = re.search(r"([A-Za-z][A-Za-z0-9'\\-]{1,24})", t)
         src = m2.group(1) if m2 else ""
+    if not src:
+        # 「A はどう英語にする？」型は動詞の型が掛からないことがあるので、*名詞 1 語* を
+        # 探します。文をそのまま渡すと "The weather do to dou English" のような
+        # 誤訳になるので、品詞で絞るのが安全です。
+        skip = set(_LANG_WORDS) | {"どう", "何", "いう", "言い方", "翻訳", "訳", "訳し", "訳して",
+                                   "訳す", "にして", "にしたい", "教えて", "ください", "して",
+                                   "したい", "欲しい", "方法", "仕方", "場合", "場面", "語", "文"}
+        try:
+            for w, pos in lex.bank().segment(re.sub(r"[「」『』\s]", "", t)):
+                w = re.sub(r"(って|とは|は|が|を|の|で|に|も|と|や|へ|から|まで|より|して)+$", "", w)
+                if str(pos).split("/")[0] != "名詞" or not w or w in skip:
+                    continue
+                if any(k in w for k in ("訳", "翻訳", "英語", "日本語", "口調")):
+                    continue
+                src = w
+                break
+        except Exception:  # noqa: BLE001
+            src = ""
+    if not src and lang != "外国語":
+        # 「猫って英語？」は言語名の *手前* が対象です。
+        head = re.split(lang, t, 1)[0].strip()
+        head = re.sub(r"(って|とは|は|が|を|の|で|に|も|と)+$", "", head)
+        head = head.strip(" 、。「」『』？?")
+        if 1 <= len(head) <= 12 and not re.search(r"(どう|何|いう|訳|翻訳|教えて|欲しい)", head):
+            src = head
     return src, lang
 
 

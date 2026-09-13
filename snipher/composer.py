@@ -604,52 +604,40 @@ class Composer:
 
     def _observations(self, text: str, *, u: Utterance | None = None,
                       prev: list[str] | None = None) -> str:
-        """入力から実際に読めた事実だけを 1 文にまとめる（辞書・字形・語数）。"""
-        u = u or self.analyze(text)
-        try:
-            from .lang.lex import bank as _bank
+        """最終手段。*観測値（文字数・語彙の状態）は並べず*、読めた語から答えにいきます。
 
-            b = _bank()
-        except Exception:  # noqa: BLE001
-            b = None
-        words = [w for w in (u.words or []) if w]
-        known, unknown = [], []
-        if b is not None:
-            for w in words:
-                (known if b.has(w) else unknown).append(w)
-        bits: list[str] = []
+        ここは mind が壊れたときだけ通る道ですが、通ったからといって
+        「入力は N 文字」「語彙バンクにある語は…」を画面に出すのは
+        応答として許されません（v4 で禁止した辞書引きの形そのものなので）。
+        """
+        u = u or self.analyze(text)
         raw = (text or "").strip()
-        if raw:
-            bits.append(f"入力は {len(raw)} 文字・{max(len(words), 1)} 語")
-        if known:
-            bits.append(f"語彙バンクにある語は {'・'.join(known[:4])}")
-        if unknown:
-            bits.append(f"見つからなかった語は {'・'.join(unknown[:4])}")
-        if u.numbers:
-            bits.append(f"数字は {' '.join(u.numbers[:4])}")
-        hint = self._word_hint(u.echo or u.subject()) if (unknown and (u.echo or u.subject())) else ""
-        cand = ""
-        try:
-            sug = [str(s or "") for s in self.kb.suggest(raw, top_k=2) if s]
-            if sug:
-                cand = f"近い話題は {'・'.join(sug[:2])}"
-        except Exception:  # noqa: BLE001
-            cand = ""
-        body = "、".join(bits)
-        if not body:
-            return ""
-        out = body + "です。"
-        extra = "。".join(x for x in (hint.rstrip("。"), cand.rstrip("。")) if x)
-        if extra:
-            out += extra + "。"
-        # ここから先も「相手の言葉」か観測値だけを使い、固定の結句は置かない。
-        if unknown and len(out) < 170:
-            out += f"「{unknown[0]}」は辞書に無い語なので、そのままの固有名として扱います。"
-        elif not cand and not u.is_question and len(out) < 170:
-            out += "続きも一緒に見ます。"
-        if prev and out in prev:
-            out = body + "でした。"
-        return out
+        words = [str(w) for w in (u.words or []) if w]
+        out: list[str] = []
+        for probe in [u.echo or u.subject()] + words[:4]:
+            probe = str(probe or "").strip(" 「」『』、。")
+            if len(probe) < 2:
+                continue
+            try:
+                got = self.kb.answer(probe) if self.kb is not None else None
+            except Exception:  # noqa: BLE001
+                got = None
+            body = str((got or {}).get("text") or "").strip()
+            if body and 10 <= len(body) <= 130 and not re.search(r"(拍|品詞|索引|U\+)", body):
+                out.append(body)
+                break
+        if not out and raw:
+            try:
+                from .mind.think import shape_line
+
+                out.append(shape_line(raw))
+            except Exception:  # noqa: BLE001
+                out.append("用件から組み直します。いちばん近い語を一言もらえますか。")
+        text_out = "\n".join(out).strip()
+        if prev and text_out in prev:
+            text_out = f"{text_out}\n別の角度からも見ます。どれを先に決めたいですか。"
+        return text_out
+
 
     def _word_hint(self, w: str) -> str:
         """未知語の中に既知の話題が含まれていれば、手がかりの一文を返す。"""

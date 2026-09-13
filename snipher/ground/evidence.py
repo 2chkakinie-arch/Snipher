@@ -409,6 +409,30 @@ def _strip_ask_words(query: str) -> str:
     return t[:12]
 
 
+def _shares_run(name: str, runs: set, query: str) -> bool:
+    """発話と語名が *意味を持つ並び* を共有しているか。
+
+    漢字を含む 2 文字、または 3 文字以上の連続を要求します。カタカナ一音節
+    （「クラ」「ター」）は語数が少ないので 2 文字だと別語に当たります。
+    「クラスター」と「クラウド」のような偶然の重なりを、答えの取り違えに
+    使わないための線引きです。
+    """
+    if not name:
+        return False
+    if len(name) <= 1:
+        return "一" <= name <= "鿿" and name in query
+    for r in runs:
+        if r not in name:
+            continue
+        if any("一" <= ch <= "鿿" for ch in r):
+            return True
+        if r.isascii() and (len(r) >= 3 or not r.isalpha()):
+            return True
+        if len(r) >= 3:
+            return True
+    return False
+
+
 def suggestion_claims(text: str, *, kb) -> list[Claim]:
     """手元に近い話題があれば、*名前を挙げて* 提案する（索引が言う事実で、推測ではない）。"""
     out: list[Claim] = []
@@ -418,9 +442,13 @@ def suggestion_claims(text: str, *, kb) -> list[Claim]:
         names = [str(x) for x in (kb.suggest(text, top_k=3) or []) if x]
     except Exception:  # noqa: BLE001
         names = []
-    q_chars = {c for c in normalize(text) if "一" <= c <= "龯" or c.isascii() and c.isalnum()}
-    if q_chars:
-        names = [n for n in names if len({c for c in n if c in q_chars}) >= 2]
+    # 提案を通すのは、*問いと語名が 2 文字以上の並びを共有している* ときだけ。
+    # 一文字ずつの重ね合わせ（旧実装）だと「プルントゥーラ・クラスタ」と
+    # 「ターミナル操作」がタ・ー・ルで通ってしまい、無関係の定義が答えになります。
+    # 漢字の無い発話（「ゾルタクス＝ゼッカって？」）でも同じなので省略しません。
+    q = re.sub(r"[、。？?！!\s]", "", _strip_ask_words(normalize(text)))
+    runs = {q[i:j] for i in range(len(q)) for j in range(i + 2, min(i + 7, len(q) + 1))}
+    names = [n for n in names if _shares_run(normalize(n), runs, q)]
     if not names:
         return out
     # 話題名の羅列（「〜のあたりを話せます」）は *何も答えていない* ので、
