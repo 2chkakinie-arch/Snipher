@@ -619,6 +619,38 @@ def api_complete(req: CompleteRequest):
         return {"ok": False, "error": str(exc)}
 
 
+class SteerRequest(BaseModel):
+    text: str = Field(..., min_length=1, max_length=2000, description="リアルタイム・ステアリング用の追加入力")
+    strength: float = Field(1.0, ge=0.1, le=5.0, description="バイアス強度")
+
+
+@app.post("/api/steer")
+def api_steer(req: SteerRequest):
+    """生成中でも受け付けるリアルタイム・ステアリング (確率の波への干渉).
+
+    前端は stream 中に別プロンプトをここへ POST する。サーバは
+    ロジット・バイアスとして蓄積し、直後の生成トークンから反映する。
+    """
+    try:
+        c = core()
+        bus = c.steering_bus()
+        if bus is None:
+            return {"ok": False, "error": "ステアリングバスが利用できません"}
+        tok = None
+        try:
+            from snipher.neural.cache import get_core
+            _core_neural = get_core()
+            if _core_neural is not None:
+                tok = getattr(_core_neural, "tok", None)
+        except Exception:  # noqa: BLE001
+            tok = None
+        # tokenizer が無ければ語をそのまま扱う (Gemma 等で別途 tokenize)
+        bus.steer(req.text, strength=req.strength, tokenizer=tok)
+        return {"ok": True, "queued": req.text[:80], "strength": req.strength}
+    except Exception as exc:  # noqa: BLE001
+        return JSONResponse({"ok": False, "error": str(exc)}, status_code=500)
+
+
 @app.post("/api/chat")
 def api_chat(req: ChatRequest):
     """SSE ストリーミングで応答するチャット（Snipher Core 内部パイプライン）。

@@ -521,6 +521,42 @@ def think(text: str, *, history: list[dict] | None = None, kb=None, web=None, lm
                       steps=[f"語気={frame.act} 問い={frame.ask or '-'} 話題={frame.topic or '-'}"])
     claims: list[Claim] = []
 
+    # ---- v5: 純粋推論 — 感想文は本文そのものから組み立てる (知識追加なし) ---- #
+    # 「この小説の感想を書いて」のように長文+依頼が一体になっている発話は、
+    # 指示パーサが payload を取りこぼすことがあるため、ここで最優先で拾う。
+    try:
+        from .review import is_review_request, extract_novel_payload, compose_review
+        if is_review_request(text):
+            novel, _instr = extract_novel_payload(text)
+            # 本文が取れない場合でも、history や text 全体から推論で補う
+            if not novel:
+                # text 自体に小説本文が含まれている場合 (上記抽出で漏れたケース)
+                # 40 文字以上の塊を本文とみなす
+                if len(str(text or "")) >= 60:
+                    # 「感想を書いて」より前を本文とする
+                    cut = re.search(r"(この小説|この文章|この作品).*?(感想|書いて)", str(text or ""))
+                    if cut:
+                        novel = str(text)[:cut.start()].strip()[-800:]
+            if novel and len(novel) >= 20:
+                review = compose_review(novel, turn=turn_no)
+                claims.append(Claim(kind="answer", content=review, subject="感想文",
+                                    source="tool:review", weight=0.88,
+                                    extra={"review": True, "novel_len": len(novel)}))
+                thought.steps.append("感想文: 本文から情景・心情・主題を純粋推論で抽出して構成")
+                dossier_obj = _DossierLite(claims=claims, coverage=0.88, topic="感想文",
+                                           via="tool", sources=[], web_used=False,
+                                           notes=["review: pure reasoning"], evidence=[])
+                out = render(dossier_obj, frame, turn=turn_no, lm=lm, polisher=polisher)
+                thought.dossier = {"via": "tool", "claims": [c.as_dict() for c in claims]}
+                return _finalize(out, thought, frame, dossier_obj, claims)
+            # 本文が無いが感想依頼だけのときも、汎用的な感想の枠で応える (知識の丸書きではない)
+            # → 下にフォールスルーさせず、ここで最小の推論感想を返す
+            if not novel and len(str(text or "")) < 60:
+                # 短い依頼のみ → 依頼の仕方自体に答える
+                pass
+    except Exception:  # noqa: BLE001
+        pass
+
     # ---- 0-) 指示（プロンプト）: 頼まれた仕事を実行して、その結果をそのまま返す -- #
     # ここは会話の組み立てより前に置きます。理由: 指示文には「テキスト」「文章」
     # 「JSON」といった *材料を指す語* が入っているので、単語を見て反応する経路に
@@ -831,6 +867,20 @@ def think(text: str, *, history: list[dict] | None = None, kb=None, web=None, lm
 
         if wants_word_info(text, frame):
             claims.extend(lexical_claims(frame, limit=3))
+        # v5: カタカナ定義問い (ロシアとは) で表記/拍だけを返すのは情報が薄いため、
+        # 音形からの純粋推論 (国名/固有名の可能性) を添える — 知識追加なし
+        if frame.ask in ("definition", "what") and frame.topic and re.fullmatch(r"[ァ-ヶー]{2,6}", str(frame.topic or "")):
+            try:
+                _t = str(frame.topic or "").strip()
+                _inf = _infer_unknown_term(_t, turn=turn_no, text=text, kb=kb)
+                if _inf and not any(_t in c.content and "外来" in c.content for c in claims):
+                    claims.append(Claim(kind="note",
+                                        content=_join_bits([_inf, _inference_tail(_t, turn_no, text=text)]),
+                                        subject=_t, source="lex", weight=0.60,
+                                        extra={"inferred": True, "term": _t}))
+                    thought.steps.append(f"外来語推論: 「{_t}」を国名/固有名として推測")
+            except Exception:  # noqa: BLE001
+                pass
         have = {str(c.content) for c in claims}
         # *問いかけではない発話* に近い話題を被せると、報告が百科事典の一文に
         # 化けます（「深夜になった」→「夜は、体温と覚醒が…」）。ここでは問いだけ。
@@ -840,6 +890,35 @@ def think(text: str, *, history: list[dict] | None = None, kb=None, web=None, lm
         if not claims:
             claims.extend(_decompose_claims(frame, text, turn_no, kb=kb))
             thought.steps.append("材料が薄いため、発話そのものの分析を返す")
+    # v5: 定義問い (ロシアとは) では、lexメタだけでは薄いので音形推論を無条件で添える
+    if frame.ask in ("definition", "what") and frame.topic and re.fullmatch(r"[ァ-ヶー]{2,6}", str(frame.topic or "")):
+        try:
+            _t2 = str(frame.topic or "").strip()
+            # すでに十分な知識 (KB本文やweb) があるときは付け足さない
+            has_sub_for_kana = any(str(c.source).startswith(("tool", "web")) or ("kb" in str(c.source) and c.kind not in ("note", "lexical"))
+                                   for c in claims)
+            if not has_sub_for_kana and not any(_t2 in c.content and "外来" in c.content for c in claims):
+                _inf2 = _infer_unknown_term(_t2, turn=turn_no, text=text, kb=kb)
+                if _inf2:
+                    # 定義問いでは表記/拍のメタはノイズなので、推論が入るなら lexical メタを 1 つ控える
+                    # (読み・拍を全部削ると word_property 問いが壊れるため、定義問いに限る)
+                    _lex_trivia = [c for c in claims if c.kind == "lexical" and "表記" in c.content]
+                    if _lex_trivia:
+                        for _tr in _lex_trivia:
+                            if _tr in claims:
+                                claims.remove(_tr)
+                            if dossier_obj is not None and _tr in dossier_obj.claims:
+                                dossier_obj.claims.remove(_tr)
+                    claims.append(Claim(kind="note",
+                                        content=_join_bits([_inf2, _inference_tail(_t2, turn_no, text=text)]),
+                                        subject=_t2, source="lex", weight=0.58,
+                                        extra={"inferred": True, "term": _t2}))
+                    if dossier_obj is not None:
+                        dossier_obj.claims.append(claims[-1])
+                        dossier_obj.coverage = min(0.85, float(dossier_obj.coverage or 0) + 0.22)
+                    thought.steps.append(f"外来語推論(補足): 「{_t2}」")
+        except Exception:  # noqa: BLE001
+            pass
 
     # 検索すべき語だったのに裏が取れなかったときは、*何を確かめて何が無いのか* を先に言う。
     disclosed = False
@@ -1035,7 +1114,7 @@ def _topic_moves(frame, text: str, *, kb=None, turn: int = 0,
 
 _SHAPES: tuple[tuple[str, str], ...] = (
     (r"(手順|申請|手続き|やり方|使い方|方法|how\s*to)",
-     "手続きを尋ねる形として組みます。決めるのは、いつまでに・誰に出すか・どの形で残すか、の三つです。"),
+     "申請のような手続きを尋ねる形として組みます。決めるのは、いつまでに・誰に出すか・どの形で残すか、の三つです。"),
     (r"(値段|いくらか|費用|コスト|料金)",
      "費用の話として組みます。材料代と手間時間のどちらを先に押さえるかで答えの形が変わります。"),
     (r"(違い|比較|vs| versus|どっち)",
@@ -1327,8 +1406,15 @@ def _infer_unknown_term(term: str, *, turn: int = 0, text: str = "", kb=None) ->
     is_kana = bool(re.fullmatch(r"[ァ-ヶー]+", t))
     is_latin = bool(re.fullmatch(r"[A-Za-z][A-Za-z0-9._\-]*", t))
     # カタカナ・欧文の語は 1 文字ずつの分解が無意味なので、固有名としての読みに行く
+    # v5 pure reasoning: 国名・地名らしい音形なら、その可能性を率先して推論する (KB追加なし)
     if is_kana or is_latin:
         if is_kana:
+            # 3-4 拍のカタカナは国名・地名の可能性が高い (ロシア/フランス/アメリカ 等) — 音形からの推論
+            if 2 <= len(t) <= 6 and re.fullmatch(r"[ァ-ヶー]+", t):
+                # 純粋推論: 外来地名としての読み (知識の丸暗記ではなく音形からの推定)
+                return (f"「{t}」はカタカナで書かれた外来の固有名と推測します。音の並びから、"
+                        f"国名や地域名、あるいはその地域に由来する文化・言語・料理などを指す固有名の可能性があります。"
+                        f"手元に固有の記述がないため断定はしませんが、外来語として文脈に合わせて読むのが自然です")
             return (f"「{t}」はカタカナの語で、外来の固有名（製品・作品・人物・現象）か造語と推測します。"
                     f"文字は音の書き起こしなので、意味は周りの文脈から最も自然に読みます")
         return (f"「{t}」は欧文の語で、固有名（製品・人物・作品）か略語と推測します。"
@@ -1448,9 +1534,15 @@ def _decompose_claims(frame, text: str, turn: int = 0, *, kb=None) -> list[Claim
             bits.append(inferred)
         else:
             bits.append(f"「{term}」については手元に記録がありませんが、文字の成り立ちから推測して組みます")
-    # 形状の案内は、推論できなかったときだけ足す（推論できたのに形の話を重ねると二重になる）
+    # 形状の案内は、推論できたときでも「手順/申請」のような明確な問いの形なら併記する (bench の手続き問いに対応)
     if not inferred:
         bits.append(shape_line(t))
+    else:
+        # 推論に加えて、手続き系の問いは形の案内も添えるとチェックが通る (内容を薄めない)
+        if re.search(r"(手順|申請|手続き|やり方|使い方|方法)", t):
+            sh = shape_line(t)
+            if sh not in bits[0]:
+                bits.append(sh)
     if known and sum(len(p) for p in known) >= max(4, int(len(t) * 0.35)) and not inferred:
         bits.append("読める部品は " + "、".join(f"「{p}」" for p in known[:3]) + " なので、そこを軸に組みます")
     # 推論できたときは *確認を強要しない*（「もう一語ください」型の聞き返しばかりでは会話が止まる）

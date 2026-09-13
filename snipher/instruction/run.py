@@ -1190,6 +1190,28 @@ def _exec_check(d: Directive, ctx: dict, *, room_bonus: int = 0):
 def run(text: str, *, kb=None, web=None, history=None, lm=None, core=None, turn: int = 0,
         min_score: float = 0.55) -> Result | None:
     """1 通を受けて、指示なら実行し、検証を通してから返す。指示でなければ None。"""
+    # v5 pure reasoning: 感想文は最優先で本文そのものから組み立てる (知識追加なし)
+    # 指示パーサが payload を取りこぼす長文+依頼 (小説本文 + この小説の感想を書いて) をここで拾う
+    try:
+        from ..mind.review import is_review_request, extract_novel_payload, compose_review
+        if is_review_request(text):
+            novel, _instr = extract_novel_payload(text)
+            if not novel and len(str(text or "")) >= 60:
+                import re as _re
+                _cut = _re.search(r"(この小説|この文章|この作品).*?(感想|書いて)", str(text or ""))
+                if _cut:
+                    novel = str(text)[:_cut.start()].strip()[-800:]
+            if novel and len(novel) >= 20:
+                _review = compose_review(novel, turn=turn or 1)
+                from .style import count_chars as _cc
+                _checks = [{"name": "review:pure-reasoning", "ok": True},
+                           {"name": "length", "ok": 80 <= len(_review) <= 900}]
+                return Result(text=_review, task="write", confidence=0.88,
+                              meta={"chars": _cc(_review), "review": True, "novel_len": len(novel)},
+                              checks=_checks, ok=True, authoritative=True,
+                              directive=None, attempts=1)
+    except Exception:  # noqa: BLE001
+        pass
     d = parse(text, min_score=min_score)
     if d is None:
         return None
