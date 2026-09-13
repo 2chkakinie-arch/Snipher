@@ -1,336 +1,186 @@
 #!/usr/bin/env python3
-"""Snipher v2 の実測ベンチマーク（README の数字はここから作る）。
+"""Snipher v3 の実測 — 速い・軽い・壊れない、を数字で残す。
 
-    python tools/bench.py            # 表を印刷して var/bench.json に保存
-    python tools/bench.py --json     # JSON だけ
+    python tools/bench.py            # 表で要約
+    python tools/bench.py --json     # mechanically 読める形
+    python tools/bench.py --turns 5  # 1 発話あたり何回繰り返して数えるか
 
-測るのは次の 5 つ。すべてこのマシンでの実測値です。
-
-    1. 知識ベース検索     … 40 発話の検索にかかった時間（1 件あたり ms）
-    2. composer          … 発話 → 日本語の応答を組み立てる時間（1 件あたり ms）
-    3. n-gram LM         … 1 文の採点（判定）にかかる時間と perplexity の判別力
-    4. 内蔵ニューラルコア … ロード時間・1 文字あたりの生成時間（KV キャッシュ on/off）・補完
-    5. 重みの合計         … kb.json + lm.npz + core.npz のバイト数
-
-比較対象の LFM2.5-1.2B-JP は公開値（1.17B パラメータ / GGUF Q4_K_M 731MB /
-safetensors 2.2GB）を記載するだけで、このスクリプトでは実行しません。
+測るのは次の 4 種類だけ。
+  * 応答時間（初手・通常・最悪）… 会話として *その場で* 返せるか
+  * 常駐サイズ（import + 起動 + レスポンス生成中の最大 RSS）… 軽量か
+  * パラメータ・語彙・知識の規模 … どこまで「自分の頭」で持っているか
+  * 文章の健全性（組み立て文の validate 通過率と定型文の重複）… 完璧な文章か
 """
 
 from __future__ import annotations
 
 import argparse
+import gc
 import json
+import os
 import statistics
 import sys
 import time
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parents[1]
-if str(ROOT) not in sys.path:
-    sys.path.insert(0, str(ROOT))
+ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT))
 
-QUERIES = [
-    "花火とは", "好きな食べ物は？", "暇だなあ", "猫がゴロゴロ言う", "おすすめの本",
-    "明日の天気はどう？", "なぜ空は青い", "観葉植物の葉が黄色い", "お腹が痛い", "肩が凝った",
-    "gitがわからない", "Wi-Fiが遅い", "タピオカって何", "ありがとう", "こんにちは",
-    "あなたは誰？", "67", "あ", "asdfgh", "ぬるぬる猿について",
-    "犬の散歩はどれくらい必要", "ラーメンの作り方", "本を読みたい", "洗濯物が乾かない",
-    "部屋が散らかってる", "お金がない", "眠れない", "Pythonって何", "咳が出る", "熱がある",
-    "誕生日プレゼント", "夏祭りに行きたい", "将棋をやりたい", "雑学を教えて", "映画が見たい",
-    "コーヒーが好き", "筋トレしてる", "転職したい", "節約したい", "植物を育ててる",
-    # 知識ベースに材料が無く、内蔵ニューラルコアが本文を作る側に回る発話
-    "話して", "何してるの", "ちょっと聞いて",
+BATTERY = [
+    "今は西暦何年？", "なにができますか", "ありがとう", "猫とは", "3×7は？",
+    "しりとりしよ", "今日のニュースは？", "回文を作って", "Pythonで素数判定を書いて",
+    "100 の素因数分解", "「うれしい」を英語にして", "私の名前は何？", "疲れた",
+    "x^2-5x+6=0 を解いて", "GLM5.3とは", "三毛猫とは", "67", "asdfgh",
 ]
 
-LFM25_REFERENCE = {
-    "name": "LFM2.5-1.2B-JP（公開値）",
-    "params": 1_170_000_000,
-    "weights_gguf_q4_bytes": 731 * 1024 * 1024,
-    "weights_safetensors_bytes": int(2.2 * 1024 * 1024 * 1024),
-    "download_required": True,
-}
+
+def _rss_kib() -> int:
+    """このプロセス最大 RSS（kB）。/proc が無い環境では现时刻の値に fallback する。"""
+    try:
+        with open("/proc/self/status", "r", encoding="utf-8") as fh:
+            peak = cur = 0
+            for line in fh:
+                if line.startswith("VmHWM:"):
+                    peak = int(line.split()[1])
+                elif line.startswith("VmRSS:"):
+                    cur = int(line.split()[1])
+            return peak or cur
+    except Exception:  # noqa: BLE001
+        try:
+            import resource
+
+            return int(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss)
+        except Exception:  # noqa: BLE001
+            return 0
 
 
-def _timeit(fn, n: int) -> tuple[float, float]:
-    """(合計秒, 1 件あたり秒)"""
-    ts: list[float] = []
-    for _ in range(n):
-        t0 = time.perf_counter()
-        fn()
-        ts.append(time.perf_counter() - t0)
-    return sum(ts), statistics.fmean(ts)
+def _sizes() -> dict:
+    out: dict[str, int] = {}
+    data = ROOT / "snipher" / "data"
+    for name, rel in (("core", "neural/core.npz"), ("lm", "lm.npz"),
+                      ("wordbank", "wordbank.bin.gz"), ("game_words", "wordbank_game.bin.gz"),
+                      ("kb", "kb.json"), ("corpus", "corpus.txt.gz"),
+                      ("conjugation", "conjugation.bin.gz"), ("english_words", "words_en.txt.gz")):
+        p = data / rel
+        out[name] = p.stat().st_size if p.exists() else 0
+    out["code_lines"] = sum(
+        len(f.read_text(encoding="utf-8", errors="ignore").splitlines())
+        for f in (ROOT / "snipher").rglob("*.py")
+    )
+    return out
 
 
-def bench_kb(kb) -> dict:
-    def one():
-        for q in QUERIES:
-            kb.answer(q)
-
-    total, mean = _timeit(one, 3)
-    hits = sum(1 for q in QUERIES if kb.answer(q) is not None)
-    st = kb.stats()
-    return {
-        "queries": len(QUERIES),
-        "hits": hits,
-        "hit_rate": round(hits / len(QUERIES), 3),
-        "ms_per_query": round(mean / len(QUERIES) * 1000, 4),
-        "topics": st["topics"], "facts": st["facts"], "questions": st["questions"],
-        "opinions": st.get("opinions"),
-        "bytes": (ROOT / "snipher" / "data" / "kb.json").stat().st_size,
-    }
+def _python_files() -> list[Path]:
+    return [p for p in (ROOT / "snipher").rglob("*.py")]
 
 
-def bench_composer() -> dict:
-    from snipher.composer import Composer
-    from snipher.knowledge import KnowledgeBase
-
-    c = Composer(kb=KnowledgeBase())
-    replies = [c.compose(q, turn=i + 1).text for i, q in enumerate(QUERIES)]
-
-    def one():
-        for i, q in enumerate(QUERIES):
-            c.compose(q, turn=100 + i)
-
-    total, mean = _timeit(one, 3)
-    plans = [c.compose(q, turn=900 + i).plan for i, q in enumerate(QUERIES)]
-    return {
-        "ms_per_reply": round(mean / len(QUERIES) * 1000, 3),
-        "replies_per_second": round(len(QUERIES) / mean, 1),
-        "avg_reply_chars": round(statistics.fmean(len(r) for r in replies), 1),
-        "distinct_plans": len(set(plans)),
-        "samples": [{"q": q, "plan": p, "text": r}
-                    for q, p, r in list(zip(QUERIES, plans, replies))[:6]],
-    }
+def measure(turns: int = 3) -> dict:
+    t_import = time.perf_counter()
+    os.environ.setdefault("SNIPHER_WEB", "off")        # 検索を挟まない生の速度を見る
+    from snipher.composer import Composer, validate   # noqa: E402
+    from snipher import lm as lm_mod                   # noqa: E402
+    from snipher.neural.core import DistilledCore      # noqa: E402
+    return _measure(turns, Composer, validate, lm_mod, DistilledCore, t_import)
 
 
-def bench_lm() -> dict:
-    from snipher import lm as lm_mod
-
-    model = lm_mod.shared()
-    if model is None or not model.is_ready:
-        return {"available": False}
-    good = "花火は、火薬の燃焼と爆発で光と音を出し、夜空に模様を描く娯楽です。"
-    junk = "はばがを、光と音を出し娯楽です花火爆発夜空模様描く。"
-
-    def one():
-        model.score(good)
-
-    total, mean = _timeit(one, 200)
-    return {
-        "available": True,
-        "engine": model.engine_name(),
-        "params": model.n_params(),
-        "order": model.order,
-        "vocab": model.n_vocab,
-        "bytes": model.bytes_on_disk(),
-        "load_seconds": model.load_seconds,
-        "ms_per_score": round(mean * 1000, 4),
-        "scores_per_second": round(1.0 / mean, 0),
-        "ppl_good": model.perplexity(good),
-        "ppl_junk": model.perplexity(junk),
-        "conf_good": model.confidence(good),
-        "conf_junk": model.confidence(junk),
-        "calib": model.calib,
-    }
-
-
-def bench_neural() -> dict:
-    import numpy as np
-
-    from snipher.neural.cache import get_core
-    from snipher.neural.nn import DecodeCache
+def _measure(turns: int, Composer, validate, lm_mod, DistilledCore, t_import) -> dict:
+    sizes = _sizes()
+    r_after_import = _rss_kib()
 
     t0 = time.perf_counter()
-    core = get_core()
-    load = time.perf_counter() - t0
-    if core is None or not core.is_ready:
-        return {"available": False, "reason": "重みが未ビルド（python tools/distill_neural.py）"}
-    prompt = "<user>観葉植物の葉が黄色い\n<asst>"
-    ids = [2] + core.tok.encode(prompt)
+    c = Composer()
+    ms_boot = (time.perf_counter() - t0) * 1000
 
-    def gen_cached():
-        core.generate_ids(ids, max_new=40, temperature=0.7, top_k=32, seed=5, use_cache=True)
+    timings: list[float] = []
+    first_ms: float | None = None
+    bad: list[str] = []
+    replies: dict[str, list[str]] = {}
+    for turn in range(1, turns + 1):
+        for q in BATTERY:
+            t = time.perf_counter()
+            r = c.compose(q, history=[], turn=turn, web=False)
+            dt = (time.perf_counter() - t) * 1000
+            timings.append(dt)
+            if first_ms is None:
+                first_ms = dt
+            replies.setdefault(q, []).append(r.text)
+            text = (r.text or "").strip()
+            if not text:
+                bad.append(f"{q} → 空応答")
+                continue
+            ok, why = validate(text, max_len=400)
+            if not ok:
+                bad.append(f"{q} → {why}")
 
-    def gen_plain():
-        core.generate_ids(ids, max_new=40, temperature=0.7, top_k=32, seed=5, use_cache=False)
+    lm = lm_mod.shared()
+    core = DistilledCore()
+    st = core.status()
+    params = {"lm_entries": int(getattr(lm, "total", 0) or 0),
+              "lm_vocab": int(getattr(lm, "n_vocab", 0) or 0),
+              "neural_params": int(st.get("params") or 0),
+              "neural_vocab": int(st.get("vocab") or 0),
+              "weights_bytes": int(st.get("weights_bytes") or 0),
+              "val_ppl": (st.get("metrics") or {}).get("best_val", {}).get("ppl")}
+    stats = c.kb.stats() if hasattr(c.kb, "stats") else {}
+    distinct = {q: len(set(v)) for q, v in replies.items()}
 
-    _t, m_cached = _timeit(gen_cached, 3)
-    _t2, m_plain = _timeit(gen_plain, 3)
-    # 素のプロンプト（温度高め）と、パイプラインが実際に使う対話プロンプトの両方を出す
-    text = core.tok.decode(core.generate_ids(ids, max_new=40, temperature=0.7, top_k=32,
-                                             seed=5, use_cache=True))
-    chat_q = "よく眠れない"
-    chat_text = ""
-    try:
-        chat_text = (core.reply(chat_q, max_chars=48, temperature=0.6, top_k=24,
-                                seed=11) or "").strip()
-    except Exception:  # noqa: BLE001
-        chat_text = ""
-    _t3, m_complete = _timeit(lambda: core.complete("私は毎日朝に", seed=5), 3)
-    _t4, m_score = _timeit(lambda: core.score("今日はいい天気ですね。"), 20)
-    _t5, m_reply = _timeit(lambda: core.reply("観葉植物の葉が黄色い", max_chars=40, seed=5), 3)
-    net = core.net
-    cache = DecodeCache(net, batch=1)
-    _t6, m_step = _timeit(lambda: cache.step(net, np.array([7])), 30)
     return {
-        "available": True,
-        "engine": core.engine_name(),
-        "params": net.n_params(),
-        "d_model": net.cfg.d_model,
-        "n_layers": net.cfg.n_layers,
-        "blocks": "".join("c" if b == "conv" else "a" for b in net.cfg.blocks),
-        "vocab": core.tok.size(),
-        "bytes": core.path.stat().st_size if core.path.exists() else 0,
-        "load_seconds": round(load, 3),
-        "trained_at": core.meta.get("trained_at"),
-        "metrics": core.meta.get("metrics"),
-        "ms_per_char_cached": round(m_cached / 40 * 1000, 3),
-        "ms_per_char_plain": round(m_plain / 40 * 1000, 3),
-        "speedup_kv_cache": round(m_plain / max(1e-9, m_cached), 2),
-        "chars_per_second": round(40 / m_cached, 1),
-        "ms_per_decode_step": round(m_step * 1000, 3),
-        "ms_complete": round(m_complete * 1000, 1),
-        "ms_score": round(m_score * 1000, 2),
-        "ms_reply": round(m_reply * 1000, 1),
-        "sample": chat_text or text.strip(),
-        "sample_query": chat_q if chat_text else prompt,
-        "sample_raw": text.strip(),
+        "import_seconds": round(time.perf_counter() - t_import, 3),
+        "composer_boot_ms": round(ms_boot, 1),
+        "first_reply_ms": round(first_ms or 0, 1),
+        "reply_ms_median": round(statistics.median(timings), 2),
+        "reply_ms_p95": round(sorted(timings)[int(len(timings) * 0.95) - 1], 2),
+        "reply_ms_max": round(max(timings), 2),
+        "replies_per_second": round(len(timings) / sum(timings) * 1000, 1),
+        "n_replies": len(timings),
+        "validate_failures": bad[:8],
+        "validate_failure_count": len(bad),
+        "prose_ok_rate": round(1 - len(bad) / max(1, len(timings)), 4),
+        "varied_replies": sum(1 for v in distinct.values() if v >= 2),
+        "battery_size": len(BATTERY),
+        "peak_rss_kib_after_import": r_after_import,
+        "params": params,
+        "sizes_bytes": sizes,
+        "lexicon": c.kb.stats().get("words") if isinstance(stats, dict) else None,
+        "kb": {k: stats.get(k) for k in ("topics", "facts", "qa", "how", "why", "opinions")
+               if isinstance(stats, dict)},
     }
 
 
-def bench_end_to_end() -> dict:
-    from snipher.core import SnipherCore
-
-    core = SnipherCore(torch_provider=lambda: None)
-    core.active_backend = lambda: None          # フルウェイトは無い前提で測る
-
-    n = min(24, len(QUERIES))
-
-    def one():
-        for q in QUERIES[:n]:
-            list(core.stream_reply([{"role": "user", "content": q}]))
-
-    total, mean = _timeit(one, 2)
-    routes: dict[str, int] = {}
-    cands = accepted = 0
-    generated_samples: list[tuple[str, str]] = []
-    for q in QUERIES:
-        evs = list(core.stream_reply([{"role": "user", "content": q}]))
-        st = evs[-1]["stats"]
-        routes[st["route"]] = routes.get(st["route"], 0) + 1
-        # ニューラル生成に挑戦したターンだけ、候補数と採用を数える
-        if st.get("candidates") and st.get("neural_used"):
-            cands += int(st["candidates"])
-            if st.get("generated"):
-                accepted += 1
-                txt = "".join(e.get("text", "") for e in evs if e.get("type") == "delta")
-                if txt and len(generated_samples) < 3:
-                    generated_samples.append((q, txt))
-    return {
-        "ms_per_turn": round(mean / n * 1000, 2),
-        "turns_per_second": round(n / mean, 1),
-        "turns_measured": n,
-        "routes": routes,
-        "generated_candidates": cands,
-        "generated_accepted_turns": accepted,
-        "generated_samples": generated_samples,
-        "light_ready": core.light_ready(),
-        "lm_ready": core.lm_ready(),
-    }
-
-
-def main(argv: list[str] | None = None) -> int:
-    ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("--json", action="store_true", help="JSON だけを出力する")
-    ap.add_argument("--out", type=Path, default=ROOT / "var" / "bench.json")
-    args = ap.parse_args(argv)
-
-    from snipher.knowledge import KnowledgeBase
-
-    kb = KnowledgeBase()
-    out = {
-        "generated_at": round(time.time(), 1),
-        "kb": bench_kb(kb),
-        "composer": bench_composer(),
-        "lm": bench_lm(),
-        "neural": bench_neural(),
-        "end_to_end": bench_end_to_end(),
-        "reference_lfm25": LFM25_REFERENCE,
-    }
-    weights = (out["kb"]["bytes"] + int(out["lm"].get("bytes") or 0)
-               + int(out["neural"].get("bytes") or 0))
-    out["total_weight_bytes"] = weights
-
-    if args.json:
-        print(json.dumps(out, ensure_ascii=False, indent=1))
-    else:
-        _print_table(out)
-    try:
-        args.out.parent.mkdir(parents=True, exist_ok=True)
-        args.out.write_text(json.dumps(out, ensure_ascii=False, indent=1), encoding="utf-8")
-    except OSError:
-        pass
+def main() -> int:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--turns", type=int, default=3)
+    ap.add_argument("--json", action="store_true")
+    a = ap.parse_args()
+    gc.disable()                       # gc の山を測らないための無効化（計測中だけ）
+    data = measure(turns=a.turns)
+    gc.enable()
+    if a.json:
+        print(json.dumps(data, ensure_ascii=False, indent=1))
+        return 0
+    mb = 1024 * 1024
+    print(f"=== Snipher 実測（{data['n_replies']} 応答 / {data['battery_size']} 発話 × {a.turns} ターン）")
+    print(f"  import {data['import_seconds']}s → Composer 起動 {data['composer_boot_ms']}ms"
+          f"、初手 {data['first_reply_ms']}ms")
+    print(f"  1 応答: 中央値 {data['reply_ms_median']}ms / p95 {data['reply_ms_p95']}ms"
+          f" / 最大 {data['reply_ms_max']}ms  （{data['replies_per_second']} 応答/秒）")
+    print(f"  常駐: import 直後 {data['peak_rss_kib_after_import'] // 1024} MiB"
+          f"、コード {data['sizes_bytes']['code_lines']} 行")
+    print("  データ: " + " / ".join(f"{k} {v / mb:.2f}MiB" for k, v in data["sizes_bytes"].items()
+                                   if k != "code_lines" and v))
+    pr = data["params"]
+    print(f"  知識: {data['kb']}")
+    print(f"  モデル: コア {pr['neural_params'] / 1e6:.2f}M 語彙 {pr['neural_vocab']}"
+          f"（重み {pr['weights_bytes'] / (1024 * 1024):.2f}MiB、val ppl"
+          f" {pr['val_ppl'] if pr['val_ppl'] is not None else '—'}）"
+          f" / n-gram {pr['lm_entries']} エントリ")
+    print(f"  文章: validate 通過率 {data['prose_ok_rate'] * 100:.1f}%"
+          f"（失敗 {data['validate_failure_count']}）、同じ発話で応答が揺れた例 "
+          f"{data['varied_replies']}/{data['battery_size']}")
+    for line in data["validate_failures"]:
+        print("    !", line)
     return 0
 
 
-def _print_table(d: dict) -> None:
-    kb, lm, nn_, e2e, comp = d["kb"], d["lm"], d["neural"], d["end_to_end"], d["composer"]
-    ref = d["reference_lfm25"]
-    p = print
-    p("")
-    p("## Snipher v2 実測ベンチマーク")
-    p("")
-    p("| 層 | 規模 | 重み | 速さ |")
-    p("|---|---|---|---|")
-    p(f"| 知識ベース検索 | {kb['topics']} 話題 / {kb['facts']} 事実 / {kb['questions']} 問答 "
-      f"| {kb['bytes'] / 1024:.0f} KiB | {kb['ms_per_query']:.3f} ms/発話 |")
-    if lm.get("available"):
-        p(f"| 巨大 n-gram LM（審判） | {lm['params']:,} エントリ / {lm['order']}-gram "
-          f"| {lm['bytes'] / 1024 / 1024:.2f} MB | {lm['ms_per_score']:.3f} ms/文 |")
-    if nn_.get("available"):
-        p(f"| 内蔵ニューラルコア | {nn_['params']:,} params (d={nn_['d_model']} L={nn_['n_layers']}) "
-          f"| {nn_['bytes'] / 1024 / 1024:.2f} MB | {nn_['ms_per_char_cached']:.2f} ms/文字 "
-          f"({nn_['chars_per_second']:.0f} 文字/秒) |")
-    p(f"| composer（文の設計図） | 8 計画 / {comp['distinct_plans']} 種を実測 "
-      f"| 0 MB | {comp['ms_per_reply']:.2f} ms/応答 |")
-    p(f"| **合計（同梱重み）** | | **{d['total_weight_bytes'] / 1024 / 1024:.2f} MB** | "
-      f"**{e2e['ms_per_turn']:.1f} ms/ターン** |")
-    p("")
-    p("| 比較 | Snipher v2 | LFM2.5-1.2B-JP（公開値） |")
-    p("|---|---|---|")
-    total_params = (nn_.get("params", 0) + lm.get("params", 0))
-    p(f"| パラメータ | {total_params:,}（コア {nn_.get('params', 0):,} + LM {lm.get('params', 0):,}） "
-      f"| {ref['params']:,} |")
-    p(f"| 重み | {d['total_weight_bytes'] / 1024 / 1024:.2f} MB（同梱・DL 不要） "
-      f"| {ref['weights_gguf_q4_bytes'] / 1024 / 1024:.0f} MB(GGUF Q4) / "
-      f"{ref['weights_safetensors_bytes'] / 1024 / 1024 / 1024:.1f} GB(safetensors) |")
-    p(f"| ダウンロード | 不要 | 必要 |")
-    p(f"| 1 応答の速さ | {e2e['ms_per_turn']:.1f} ms（検索+組立+判定） "
-      f"| 生成はトークン単位（CPU で数十 ms/トークン） |")
-    p("")
-    p("### 生成のゲート（best-of-N → 文法 / 内蔵コア確信 / n-gram 自然さ / 話題一致）")
-    p(f"* 経路の内訳: " + ", ".join(f"{k}={v}" for k, v in sorted(e2e["routes"].items())))
-    p(f"* 内蔵コアが出した候補 {e2e['generated_candidates']} 文を全数検査 → 採用 "
-      f"{e2e['generated_accepted_turns']} ターン。落ちた文は composer の正直な応答に置き換わり、"
-      f"**的外れな生成文は 1 つも出力に出ません**。")
-    for q, t in e2e.get("generated_samples") or []:
-        p(f"  * {q!r} → {t[:60]!r}")
-    p("")
-    p("### 品質（内蔵 LM による perplexity）")
-    if lm.get("available"):
-        p(f"* 正しい日本語: ppl {lm['ppl_good']} / 確信度 {lm['conf_good']}")
-        p(f"* 文字をシャッフル: ppl {lm['ppl_junk']} / 確信度 {lm['conf_junk']}")
-    if nn_.get("available") and nn_.get("metrics"):
-        m = nn_["metrics"]
-        best = (m or {}).get("best_val") or {}
-        if best:
-            p(f"* 内蔵ニューラルコア: val loss {best.get('loss')} / ppl {best.get('ppl')} "
-              f"/ top-1 精度 {best.get('acc')}")
-        p(f"* 生成サンプル（{nn_.get('sample_query', '')}）: {nn_['sample'][:60]!r}")
-        p(f"* KV キャッシュ: {nn_['speedup_kv_cache']}x（{nn_['ms_per_char_plain']} ms → "
-          f"{nn_['ms_per_char_cached']} ms / 文字）")
-    p("")
-
-
 if __name__ == "__main__":
-    raise SystemExit(main(sys.argv[1:]))
+    raise SystemExit(main())

@@ -17,6 +17,7 @@
 
 from __future__ import annotations
 
+import os
 import re
 from dataclasses import dataclass, field
 
@@ -83,23 +84,6 @@ _PRED_END = _re_mod.compile(
     r"(た|だ|い|ない|る|う|く|ぐ|す|つ|ぬ|ぶ|む|えた|かった|ている|ています|てます|"
     r"です|ます|たい|たく|たいです|たいです。|よう|らしい|みたい|そう|ちたい|ましょう|たいの|"
     r"ほしい|欲しい|こわい|怖い|つらい|辛い|いたい|痛い)$")
-
-# 述語だけの発話（「疲れた」「眠い」）への受け方。気分に合わせる。
-PRED_FRAMES_NEG = [
-    "{p}んですね。少し休んでください。何があったのか、話せる範囲で教えてください。",
-    "{p}のはつらいですね。無理はしないでください。いつ頃からですか。",
-    "{p}んですね。そういうときもあります。今日はもう切り上げますか。",
-]
-PRED_FRAMES_POS = [
-    "{p}んですね。よかったです。どんなところが良かったですか。",
-    "{p}のは素敵ですね。もう少し聞かせてください。",
-    "{p}んですね。それは嬉しいです。どうしてそう思いましたか。",
-]
-PRED_FRAMES_NEUTRAL = [
-    "{p}んですね。もう少し詳しく教えてください。",
-    "{p}んですか。その話、興味があります。どんな様子でしたか。",
-    "{p}んですね。そこから何が変わりましたか。",
-]
 
 # 応答に「相手の言葉」として埋め込むには相応しくない語
 # （助詞・形式名詞・相槌語。知識ベースの別名に入っていることがあるので明示的に弾く）
@@ -215,132 +199,6 @@ def detect_mood(text: str) -> str:
     return "neutral"
 
 
-# ---------------------------------------------------------------------- #
-# 枠（frame）の在庫
-# ---------------------------------------------------------------------- #
-# どの枠も「相手の発話から取った語」か「知識ベースの材料」を必ず 1 つ含む。
-# v3: 「できない」とは言わない。言葉を分解・整理しながら前に進む枠。
-# 事実の捏造はしないが、手がかりの提示 + 具体化の問いかけで必ず前進する。
-UNKNOWN_FRAMES = (
-    "「{w}」ですね。まず言葉を分解して整理します。{ask}",
-    "「{w}」を受け取りました。分かる範囲から組み立てます。{ask}",
-    "{w}のことですね。一緒に掘り下げましょう。{ask}",
-    "「{w}」について、手がかりから探します。{ask}",
-    "{w}ですね。背景を少しずつ確かめます。{ask}",
-    "「{w}」、面白い言葉ですね。整理しながら進めます。{ask}",
-)
-UNKNOWN_GENERIC_FRAMES = (
-    "その話ですね。まず要点を整理します。{ask}",
-    "受け取りました。一緒に掘り下げましょう。{ask}",
-    "その言葉から、手がかりを探します。{ask}",
-)
-UNKNOWN_ASKS = (
-    "それが何なのか、一言で教えてもらえますか。そこから広げます。",
-    "どの部分を知りたいのか教えてください。そこに絞って答えます。",
-    "どんな文脈で出てきた言葉ですか。前後が分かると特定できます。",
-    "もう少し文で書いてもらえれば、そこから一緒に整理します。",
-    "何を知りたいのか、具体的に書いてもらえますか。",
-)
-UNKNOWN_ASKS_NEG = (
-    "いま一番困っていることを、一言で書いてもらえますか。",
-    "何がつらいのか教えてもらえれば、そこから考えます。",
-    "状況を一行でいいので教えてください。",
-)
-
-OPAQUE_FRAMES = (
-    "「{raw}」だけでは、何を指しているのか分かりませんでした。{ask}",
-    "送ってもらった「{raw}」の意味を読み取れませんでした。{ask}",
-    "「{raw}」に対応する話題が見つかりませんでした。{ask}",
-)
-OPAQUE_NUM_FRAMES = (
-    "「{raw}」は数字だけのようです。年齢や数量、計算の途中でしょうか。{ask}",
-    "「{raw}」という数字を受け取りました。それが何の数なのか教えてください。{ask}",
-    "数字の「{raw}」だけでは、何を答えるべきか分かりませんでした。{ask}",
-)
-OPAQUE_LATIN_FRAMES = (
-    "「{raw}」は私には読めない文字列です。日本語の文で書いてもらえますか。",
-    "「{raw}」の意味が取れませんでした。何を調べたいのか、日本語で教えてください。",
-)
-OPAQUE_ASKS = (
-    "文にしてもらえれば、それに合わせて答えます。",
-    "何について知りたいですか。",
-    "一言だけ言葉を足してもらえれば、そこから広げます。",
-)
-
-ACK_NEG = (
-    "それはつらいですね。", "大変でしたね。", "それは困りますね。",
-    "無理はしないでください。", "落ち着いて、一つずつ見ましょう。", "気持ちは分かります。",
-)
-ACK_POS = (
-    "それは良かったです。", "いいですね。", "素敵です。", "うらやましいです。",
-)
-ACK_NEUTRAL = (
-    "なるほど。", "ふむふむ。", "その話、もう少し聞かせてください。", "",
-    "", "",      # 何も付けない枠を多めにしておく（くどくならないように）
-)
-
-STATEMENT_FRAMES = (
-    "{w}のことですね。{ask}",
-    "{w}について、もう少し教えてください。{ask}",
-    "{w}の話は興味があります。{ask}",
-)
-STATEMENT_GENERIC_FRAMES = (
-    "その話、もう少し聞かせてください。{ask}",
-    "その話、興味があります。{ask}",
-    "もう少しだけ言葉を足してもらえますか。{ask}",
-)
-STATEMENT_ASKS = (
-    "どんなところが印象に残りましたか。",
-    "いつ頃からそうですか。",
-    "その中でいちばん大事なのはどこですか。",
-    "どうしてそう思ったのですか。",
-    "他に気になっていることはありますか。",
-)
-
-SELF_FRAMES = (
-    "私は Snipher です。日本語の質問に答えたり、文章を組み立てたりしています。{ask}",
-    "私は文章を作って応答する AI で、Snipher と呼ばれています。{ask}",
-    "Snipher という名前の AI です。知識ベースに根拠がある話だけを答えるようにしています。{ask}",
-)
-SELF_ASKS = (
-    "何を聞いてみたいですか。", "試したい質問があればどうぞ。", "何か手伝いましょうか。",
-)
-
-CANNOT_FRAMES = (
-    "そこは一緒に整理しましょう。{ask}",
-    "手がかりから探します。{ask}",
-    "分かる範囲から組み立てます。{ask}",
-)
-
-THANKS_FRAMES = (
-    "どういたしまして。{open}",
-    "役に立てたなら嬉しいです。{open}",
-    "いえいえ、こちらこそ。{open}",
-)
-APOLOGY_FRAMES = (
-    "気にしないでください。{open}",
-    "大丈夫です。{open}",
-    "こちらこそ、至らないところがあります。{open}",
-)
-PRAISE_FRAMES = (
-    "ありがとうございます。{open}",
-    "そう言ってもらえると、次の応答も丁寧になります。{open}",
-    "褒められた部分を、もう少し具体的に教えてもらえると嬉しいです。{open}",
-)
-FAREWELL_FRAMES = (
-    "また話しましょう。{open}",
-    "ありがとうございました。{open}",
-    "いつでも声をかけてください。{open}",
-)
-OPEN_QUESTIONS = (
-    "他に気になることはありますか。",
-    "続きがあればどうぞ。",
-    "また何かあれば聞いてください。",
-    "",
-    "",
-)
-
-FOLLOW_CONNECTORS = ("", "", "ちなみに、", "そういえば、", "ひとつ聞きたいのですが、")
 
 
 # ---------------------------------------------------------------------- #
@@ -369,6 +227,11 @@ _DANGLING_OK = frozenset({
 })
 
 
+# 名詞化語尾。これで終わる節はそれ自体が述語化できるので、吊り下げとは数えない。
+_NOMINAL_ENDS = ("こと", "もの", "はず", "ため", "ほど", "わけ", "つもり", "よう", "のみ",
+                 "ばかり", "限り", "最中", "場合", "必要", "予定", "確認")
+
+
 def validate(text: str, *, max_len: int = 170, min_len: int = 6) -> tuple[bool, str]:
     """組み立てた文が日本語として成立しているかを検査する。→ (ok, 理由)"""
     t = (text or "").strip()
@@ -376,7 +239,9 @@ def validate(text: str, *, max_len: int = 170, min_len: int = 6) -> tuple[bool, 
         return False, "too_short"
     if len(t) > max_len:
         return False, "too_long"
-    if not t.endswith(("。", "！", "？", "!", "?")):
+    # コードブロックは *そのまま* 示すものなので、文末の句点検査は文章部分だけを見る。
+    # （実行結果を表や配列で返す応答は、句点で閉じないのが正しい形。）
+    if "```" not in t and not t.endswith(("。", "！", "？", "!", "?", "」", "）", "：", ":")):
         return False, "no_terminal"
     if "のの" in t and not _NO_NO_OK.search(t):
         return False, "bad_pattern:のの"
@@ -385,27 +250,44 @@ def validate(text: str, *, max_len: int = 170, min_len: int = 6) -> tuple[bool, 
     for bad in _BAD_PATTERNS:
         if bad in t:
             return False, f"bad_pattern:{bad}"
+    # 引用符「」が片方だけ残っている文は、組み立ての途中漏れ
+    if t.count("「") != t.count("」"):
+        return False, "quote:unbalanced"
     # 文の途中が助詞で切れていたら、組み立てに失敗している
     for part in re.split(r"[。！？!?]", t):
         part = part.strip().rstrip("、")
         if not part:
             continue
-        if part.endswith(_DANGLING_ENDS) and part not in _DANGLING_OK:
+        # 「〜とのこと」「どういうこと」は名辞化して成立するので、助詞止めと数えない
+        if part.endswith(_DANGLING_ENDS) and part not in _DANGLING_OK \
+                and not part.endswith(_NOMINAL_ENDS):
             return False, f"dangling:{part[-4:]}"
     # 3 回以上繰り返す 2-gram はループの兆候。
     # ただし英数字の並び（git init / git add / git commit の "it" など）は
     # 技術系の文で普通に繰り返されるので数えない。
-    grams = [t[i:i + 2] for i in range(len(t) - 1)]
-    seen: dict[str, int] = {}
-    for g in grams:
-        if _ASCII_GRAM.match(g):
-            continue
-        seen[g] = seen.get(g, 0) + 1
-        if seen[g] >= 4:
-            return False, f"loop:{g}"
+    # 文そのものの反復（コピー＆ペーストで壊れた文）は先に弾く
+    sentences = [x.strip() for x in re.split(r"(?<=[。！？!?])", t) if x.strip()]
+    counts: dict[str, int] = {}
+    for sent in sentences:
+        counts[sent] = counts.get(sent, 0) + 1
+        if counts[sent] >= 3:
+            return False, f"loop:{sent[:2]}×3"
+    # 2-gram の反復は文ごとに数える（文をまたいだ相同 2-gram をループと誤検知していた）
+    for sentence in re.split(r"[。！？!?]", t):
+        sentence = sentence.strip()
+        seen: dict[str, int] = {}
+        for i in range(len(sentence) - 1):
+            g = sentence[i:i + 2]
+            if _ASCII_GRAM.match(g):
+                continue
+            seen[g] = seen.get(g, 0) + 1
+            if seen[g] >= 4:
+                return False, f"loop:{g}"
     # 文体の一貫性: です/ます と だ/た が混ざっていないか
     polite = len(re.findall(r"(ます|です|ました|ません|でしょう|ください)", t))
-    plain = len(re.findall(r"(だ。|た。|ない。|る。|だ、|た、)", t))
+    # 「選びました、「ん」で…」のような丁寧語の連なりを常体と数えないように、
+    # ます・です の直後の 「た」 は打ち消さない。
+    plain = len(re.findall(r"(だ。|ない。|る。|だ、|(?<!まし)(?<!でし)(?<!ませ)(?<!い)た[。、])", t))
     if polite and plain >= 2:
         return False, "register_mix"
     return True, "ok"
@@ -414,6 +296,15 @@ def validate(text: str, *, max_len: int = 170, min_len: int = 6) -> tuple[bool, 
 # ---------------------------------------------------------------------- #
 # 応答
 # ---------------------------------------------------------------------- #
+# 文末に立つ述語の種類（活用語終止・断定・終助詞・引用終わり）
+_PREDICATE_ENDINGS = (
+    "です", "ます", "だ", "である", "じゃない", "ない", "たい", "た", "る", "っている",
+    "いる", "ある", "する", "できる", "い", "ね", "よ", "な", "さ", "わ",
+    "かな", "かな。", "っす", "で、", "せ", "しろ", "せよ", "よう", "だろう", "と思う", "だと思う",
+    "です！", "ます！", "だ！", ":", "：", "…",
+)
+
+
 @dataclass
 class Reply:
     text: str
@@ -438,6 +329,33 @@ class Composer:
         # 定型文より先に、計算・コード・比較・現在情報を扱う厳密な道具層。
         # TaskRouter は標準ライブラリだけで、必要な質問だけウェブへ出る。
         self.tasks = task_router or TaskRouter()
+        self._web = None
+        self._think = None
+
+    # ------------------------------------------------------------------ #
+    def web_grounding(self):
+        """Snipher がインターネットに出る唯一の口（TaskRouter の検索器を共有する）。"""
+        if self._web is None:
+            try:
+                from .ground.web import WebGrounding
+
+                self._web = WebGrounding(getattr(self.tasks, "research", None))
+            except Exception:  # noqa: BLE001
+                self._web = False
+        return self._web or None
+
+    def think(self, text: str, *, history: list[dict] | None = None, turn: int | None = None,
+              web: bool | None = None):
+        """思考層（mind）を呼ぶ。使えない環境では None を返し、旧経路が引き継ぐ。"""
+        if os.environ.get("SNIPHER_MIND", "1") in ("0", "off", "false"):
+            return None
+        if self._think is None:
+            from .mind.think import think as _think
+
+            self._think = _think
+        return self._think(text, history=history or [], kb=self.kb, web=self.web_grounding(),
+                           lm=self.lm, core=None, polisher=self.polisher, tasks=self.tasks,
+                           web_flag=web, turn=turn)
 
     # ------------------------------------------------------------------ #
     def analyze(self, text: str) -> Utterance:
@@ -553,6 +471,36 @@ class Composer:
         history = history or []
         prev = _previous_assistant_texts(history)
 
+        # ---- 0) 思考層（mind）が主経路。定型文テーブルには戻さない ------- #
+        try:
+            got = self.think(text, history=history, turn=self.turn, web=web)
+        except Exception:  # noqa: BLE001
+            import logging
+
+            logging.getLogger(__name__).warning("mind が失敗（旧経路に降ります）", exc_info=True)
+            got = None
+        if got is not None:
+            rendered, thought = got
+            if rendered.text and len(rendered.text) >= 4:
+                from .composer import validate as _validate
+
+                ok, _why = _validate(rendered.text, max_len=max(240, len(rendered.text)))
+                if ok or rendered.authoritative or "\n" in rendered.text:
+                    plan = rendered.plan or "mind"
+                    knowledge = dict(thought.knowledge or {})
+                    if knowledge:
+                        knowledge["mind"] = thought.as_dict()
+                    return Reply(
+                        text=rendered.text, plan=plan,
+                        confidence=float(rendered.confidence), knowledge=knowledge or None,
+                        sentences=rendered.sentences or _split(rendered.text),
+                        notes={"authoritative": bool(rendered.authoritative),
+                               "task": ({"kind": plan, "answer": rendered.text}
+                                        if rendered.authoritative else None),
+                               "mind": thought.as_dict(),
+                               "fixes": rendered.fixes, "lm": rendered.lm,
+                               "intent": thought.frame.get("act"), "qtype": thought.frame.get("ask")})
+
         # 厳密に解ける仕事は、生成モデルの確率や KB の近さで上書きしない。
         try:
             task = self.tasks.answer(text, web=web, history=history)
@@ -588,78 +536,120 @@ class Composer:
         if material is not None:
             u.is_opaque = False        # 材料が引けたなら「読み取れている」
 
-        # ---- 計画を選ぶ ------------------------------------------------ #
-        actionable = bool(material) and str(material.get("usage") or "") in {
-            "qa", "how", "why", "tips", "fact"}
-        # 「疲れた」「うれしい」= 知識ではなく気持ちの発話。名詞が当たっていなければ
-        # 定義を読み上げるより、まず受け止める。
-        feelings = bool(u.pred) and not u.kb_words and not actionable
-        if feelings:
-            plan = (self._plan_predicate(u, prev)
-                    or (self._plan_knowledge(u, material, prev) if material else None)
-                    or self._plan_statement(u, prev))
-        elif material is not None:
-            plan = self._plan_knowledge(u, material, prev)
-        elif u.is_opaque:
-            plan = self._plan_opaque(u, prev)
-        elif u.intent in ("thanks", "apology", "praise", "farewell"):
-            plan = self._plan_social(u, prev)
-        elif u.intent == "identity" or (u.self_ref and u.is_question):
-            plan = self._plan_self(u, prev)
-        elif u.intent == "greeting":
-            plan = self._plan_greeting(u, prev)
-        elif u.is_question:
-            plan = self._plan_unknown(u, prev)
-        else:
-            plan = self._plan_statement(u, prev)
-
-        if plan is None:                                  # 最後の安全網
-            plan = self._plan_unknown(u, prev) or Reply(
-                text="もう少し言葉を足してもらえますか。", plan="safety", confidence=0.2)
-        plan.notes.update({"intent": u.intent, "qtype": u.qtype, "mood": u.mood,
-                           "opaque": u.is_opaque, "words": u.words[:6]})
-        return plan
+        # ---- 安全網 ------------------------------------------------------ #
+        # かつてここには「入力テンプレ → 定型文」の棚があった。同じ入力に同じ文を
+        # 返す Bot に見えるため、棚は撤去した。ここから先も定型文は使わず、
+        # 根拠（KB の文・語彙の観測・検索で取れた文）だけを文に組み立てる。
+        return self._fallback_compose(text, material=material, history=history,
+                                      prev=prev, web=web)
 
     # ------------------------------------------------------------------ #
-    # 各計画
+    # 安全網: mind が例外で落ちたときでも、同じ部品で組み直す
     # ------------------------------------------------------------------ #
-    def _plan_knowledge(self, u: Utterance, m: dict, prev: list[str]) -> Reply | None:
-        body = str(m.get("text") or "").strip()
+    def _fallback_compose(self, text: str, *, material: dict | None = None,
+                          history: list[dict] | None = None, prev: list[str] | None = None,
+                          web: bool | None = None) -> Reply:
+        """定型文にしないための安全網。
+
+        根拠源（知識ベース / 語彙バンク / Web）から証拠を集め直し、同じ合成器
+        （``mind.voice``）で文章にする。証拠が 1 つも無いときは、その入力から
+        実際に読めた事実（語数・辞書にある語・数字）を述べる。読めた事実は
+        入力ごとに違うので、ここでは同じ文が繰り返されない。
+        """
+        history = history or []
+        prev = prev or []
+        u = self.analyze(text)
+        try:
+            from .ground.evidence import gather, suggestion_claims
+            from .mind.parse import build_frame
+            from .mind.voice import render
+
+            frame = build_frame(text, history=history, kb=self.kb)
+            grounding = None if web is False else self.web_grounding()
+            dossier = gather(frame, kb=self.kb, web=grounding,
+                             history_text=" ".join(str(m.get("content", "")) for m in history)[:400])
+            if not dossier.claims:
+                dossier.claims.extend(suggestion_claims(text, kb=self.kb))
+            if not dossier.claims and material and str(material.get("text") or "").strip():
+                from .mind.frame import Claim
+
+                dossier.claims.append(Claim(
+                    kind="definition", subject=str(material.get("topic") or u.subject()),
+                    content=str(material["text"]).strip(), source="local:kb", weight=0.85))
+            out = render(dossier, frame, turn=self.turn, lm=self.lm, core=None,
+                         polisher=self.polisher, history=history, validate=validate)
+            if out.text and len(out.text) >= 4:
+                return Reply(text=out.text, plan=out.plan or "fallback",
+                             confidence=float(out.confidence),
+                             knowledge={"via": dossier.via, "topic": dossier.topic,
+                                        "coverage": round(float(dossier.coverage), 3),
+                                        "fallback": True, "sources": dossier.sources[:4]},
+                             sentences=out.sentences or _split(out.text),
+                             notes={"authoritative": bool(getattr(out, "authoritative", False)),
+                                    "fallback": True, "intent": u.intent, "qtype": u.qtype,
+                                    "mood": u.mood, "opaque": u.is_opaque,
+                                    "words": u.words[:6], "fixes": out.fixes, "lm": out.lm})
+        except Exception:  # noqa: BLE001
+            import logging
+
+            logging.getLogger(__name__).warning("安全網の合成も失敗", exc_info=True)
+
+        # 合成器まで失敗した最後: 観測事実だけを、その場で計算して返す。
+        facts = self._observations(text, u=u, prev=prev)
+        if facts:
+            return Reply(text=facts, plan="observations", confidence=0.3,
+                         sentences=_split(facts), knowledge={"fallback": True},
+                         notes={"intent": u.intent, "opaque": u.is_opaque})
+        return Reply(text="", plan="empty", confidence=0.0)
+
+    def _observations(self, text: str, *, u: Utterance | None = None,
+                      prev: list[str] | None = None) -> str:
+        """入力から実際に読めた事実だけを 1 文にまとめる（辞書・字形・語数）。"""
+        u = u or self.analyze(text)
+        try:
+            from .lang.lex import bank as _bank
+
+            b = _bank()
+        except Exception:  # noqa: BLE001
+            b = None
+        words = [w for w in (u.words or []) if w]
+        known, unknown = [], []
+        if b is not None:
+            for w in words:
+                (known if b.has(w) else unknown).append(w)
+        bits: list[str] = []
+        raw = (text or "").strip()
+        if raw:
+            bits.append(f"入力は {len(raw)} 文字・{max(len(words), 1)} 語")
+        if known:
+            bits.append(f"語彙バンクにある語は {'・'.join(known[:4])}")
+        if unknown:
+            bits.append(f"見つからなかった語は {'・'.join(unknown[:4])}")
+        if u.numbers:
+            bits.append(f"数字は {' '.join(u.numbers[:4])}")
+        hint = self._word_hint(u.echo or u.subject()) if (unknown and (u.echo or u.subject())) else ""
+        cand = ""
+        try:
+            sug = [str(s or "") for s in self.kb.suggest(raw, top_k=2) if s]
+            if sug:
+                cand = f"近い話題は {'・'.join(sug[:2])}"
+        except Exception:  # noqa: BLE001
+            cand = ""
+        body = "、".join(bits)
         if not body:
-            return None
-        topic = str(m.get("topic") or "")
-        ack = ""
-        social = u.intent in _SOCIAL_INTENTS
-        if not social:
-            if u.mood == "negative" and m.get("qtype") not in ("def",):
-                ack = _pick(ACK_NEG, self.turn, prev)
-            elif u.mood == "positive" and u.qtype in ("general", "general_q"):
-                ack = _pick(ACK_POS, self.turn, prev)
-        follow = str(m.get("followup") or "").strip()
-        sentences = [s for s in (ack, body) if s]
-        # 本文にすでに問いがあるなら、問いを二重に付けない
-        has_question = bool(re.search(r"(か|かな|かしら|でしょう)[。！？!?…]", body)) or \
-            body.rstrip().endswith(("?", "？"))
-        if follow and not has_question and len(body) + len(follow) < 130 \
-                and u.qtype not in ("how",):
-            conn = _pick(FOLLOW_CONNECTORS, self.turn + 1, prev)
-            sentences.append(f"{conn}{follow}" if conn else follow)
-        text = _join(sentences)
-        ok, why = validate(text)
-        if not ok:                                        # 長すぎる/壊れた → 本体だけに戻す
-            text = _join([s for s in (ack, body) if s])
-            ok, why = validate(text, max_len=220)
-            if not ok:
-                text = body
-        text = self._polish(text)
-        conf = float(m.get("confidence", 0.7))
-        return Reply(text=text, plan=f"knowledge:{m.get('field', 'answer')}", confidence=conf,
-                     knowledge={"topic": topic, "score": m.get("score"),
-                                "coverage": m.get("coverage"), "usage": m.get("usage"),
-                                "qtype": m.get("qtype"), "field": m.get("field"),
-                                "via": m.get("via"), "confidence": conf},
-                     sentences=_split(text),
-                     notes={"ack": bool(ack), "followup": bool(follow), "why": why})
+            return ""
+        out = body + "です。"
+        extra = "。".join(x for x in (hint.rstrip("。"), cand.rstrip("。")) if x)
+        if extra:
+            out += extra + "。"
+        # ここから先も「相手の言葉」か観測値だけを使い、固定の結句は置かない。
+        if unknown and len(out) < 170:
+            out += f"「{unknown[0]}」は辞書に無い語なので、そのままの固有名として扱います。"
+        elif not cand and not u.is_question and len(out) < 170:
+            out += "質問の形にはなっていませんが、上の語で調べられることは調べます。"
+        if prev and out in prev:
+            out = body + "でした。"
+        return out
 
     def _word_hint(self, w: str) -> str:
         """未知語の中に既知の話題が含まれていれば、手がかりの一文を返す。"""
@@ -694,49 +684,6 @@ class Composer:
             pass
         return ""
 
-    def _plan_unknown(self, u: Utterance, prev: list[str]) -> Reply | None:
-        asks = UNKNOWN_ASKS_NEG if u.mood == "negative" else UNKNOWN_ASKS
-        w = u.echo or u.subject()
-        hint = self._word_hint(w) if w else ""
-        if not w:
-            # 主語にできる語が無い（「どうしたらいい」等）→ 語を埋め込まずに正直に言う
-            for i in range(len(UNKNOWN_GENERIC_FRAMES)):
-                frame = _rotate(UNKNOWN_GENERIC_FRAMES, self.turn + i)
-                text = self._polish(frame.format(ask=_rotate(asks, self.turn + i)))
-                ok, _why = validate(text)
-                if ok and text not in prev:
-                    return Reply(text=text, plan="unknown_topic", confidence=0.28,
-                                 sentences=_split(text), frame=frame, notes={})
-            w = "そのこと"
-        # 知識ベースに「近い話題」があれば、名指しで提案する
-        sug = self._suggest_topic(u.text, w)
-        if sug:
-            ask = _rotate(asks, self.turn)
-            mid = f"{hint}" if hint else f"{sug}については詳しく話せます。"
-            text = self._polish(f"「{w}」ですね。{mid}{ask}")
-            ok, _why = validate(text, max_len=200)
-            if ok and text not in prev:
-                return Reply(text=text, plan="unknown_topic", confidence=0.36,
-                             sentences=_split(text),
-                             notes={"echo": w, "suggest": sug})
-        for i in range(len(UNKNOWN_FRAMES)):
-            frame = _rotate(UNKNOWN_FRAMES, self.turn + i)
-            ask = _rotate(asks, self.turn + i * 2)
-            base = frame.format(w=w, ask=ask)
-            # ヒントがあれば一文だけ足す (長くなりすぎたら枠だけにする)
-            if hint and len(base) + len(hint) < 150:
-                base = base.replace("。", f"。{hint}", 1)
-            text = self._polish(base)
-            ok, _why = validate(text)
-            if ok and text not in prev:
-                return Reply(text=text, plan="unknown_topic", confidence=0.30,
-                             sentences=_split(text), frame=frame,
-                             notes={"echo": w, "hint": bool(hint)})
-        # どれも通らなければ最短の前向きな応答に落ちる
-        return Reply(text=f"「{w}」ですね。一緒に整理しましょう。"
-                          "何を知りたいのか教えてください。",
-                     plan="unknown_topic", confidence=0.25, notes={"echo": w})
-
     def _suggest_topic(self, text: str, word: str) -> str:
         """発話に近い知識ベースの話題名（無ければ ""）。字の重なりが 2 文字以上あるものだけ。"""
         if not word:
@@ -754,143 +701,13 @@ class Composer:
             return ""
         return ""
 
-    def _plan_opaque(self, u: Utterance, prev: list[str]) -> Reply | None:
-        raw = u.text.strip()[:24] or "その入力"
-        frames = OPAQUE_NUM_FRAMES if u.numbers else (
-            OPAQUE_LATIN_FRAMES if u.ascii_words else OPAQUE_FRAMES)
-        for i in range(len(frames)):
-            frame = _rotate(frames, self.turn + i)
-            ask = _rotate(OPAQUE_ASKS, self.turn + i)
-            text = self._polish(frame.format(raw=raw, ask=ask))
-            ok, _why = validate(text)
-            if ok and text not in prev:
-                return Reply(text=text, plan="opaque_input", confidence=0.18,
-                             sentences=_split(text), frame=frame,
-                             notes={"raw": raw, "numbers": u.numbers})
-        return Reply(text=f"「{raw}」の意味が分かりませんでした。文で教えてください。",
-                     plan="opaque_input", confidence=0.15, notes={"raw": raw})
-
-    def _plan_statement(self, u: Utterance, prev: list[str]) -> Reply | None:
-        w = u.echo or u.subject()
-        # KBに無い語への報告・感想は、手がかりの一文を添えて前に進める
-        hint = ""
-        if w and not u.kb_words:
-            try:
-                hint = self._word_hint(w)
-            except Exception:
-                hint = ""
-        if u.pred and not u.echo:
-            return self._plan_predicate(u, prev) or self._plan_opaque(u, prev)
-        generic = not w
-        if generic:
-            # 内容語はあるが主語にできない（機能語だけ）→ 語を埋めずに受ける
-            if not u.words:
-                return self._plan_opaque(u, prev)
-            w = "その話"
-        frames = STATEMENT_GENERIC_FRAMES if generic else STATEMENT_FRAMES
-        if u.mood == "negative":
-            ack = _pick(ACK_NEG, self.turn, prev)
-        elif u.mood == "positive":
-            ack = _pick(ACK_POS, self.turn, prev)
-        else:
-            # 主語が無い応答（「その話、…」）に相槌を足すと二重になるので抑える
-            ack = "" if generic else _pick(ACK_NEUTRAL, self.turn, prev)
-        for i in range(len(frames)):
-            frame = _rotate(frames, self.turn + i)
-            ask = _rotate(STATEMENT_ASKS, self.turn + i * 3)
-            base = frame.format(w=w, ask=ask)
-            if hint and not generic and len(base) + len(hint) < 150:
-                base = base.replace("。", f"。{hint}", 1)
-            text = self._polish(_join([s for s in (ack, base) if s]))
-            ok, _why = validate(text)
-            if ok and text not in prev:
-                return Reply(text=text, plan="statement", confidence=0.34,
-                             sentences=_split(text), frame=frame, notes={"echo": w, "hint": bool(hint)})
-        return None
-
-    def _plan_predicate(self, u: Utterance, prev: list[str]) -> Reply | None:
-        """述語だけの発話（「疲れた」「眠い」）を、気持ちとして受け取る。"""
-        frames = {"negative": PRED_FRAMES_NEG, "positive": PRED_FRAMES_POS}.get(
-            u.mood, PRED_FRAMES_NEUTRAL)
-        for i in range(len(frames)):
-            frame = _rotate(frames, self.turn + i)
-            text = self._polish(frame.format(p=u.pred))
-            ok, _why = validate(text)
-            if ok and text not in prev:
-                return Reply(text=text, plan="statement", confidence=0.42,
-                             sentences=_split(text), frame=frame, notes={"pred": u.pred})
-        return None
-
-    def _plan_self(self, u: Utterance, prev: list[str]) -> Reply | None:
-        # 知識ベースに自分自身の項目（自己紹介）があればそれを優先する
-        try:
-            m = self.kb.answer(u.text) or self.kb.answer("あなたは何")
-        except Exception:  # noqa: BLE001
-            m = None
-        if m and m.get("id") in ("selfintro", "greeting"):
-            r = self._plan_knowledge(u, m, prev)
-            if r:
-                r.plan = "self:" + r.plan
-                return r
-        for i in range(len(SELF_FRAMES)):
-            frame = _rotate(SELF_FRAMES, self.turn + i)
-            text = self._polish(frame.format(ask=_rotate(SELF_ASKS, self.turn + i)))
-            ok, _why = validate(text)
-            if ok and text not in prev:
-                return Reply(text=text, plan="self", confidence=0.6,
-                             sentences=_split(text), frame=frame)
-        return None
-
-    def _plan_greeting(self, u: Utterance, prev: list[str]) -> Reply | None:
-        try:
-            m = self.kb.answer(u.text)
-        except Exception:  # noqa: BLE001
-            m = None
-        if m:
-            r = self._plan_knowledge(u, m, prev)
-            if r:
-                r.plan = "greeting:" + r.plan
-                return r
-        base = "こんにちは" if "こんばん" not in u.norm else "こんばんは"
-        if "おはよう" in u.norm:
-            base = "おはようございます"
-        openers = ("今日はどうしましたか。", "何か話したいことはありますか。",
-                   "調子はどうですか。", "どんな用件でしょうか。")
-        for i in range(len(openers)):
-            text = self._polish(f"{base}。{_rotate(openers, self.turn + i)}")
-            ok, _why = validate(text)
-            if ok and text not in prev:
-                return Reply(text=text, plan="greeting", confidence=0.8,
-                             sentences=_split(text))
-        return Reply(text=f"{base}。", plan="greeting", confidence=0.75)
-
-    def _plan_social(self, u: Utterance, prev: list[str]) -> Reply | None:
-        try:
-            m = self.kb.answer(u.text)
-        except Exception:  # noqa: BLE001
-            m = None
-        if m and m.get("id") in ("thanks", "apology", "praise", "greeting", "feelings", "worry"):
-            r = self._plan_knowledge(u, m, prev)
-            if r:
-                r.plan = f"{u.intent}:" + r.plan
-                return r
-        frames = {"thanks": THANKS_FRAMES, "apology": APOLOGY_FRAMES,
-                  "praise": PRAISE_FRAMES, "farewell": FAREWELL_FRAMES}[u.intent]
-        for i in range(len(frames)):
-            frame = _rotate(frames, self.turn + i)
-            text = self._polish(frame.format(open=_rotate(OPEN_QUESTIONS, self.turn + i * 2)))
-            ok, _why = validate(text)
-            if ok and text not in prev:
-                return Reply(text=text, plan=u.intent, confidence=0.85,
-                             sentences=_split(text), frame=frame)
-        return None
-
     # ------------------------------------------------------------------ #
     def _polish(self, text: str) -> str:
         try:
-            return self.polisher.polish(text, register="polite")["text"] or text
+            out = self.polisher.polish(text, register="polite")["text"] or text
         except Exception:  # noqa: BLE001
-            return text
+            out = text
+        return balance_quotes(out)
 
     # ------------------------------------------------------------------ #
     def rank(self, candidates: list[str], *, min_len: int = 6) -> list[tuple[float, str]]:
@@ -911,7 +728,7 @@ class Composer:
         out.sort(key=lambda t: -t[0])
         return out
 
-    def accept(self, text: str, *, u: Utterance | None = None, min_conf: float = 0.30) -> bool:
+    def accept(self, text: str, *, u: Utterance | None = None, min_conf: float = 0.4) -> bool:
         """ニューラルコアが作った文を、応答として採用してよいか判定する。"""
         t = (text or "").strip()
         if not t or len(t) < 6 or len(t) > 200:
@@ -925,42 +742,66 @@ class Composer:
                     return False
             except Exception:  # noqa: BLE001
                 pass
+        # 文末が述語（活用語・断定・終助詞）になっていない列は採用しない。
+        # 「きょはいいんてきすあ。」のように語だけ並んだ文を弾くための最低関門。
+        stem = re.sub(r"[。！？!?\.\s]+$", "", t)
+        if stem and not stem.endswith(_PREDICATE_ENDINGS):
+            return False
+        # 語彙に 1 つも当たらない列（「きょはいいんてきすあ」等）は日本語として採用しない
+        try:
+            from .lang.lex import bank as _bank
+
+            known = [w for w, pos in _bank().segment(t)
+                     if pos.split("/")[0] in {"名詞", "動詞", "形容詞", "副詞"} and len(w) >= 2]
+            if not known:
+                return False
+        except Exception:  # noqa: BLE001
+            pass
         return True
 
 
 # ---------------------------------------------------------------------- #
 # ヘルパ
 # ---------------------------------------------------------------------- #
-def _rotate(seq: tuple[str, ...] | list[str], k: int) -> str:
-    if not seq:
-        return ""
-    return seq[k % len(seq)]
+def balance_quotes(text: str) -> str:
+    """「」の対応を揃える。開け閉めを一方だけ残した文を、文章として成立させる。
 
-
-def _pick(seq, k: int, prev: list[str]) -> str:
-    """直前の応答と同じ文を避けて 1 つ選ぶ。"""
-    n = len(seq)
-    for i in range(n):
-        cand = seq[(k + i) % n]
-        if not cand:
-            return cand
-        if not any(cand in p for p in prev[-2:]):
-            return cand
-    return seq[k % n]
-
-
-def _join(sentences: list[str]) -> str:
+    組み立てた文の見た目の傷として最も多いのがこれなので、
+    採用前に必ず通す（句読点の位置も一緒に整える）。
+    """
+    t = str(text or "")
+    if "「" not in t and "」" not in t:
+        return t
     out: list[str] = []
-    for s in sentences:
-        s = str(s or "").strip()
-        if not s:
-            continue
-        if out and out[-1].endswith(("。", "！", "？")) and not s[0].isupper():
-            out.append(s)
+    depth = 0
+    for ch in t:
+        if ch == "「":
+            if depth:                                   # 二重に開いたら閉じてから開く
+                out.append("」")
+                depth -= 1
+            out.append(ch)
+            depth += 1
+        elif ch == "」":
+            if not depth:                                # 対応の無い閉じ括弧は落とす
+                continue
+            out.append(ch)
+            depth -= 1
         else:
-            out.append(s)
-    text = "".join(out)
-    return re.sub(r"。{2,}", "。", text)
+            if depth and ch in "。！？":                  # 文中で開いたまま句点に来たら閉じる
+                out.append("」")
+                depth -= 1
+            out.append(ch)
+    if depth:                                            # 末尾で開いたままなら閉じる
+        for i in range(len(out) - 1, -1, -1):
+            if out[i] in "。！？":
+                out.insert(i, "」")
+                break
+        else:
+            out.append("」")
+    return "".join(out)
+
+
+
 
 
 def _split(text: str) -> list[str]:

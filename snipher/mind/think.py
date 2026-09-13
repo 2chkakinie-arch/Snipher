@@ -1,0 +1,1078 @@
+"""Snipher の思考ループ — 見る(parse) → 集める(ground) → 決める(claims) → 書く(voice) → 検べる。
+
+    ① 発話を Frame に分解する（語気・問いの型・制約・未知語）
+    ② 会話状態を見て、進行中の手遊び・指示対象を復元する
+    ③ 厳密に解ける仕事（計算・コード・暦・文字操作）はここで片付ける
+    ④ 足りない知識は証拠として集める（知識ベース → 実辞書 → ウェブ裏取り）
+    ⑤ 主張（Claim）を組み立てて voice が日本語に書く
+    ⑥ validate + n-gram LM + 規則チェック を通さないと出さない
+
+どの一手も「決まった文を引き当てる」ことはしません。素材が足りないなら、足りないと
+分かる *具体的な理由* と、いま手元にある材料（語の分析・計算・出典）を並べます。
+"""
+
+from __future__ import annotations
+
+import logging
+import os
+import re
+import unicodedata
+from dataclasses import dataclass, field
+
+from ..lang import lex, morph
+from ..lang.phonetics import char_count, kana_to_ro, mora_count, normalize, to_hiragana
+from .frame import Claim, split_sentences
+from .parse import build_frame, opaque_reason
+from .play import claims_for_move, judge, pick, word_from_turn
+from .rules import chain_ok, check
+from .state import ConversationState
+from .voice import Rendered, render
+
+log = logging.getLogger(__name__)
+
+
+@dataclass
+class Thought:
+    """1 ターン分の思考の記録（UI の「根拠」表示にも使う）。"""
+
+    frame: dict = field(default_factory=dict)
+    state: dict = field(default_factory=dict)
+    dossier: dict = field(default_factory=dict)
+    steps: list[str] = field(default_factory=list)
+    move: dict | None = None
+    knowledge: dict = field(default_factory=dict)
+
+    def as_dict(self) -> dict:
+        out = {"frame": self.frame, "state": self.state, "evidence": self.dossier,
+               "steps": self.steps[:6]}
+        if self.move:
+            out["move"] = self.move
+        return out
+
+
+# --------------------------------------------------------------------------- #
+# 特別な输入への「中身のある」応答（定型ではなく、入力を実際に解析した結果を出す）
+# --------------------------------------------------------------------------- #
+def opaque_claims(text: str, turn: int = 0) -> list[Claim]:
+    """数字だけ・1 文字だけ・文字化けの入力に対し、**読める範囲を確定して**返す。"""
+    t = normalize(text)
+    claims: list[Claim] = []
+    reason = opaque_reason(t)
+    body = re.sub(r"[\s。、！？!?・…「」『』()（）]+", "", t)
+    if reason in ("digits_only", "") and re.fullmatch(r"[0-9０-９.,%]+", body or "x") and body != "x":
+        raw = body.replace(",", "").replace("．", ".")
+        nums = [int(x) for x in re.findall(r"\d+", raw)][:2]
+        facts: list[str] = []
+        if len(nums) == 1:
+            n = nums[0]
+            from ..solve.math import _factorize, is_prime  # 局所 import（循環回避）
+
+            facts.append(f"{n} は {char_count(str(n))} 桁の整数で、"
+                         + ("素数です" if is_prime(n) else f"素因数分解すると {' × '.join(str(p) for p, e in _factorize(n) for _ in range(e))} です"))
+            if n % 2 == 0:
+                facts.append("2 で割れるので偶数です")
+            else:
+                facts.append("2 で割れないので奇数です")
+            if 0 <= n <= 3000:
+                facts.append(f"西暦 {n} 年という読み方もできます")
+        else:
+            facts.append(f"数字が {len(nums)} つ（{', '.join(map(str, nums))}）見えます。"
+                         f"足すと {sum(nums)}、引くと {nums[0] - (nums[1] if len(nums) > 1 else 0)} です")
+        tails = ("この数字が何を指すのか（年齢・金額・数量・年）が分かれば、そこに絞って答えます",
+                 "どんな数の話ですか（金額・個数・年・割合）。一文くれれば計算に落とします",
+                 "数字として読み取れました。何の数量かを一言もらえれば、そこから組み立てます")
+        facts.append(tails[int(turn) % len(tails)])
+        claims.append(Claim(kind="result", content="。".join(facts) + "。", source="tool:math",
+                           weight=0.8, extra={"numbers": nums}))
+        return claims
+    if reason == "single_char" and body:
+        ch = body[0]
+        try:
+            name = unicodedata.name(ch)
+        except ValueError:
+            name = ""
+        if re.fullmatch(r"[ぁ-ん]", ch):
+            name = f"ひらがなの「{ch}」（ローマ字 {kana_to_ro(ch)}）"
+        elif re.fullmatch(r"[ァ-ヶ]", ch):
+            name = f"カタカナの「{ch}」（ローマ字 {kana_to_ro(ch)}）"
+        ent = lex.bank().entry(ch)
+        bits = []
+        if name:
+            bits.append(f"{name} です（U+{ord(ch):04X}）")
+        if ent is not None:
+            bits.append(f"見出し語としても立っていて、読みは「{ent.reading or ch}」、品詞 {ent.pos}")
+        else:
+            bits.append("それ単独では品詞が付きにくい文字です")
+        tails1 = ("前後の語をもう 1 語足してもらえれば、そこから意味を組み立てます",
+                  "この一文字は独立した語として立たないので、続く語をください",
+                  "単独の文字としては読めました。どんな文の中の一文字ですか")
+        bits.append(tails1[int(turn) % len(tails1)])
+        claims.append(Claim(kind="lexical", content=_join_bits(bits), subject=ch,
+                            source="lex", weight=0.72))
+        return claims
+    if reason == "mojibake":
+        codes = " ".join(f"U+{ord(c):04X}" for c in t[:8])
+        claims.append(Claim(kind="result",
+                            content=f"文字化けした列として読めました（{codes}）。UTF-8 / Shift_JIS "
+                                    f"のどちらかで保存し直すと、こちらの解析は正常に通じます。",
+                            source="tool:text", weight=0.7))
+        return claims
+    if reason == "latin_noise":
+        letters = re.findall(r"[A-Za-z]+", t)
+        claims.append(Claim(kind="result",
+                            content=(f"欧文の断片 {len(letters)} 個（{' / '.join(letters[:4])}）と読めました。"
+                                     + ("英単語なら綴り、コードなら言語を一言添えてください。組み立て直します。"
+                                        if int(turn) % 2 == 0 else
+                                        "日本語で何について聞きたいか一語だけください。そこから組み直します。")),
+                            source="tool:text", weight=0.66))
+        return claims
+    claims.append(Claim(kind="note",
+                        content=("送られた文字列には記号と空白しか見当たりません。語を 1 つ足してもらえれば、"
+                                 "その語から組み立てます。" if int(turn) % 2 == 0 else
+                                 "読める語がありませんでした。調べたい語を一語だけ送ってもらえれば、そこから始めます。"),
+                        source="lex", weight=0.5))
+    return claims
+
+
+def capability_claims(*, kb=None, lm=None, core=None, web=None) -> list[Claim]:
+    """「何ができる？」に、実測の規模と実モジュールで答える（自己紹介の定型ではない）。"""
+    bank = lex.bank()
+    stats = bank.stats()
+    bits = [
+        f"手元には {stats['words']:,} 語の語彙バンク（読み・拍・品詞つき）と "
+        f"{stats['game_words']:,} 語の手遊び用の索引があります",
+    ]
+    if kb is not None:
+        try:
+            s = kb.stats()
+            bits.append(f"知識ベースは {s.get('topics', 0)} 話題・{s.get('facts', 0)} 事実・"
+                        f"{s.get('qa', 0)} 問答を持っていて、問いの型（定義・理由・手順・いつ・値段）で欄を選びます")
+        except Exception:  # noqa: BLE001
+            pass
+    if lm is not None:
+        try:
+            bits.append(f"流暢さの審判に {lm.n_params():,} エントリの n-gram モデルを使っています")
+        except Exception:  # noqa: BLE001
+            pass
+    if core is not None:
+        try:
+            bits.append(f"内蔵ニューラルコアは {core.n_params():,} パラメータ（int8 量子化・KV キャッシュ付き）")
+        except Exception:  # noqa: BLE001
+            pass
+    if web is not None:
+        try:
+            prov = ", ".join(web.status().get("providers") or [])
+            bits.append(f"手元に無い語は {prov or 'Edge 検索'} で裏を取ってから書きます")
+        except Exception:  # noqa: BLE001
+            pass
+    bits.append("計算は分数・平方根まで厳密に検算し、コードは生成したあと実際に走らせて出力まで確認します")
+    return [Claim(kind="fact", content="。".join(bits) + "。", subject="Snipher",
+                  source="local:meta", weight=0.82)]
+
+
+def identity_claims(*, kb=None) -> list[Claim]:
+    out = [Claim(kind="definition",
+                 content="私は Snipher という日本語の会話 AI で、答えるときは知識ベース・実辞書・"
+                         "計算・ウェブ検索の順に材料を集めて、その場で文を組み立てています。",
+                 subject="Snipher", source="local:meta", weight=0.8)]
+    return out
+
+
+# --------------------------------------------------------------------------- #
+# 手遊び（規則に基づく手番）
+# --------------------------------------------------------------------------- #
+def play_turn(frame, state: ConversationState, *, turn: int) -> tuple[list[Claim], dict]:
+    activity = frame.activity or state.activity
+    if activity is None:
+        return [], {}
+    rules = activity.rules or frame.rules
+    claims: list[Claim] = []
+    info: dict = {"name": activity.name, "kind": activity.kind, "turn": activity.turn + 1}
+    user_word = word_from_turn(frame.raw)
+    prev = activity.our_word or ""
+    if user_word and (activity.turn >= 1 or frame.ask != "definition"):
+        mv = judge(prev, user_word, rules) if prev else \
+            Move_stub(user_word)
+        info["user_word"] = user_word
+        info["legal"] = mv.legal
+        if not mv.legal and prev:
+            claims.append(Claim(kind="correction", content=mv.violation, source="lex", weight=0.9,
+                                extra={"word": user_word}))
+            # 違反しても会話は止めない。続きを手伝う（語彙バンクから助ける）
+            helper = pick(prev, rules, used=activity.used)
+            if helper.word:
+                claims.append(Claim(kind="note",
+                                    content=f"「{prev}」の次なら「{helper.word}」のような手があります。",
+                                    source="lex", weight=0.7,
+                                    extra={"word": helper.word, "candidates": helper.candidates[:5]}))
+            return claims, info
+        prev = user_word
+    if not prev:
+        # 先手はこちら。語彙バンクから一般的な名詞で始める（語尾が ん ではない語）
+        starter = pick("", rules, used=activity.used)
+        if starter.word:
+            claims.extend(claims_for_move(starter, prev="", our_turn=True))
+            info["word"] = starter.word
+            return claims, info
+        return [], info
+    mv = pick(prev, rules, used=activity.used)
+    if mv.word:
+        claims.extend(claims_for_move(mv, prev=prev, our_turn=True))
+        info["word"] = mv.word
+        info["prev"] = prev
+    return claims, info
+
+
+class Move_stub:
+    """相手が先に打った語の最小表現（判定をスキップする用途）。"""
+
+    def __init__(self, word: str):
+        self.word = word
+        self.reading = to_hiragana(word)
+        self.legal = True
+        self.violation = ""
+        self.reason = ""
+        self.candidates: list[str] = []
+        self.notes: list[str] = []
+        self.from_ = "user"
+
+    def as_dict(self) -> dict:
+        return {"word": self.word, "legal": True}
+
+
+def propose_activity_claims(text: str, *, kb=None) -> tuple[list[Claim], dict] | None:
+    """「〜しよう」と誘われたら、その活動の *ルール* を知識から読んで始める。
+
+    しりとり専用の分岐はありません。「語の連鎖」という規則を定義文から読み、
+    語彙バンクで成立する手を選びます。
+    """
+    from .state import _activity_name      # 内部ヘルパ（同じ判定を再利用）
+
+    name = _activity_name(normalize(text))
+    if not name:
+        return None
+    rules: list = []
+    def_text = ""
+    if kb is not None:
+        try:
+            from ..ground.evidence import exact_definition
+
+            def_text = exact_definition(name, kb=kb)
+        except Exception:  # noqa: BLE001
+            def_text = ""
+    from .rules import from_definition
+
+    rules = from_definition(def_text, topic=name) or [_chain_rule()]
+    mv = pick("", rules, used=[])
+    claims: list[Claim] = [Claim(kind="answer", content=mv.word or "", source="lex", weight=0.9,
+                                 extra={"reading": mv.reading, "start": True})]
+    note_bits = []
+    if def_text:
+        note_bits.append(f"ルールは知識にある通り「{_short(def_text)}」という進め方なので、")
+    note_bits.append(f"私は「{mv.word}」から始めます。{mv.reason}")
+    claims.append(Claim(kind="note", content="".join(note_bits).strip(), source="lex", weight=0.7))
+    info = {"name": name, "kind": "chain", "word": mv.word, "rules": [r.describe() for r in rules]}
+    return claims, info
+
+
+def _chain_rule():
+    from .frame import Rule
+
+    return Rule(kind="chain", value="", raw="語の連鎖")
+
+
+def _short(text: str, n: int = 34) -> str:
+    t = normalize(text).strip("。 ")
+    return t if len(t) <= n else t[:n] + "…"
+
+
+# --------------------------------------------------------------------------- #
+# 入口
+# --------------------------------------------------------------------------- #
+def _kb_has_actionable(text: str, *, kb) -> bool:
+    """発話そのものが KB の問いと *ほぼ同じ* ときだけ、感情より対処を先に返す。
+
+    「お腹が痛い」→ 一致高（QA 文が同じ）→ 対処を先にする。
+    「疲れた」→ 弱い語彙一致で別話題を引っ張らない → まずは気持ちを受け止める。
+    """
+    if kb is None:
+        return False
+    try:
+        hit = kb.answer(text) or {}
+    except Exception:  # noqa: BLE001
+        return False
+    via = str(hit.get("via") or "")
+    cov = float(hit.get("coverage") or 0)
+    strong = via in ("qa_strong", "exact_topic", "exact", "alias") or via.startswith("qa:")
+    if not strong:
+        return False
+    if via.startswith("qa:") and cov < 0.55:
+        return False
+    return str(hit.get("usage") or hit.get("field") or "") in {"qa", "tips", "how", "why"}
+
+
+def plan_name(frame, dossier_obj, claims: list[Claim]) -> str:
+    """どの知能が応答を作ったかを、既存の経路名に写す（UI・統計・テストの契約）。"""
+    via = str((dossier_obj or {}).get("via") or "")
+    if via == "tool":
+        kind = claims[0].source.split(":")[-1] if claims else "task"
+        if kind in ("clock", "facts"):
+            return "tool:facts"
+        return f"tool:{kind}"
+    if via == "web":
+        return "research:web"
+    fields = [c.slot for c in claims if c.slot]
+    if via == "kb":
+        return f"knowledge:{fields[0] if fields else 'answer'}"
+    if via == "lex":
+        return f"lex:{frame.ask or 'word'}"
+    if frame.act in ("greet", "thanks", "apology", "farewell", "agree", "disagree", "praise"):
+        return frame.act
+    if frame.ask in ("identity", "capability"):
+        return "self"
+    if frame.ask == "identity_user":
+        return "session:profile"
+    if frame.flags.get("opaque"):
+        return "opaque_input"
+    if frame.act in ("declare", "wish") and not claims:
+        return "statement"
+    return f"mind:{frame.ask or frame.act}"
+
+
+def knowledge_meta(frame, dossier_obj, claims: list[Claim], thought: Thought) -> dict:
+    meta: dict = {}
+    raw = (dossier_obj or {})
+    src = raw.get("claims") or []
+    via = raw.get("via") or "none"
+    topic = raw.get("topic") or ""
+    cov = raw.get("coverage") or 0.0
+    for c in src:
+        if c.get("source", "").startswith("local:kb"):
+            meta = {"topic": topic, "coverage": cov, "via": via, "field": None}
+            break
+    if not meta:
+        meta = {"topic": topic or (frame.topic or None), "coverage": cov, "via": via}
+    # KB 由来の主张には 欄名（field / usage）を付ける（既存契約）
+    kb_claim = next((c for c in claims if c.source.startswith("local:kb")), None)
+    if kb_claim is not None:
+        extra = kb_claim.extra or {}
+        meta.update({"field": kb_claim.slot or "answer", "usage": kb_claim.slot or "answer",
+                     "score": extra.get("score"), "qtype": extra.get("qtype"),
+                     "coverage": extra.get("coverage", cov), "via": extra.get("via", via)})
+    if via == "web":
+        meta["sources"] = (raw.get("sources") or [])[:4]
+    if thought.move:
+        meta["move"] = thought.move
+    return {k: v for k, v in meta.items() if v is not None}
+
+
+def _finalize(out: Rendered, thought: Thought, frame, dossier_obj, claims: list[Claim],
+              *, plan_hint: str = "") -> tuple[Rendered, Thought]:
+    """応答の「経路名」と「根拠メタ」をここで確定させる（composer は写すだけ）。"""
+    raw = dossier_obj.as_dict() if hasattr(dossier_obj, "as_dict") else dict(dossier_obj or {})
+    via = str(raw.get("via") or "")
+    # 検証済みの仕事（計算・暦・コード・TaskRouter）が含まれていれば、経路はその場で
+    # tool に確定させる（証拠集めの via に引きずられない）。
+    tool_claims = [c for c in claims if c.source.startswith("tool")]
+    if tool_claims:
+        via = "tool"
+    _LEGACY_PLAN = {"greeting_name": "greeting:name", "word_problem": "math:word_problem",
+                    "unit": "unit:convert", "equation": "math:equation",
+                    "arithmetic": "math:arithmetic", "compare": "compare:answer"}
+    kb_claim = next((c for c in claims if c.source.startswith("local:kb")), None)
+    substantive = [c for c in claims
+                   if c.kind not in ("note", "lexical", "ask")
+                   or c.slot in ("def", "why", "how", "tips", "qa", "facts", "when", "where",
+                                 "who", "cost", "opinion")]
+    if plan_hint:
+        plan = plan_hint
+    elif frame.flags.get("opaque") and not any(c.source.startswith("tool") for c in claims):
+        plan = "opaque_input"
+    elif claims and not substantive:
+        plan = "unknown_topic"
+    elif via == "tool":
+        kind = ((tool_claims or claims)[0].source.split(":")[-1] if claims else "task")
+        if kind in _LEGACY_PLAN:
+            plan = _LEGACY_PLAN[kind]
+        else:
+            plan = "tool:facts" if kind in ("clock", "facts") else f"tool:{kind}"
+    elif via == "web":
+        plan = "research:web"
+    elif via == "kb":
+        plan = f"knowledge:{(kb_claim.slot if kb_claim and kb_claim.slot else 'answer')}"
+    elif via == "lex":
+        plan = f"lex:{frame.ask or 'word'}"
+    elif via == "local":
+        plan = "statement" if frame.act in ("declare", "wish") else (frame.act or "statement")
+    elif frame.act in ("greet", "thanks", "apology", "farewell", "agree", "disagree", "praise"):
+        plan = frame.act
+    elif frame.ask in ("identity", "capability"):
+        plan = "self"
+    elif frame.ask == "identity_user":
+        plan = "session:profile"
+    else:
+        plan = f"mind:{frame.ask or frame.act}"
+    out.authoritative = bool(tool_claims) or out.authoritative
+    out.plan = plan
+    meta: dict = {"via": via or None, "topic": raw.get("topic") or (frame.topic or None),
+                  "coverage": raw.get("coverage"), "claims": raw.get("claims")}
+    if kb_claim is not None:
+        extra = kb_claim.extra or {}
+        meta.update({"field": kb_claim.slot or "answer", "usage": kb_claim.slot or "answer",
+                     "score": extra.get("score"), "qtype": extra.get("qtype"),
+                     "coverage": extra.get("coverage", meta.get("coverage")),
+                     "via": extra.get("via", via)})
+    if via == "web":
+        meta["sources"] = (raw.get("sources") or [])[:4]
+    if thought.move:
+        meta["move"] = thought.move
+    if out.lm:
+        meta["lm"] = out.lm
+    if plan in ("statement",) and not any(c.source.startswith(("local:kb", "web", "tool"))
+                                          for c in claims):
+        out.confidence = min(float(out.confidence), 0.52)
+    if plan == "opaque_input":
+        # 入力が読めないターンは「答えられた」と見せない（確信度を盛らない）
+        thought.knowledge = {}
+        out.confidence = min(float(out.confidence), 0.36)
+    else:
+        thought.knowledge = {k: v for k, v in meta.items() if v is not None}
+    if not out.text:
+        thought.steps.append("応答を組めませんでした（材料なし）")
+    return out, thought
+
+
+def think(text: str, *, history: list[dict] | None = None, kb=None, web=None, lm=None,
+          core=None, polisher=None, tasks=None, web_flag: bool | None = None,
+          turn: int | None = None) -> tuple[Rendered, Thought]:
+    """1 発話を受けて応答を組み立てる。返るのは (文章, 思考の記録)。"""
+    history = history or []
+    state = ConversationState(history, kb=kb)
+    frame = build_frame(text, history=history, kb=kb, state=state)
+    turn_no = int(turn if turn is not None else len(state.users) + 1)
+    thought = Thought(frame=frame.as_dict(), state=state.as_dict(),
+                      steps=[f"語気={frame.act} 問い={frame.ask or '-'} 話題={frame.topic or '-'}"])
+    claims: list[Claim] = []
+
+    # ---- 0) 挨拶・礼・感情の受け取り: 相手の語を返して続ける（先に決める） -- #
+    if frame.act in ("greet", "thanks", "apology", "farewell", "agree", "disagree", "praise") \
+            and not re.search(r"(とは|なぜ|どうして|教えて|何ですか|いくら|いつ|どこ)", frame.norm):
+        claims.extend(_social_claims(frame, state))
+        thought.steps.append("社会的発話: 相手の語を戻して受け取る")
+        dossier_obj = _DossierLite(claims=claims, coverage=0.6, topic=frame.topic, via="local",
+                                   sources=[], web_used=False, notes=[], evidence=[])
+        out = render(dossier_obj, frame, turn=turn_no, lm=lm, polisher=polisher)
+        thought.dossier = dossier_obj.as_dict()
+        return _finalize(out, thought, frame, dossier_obj, claims)
+
+    # ---- 0b) 入力が読めないとき: 読めた部分を確定させる -------------------- #
+    if frame.flags.get("opaque") in ("digits_only", "single_char", "mojibake", "latin_noise"):
+        claims.extend(opaque_claims(text, turn_no))
+        dossier_obj = _DossierLite(claims=claims, coverage=0.5, topic=frame.topic, via="tool",
+                                   sources=[], web_used=False, notes=["opaque input"], evidence=[])
+        out = render(dossier_obj, frame, turn=turn_no, lm=lm, polisher=polisher)
+        thought.dossier = {"via": "tool", "claims": [c.as_dict() for c in claims]}
+        return _finalize(out, thought, frame, dossier_obj, claims, plan_hint="opaque_input")
+
+    # ---- 1) 進行中の手遊び / 遊びの提案 ------------------------------------- #
+    move_info: dict = {}
+    if state.activity is not None and (frame.flags.get("continuation") or frame.activity):
+        pclaims, move_info = play_turn(frame, state, turn=turn_no)
+        if pclaims:
+            claims.extend(pclaims)
+            thought.move = move_info
+            thought.steps.append("進行中の規則で手番を打った")
+    if not claims:
+        prop = propose_activity_claims(text, kb=kb)
+        if prop is not None:
+            pclaims, move_info = prop
+            claims.extend(pclaims)
+            thought.move = move_info
+            thought.steps.append("遊びの提案: 定義から規則を読んで開始した")
+
+    # ---- 2) 自己紹介・能力（実測値で答える） -------------------------------- #
+    if not claims and frame.ask == "identity_user":
+        # 「私の名前は？」は自己紹介の質問ではない。会話の履歴を読む。
+        facts = dict(getattr(state, "user_facts", {}) or {})
+        name = str(facts.get("name") or "")
+        if name:
+            claims.append(Claim(kind="note",
+                                content=f"{name} さんですね。{int(facts.get('name_at') or 1)} ターン目に"
+                                        f"そう名乗っていました。",
+                                source="session", weight=0.86,
+                                extra={"name": name, "at": facts.get("name_at")}))
+        else:
+            claims.append(Claim(kind="note",
+                                content="この会話ではまだ名乗ってもらえていないので、"
+                                        "そちらの呼び方は手元に記録がありません。",
+                                source="session", weight=0.8, extra={"name": None}))
+            claims.append(Claim(kind="question",
+                                content="名前を一言もらえれば、この先はその呼び方で通します。",
+                                source="session", weight=0.72))
+        if facts.get("age"):
+            claims.append(Claim(kind="note",
+                                content=f"年齢は {int(facts['age'])} 歳（"
+                                        f"{int(facts.get('age_at') or 1)} ターン目）と覚えています。",
+                                source="session", weight=0.7))
+        thought.steps.append("相手の記憶: 自己紹介ではなく会話履歴を読んだ")
+    if not claims and frame.ask in ("identity",):
+        claims.extend(identity_claims(kb=kb))
+        thought.steps.append("自己言及: 実構成で答えた")
+    if not claims and frame.ask == "capability":
+        claims.extend(capability_claims(kb=kb, lm=lm, core=core, web=web))
+        thought.steps.append("能力は実測の規模で答えた")
+
+
+    # ---- 2a2) 翻訳の依頼: 確認できる形の話 + 取れた用例 -------------------------------- #
+    if frame.ask == "translation" and not any(str(c.source) == "web" for c in claims):
+        word, lang = _translation_target(text)
+        ent = lex.bank().entry(word) if word else None
+        if word and ent is not None:
+            read = ent.reading or to_hiragana(word)
+            bits = [f"「{word}」の読みは「{read}」"]
+            try:
+                bits.append(f"ローマ字では {kana_to_ro(read)}")
+            except Exception:  # noqa: BLE001
+                pass
+            if ent.pos:
+                bits.append(f"品詞は {ent.pos}")
+            body = "、".join(bits) + "。"
+        elif word:
+            body = (f"「{word}」は {mora_count(word)} 拍の列として読めました。"
+                    f"こちらの国語辞典の見出しには無い語なので、音のまま返します。")
+        else:
+            body = "変換する語が特定できませんでした。"
+        claims.append(Claim(kind="answer", content=body, subject=word, source="lex", weight=0.64,
+                            extra={"word": word, "target": lang}))
+        claims.append(Claim(kind="note",
+                            content=f"{lang}側の対応語まで踏み込むなら、検索を通したほうが"
+                                    "出典つきの用例ごと持ってこられます。",
+                            source="lex", weight=0.52))
+        thought.steps.append("翻訳要求: 確認できる形の記述 + 検索で取れるものの案内")
+
+    # ---- 2b) 感情・状態のこぼれ言（質問形でない発話）は先に受け止める ------ #
+    if not claims and frame.act in ("declare", "wish") \
+            and not re.search(r"(とは|なぜ|どうして|何ですか|いくら|いつ|どこ|教えて|方法|手順|使い方)",
+                              frame.norm) \
+            and not _kb_has_actionable(text, kb=kb):
+        claims.extend(_feeling_claims(frame, turn_no) if frame.mood != "neutral"
+                      else _statement_claims(frame, turn_no))
+        thought.steps.append("平叙の受け取り（gather より先に）")
+        from ..ground.evidence import Dossier
+
+        dossier_obj = Dossier(claims=claims, coverage=0.55, topic=frame.topic, via="local",
+                              notes=["statement"], evidence=[])
+        thought.dossier = dossier_obj.as_dict()
+        out = render(dossier_obj, frame, turn=turn_no, lm=lm, polisher=polisher)
+        if out.text:
+            return _finalize(out, thought, frame, dossier_obj, claims)
+
+    # ---- 3) 厳密に解ける仕事（計算・暦・文字・コード） ---------------------- #
+    # 先に TaskRouter の確定分野（ここは元々厳密に解いている）を見る
+    if not claims and tasks is not None:
+        try:
+            pre = tasks.classify(text, web=False)
+        except Exception:  # noqa: BLE001
+            pre = None
+        if pre in ("greeting_name", "word_problem", "unit", "equation", "compare"):
+            try:
+                ans = tasks.answer(text, web=False)
+            except Exception:  # noqa: BLE001
+                ans = None
+            if ans is not None and getattr(ans, "text", ""):
+                claims.append(Claim(kind="result", content=ans.text.strip(), subject=pre,
+                                    source=f"tool:{pre}", weight=float(ans.confidence or 0.9),
+                                    extra={"task": ans.as_dict()}))
+                thought.steps.append(f"task={pre}（先）")
+    tool_claims: list[Claim] = []
+    if not claims:
+        if re.search(r"(今は|いまは|西暦何年|今日は何日|明日は何日|何曜日|今何時|UNIX| unix )", frame.norm):
+            from ..solve import facts as _facts
+
+            sol = _facts.handle(text)
+            if sol is not None:
+                tool_claims = [Claim(kind="time", content=" → ".join(sol.steps) + "。答えは "
+                                     + sol.answer + "。", source="tool:clock", weight=0.96,
+                                     extra=sol.as_dict())]
+                thought.steps.append("clock verified")
+    if not claims and not tool_claims:
+        tool_claims = _solve_claims(frame, text, tasks=tasks, thought=thought)
+        if tool_claims:
+            claims.extend(tool_claims)
+
+    if tool_claims and not claims:
+        claims.extend(tool_claims)
+
+    # ---- 4) 証拠（KB → 辞書 → web） ---------------------------------------- #
+    dossier_obj = None
+    from ..ground.evidence import gather
+
+    # 手元に solid な材料があるときだけ検索を省く。「solid」= 道具层の答え、
+    # または話題そのものを踏んだ知識ベースの記述。薄いつかみ（単語の読みなど）は
+    # solid と数えないので、未知語の定義要求では必ずインターネットに出る。
+    topic_key = str(frame.topic or "")
+
+    def _solid(c) -> bool:
+        src = str(getattr(c, "source", "") or "")
+        if src.startswith("tool") or src == "web":
+            return True
+        if "kb" in src and topic_key and topic_key in str(getattr(c, "content", "")):
+            return True
+        return False
+
+    solid = any(_solid(c) for c in claims)
+    wants_web = (web is not None and web_flag is not False
+                 and bool(frame.needs_web or frame.flags.get("current")))
+    need_web = (bool(frame.needs_web) or bool(frame.flags.get("current"))) and web_flag is not False
+    if not claims or (wants_web and not solid):
+        dossier_obj = gather(frame, kb=kb,
+                             web=web if need_web else None,
+                             tool_claims=[c for c in claims if str(c.source).startswith("tool")]
+                             or tool_claims, history_text=text)
+        if web is not None and need_web:
+            frame.flags["web_tried"] = True
+        if dossier_obj.claims:
+            merged: list = []
+            seen: set[str] = set()
+            for c in list(dossier_obj.claims) + list(claims):
+                key = str(c.content)
+                if key in seen:
+                    continue
+                seen.add(key)
+                merged.append(c)
+            claims = merged
+            dossier_obj.claims = merged
+        thought.dossier = dossier_obj.as_dict()
+        thought.steps.append(f"証拠: via={dossier_obj.via} claims={len(claims)} "
+                             f"coverage={dossier_obj.coverage:.2f} web={dossier_obj.web_used}")
+    else:
+        from ..ground.evidence import Dossier
+
+        dossier_obj = Dossier(claims=claims, coverage=0.8 if tool_claims else 0.7,
+                              topic=frame.topic or state.previous_token(), via="lex",
+                              notes=["手遊び/自己言及は証拠集合を省略"], evidence=[])
+        thought.dossier = dossier_obj.as_dict()
+
+    # ---- 5) 何も引けなかったときも「知らない」で止めない -------------------- #
+    if not claims and frame.act == "declare" and frame.mood != "neutral":
+        claims.extend(_feeling_claims(frame, turn_no))
+        thought.steps.append("感情の受け取り: 述語を組み替り返す")
+    if not claims:
+        from ..ground.evidence import lexical_claims, exact_definition
+
+        # 話題名そのものの定義が引けるときは、それを確からしく使う
+        claims.extend(lexical_claims(frame, limit=3))
+        # 手元で話せる話題は、語の分析を返すときでも必ず添える（探索の案内役）。
+        have = {str(c.content) for c in claims}
+        extra = [x for x in suggestion_claims(text, kb=kb) if str(x.content) not in have]
+        claims.extend(extra)
+        if not claims:
+            claims.extend(_decompose_claims(frame, text, turn_no))
+            thought.steps.append("材料が薄いため、発話そのものの分析を返す")
+
+    # 検索すべき語だったのに裏が取れなかったときは、*何を確かめて何が無いのか* を先に言う。
+    disclosed = False
+    has_substance = any(str(c.source).startswith(("tool", "web", "session"))
+                        or ("kb" in str(c.source) and c.kind != "note") for c in claims)
+    if frame.needs_web and not has_substance:
+        extra = _decompose_claims(frame, text, turn_no)
+        if extra:
+            claims.extend(extra)
+            disclosed = True
+            thought.steps.append("未知語の開示: 手元に無い理由と取り方を添えた")
+
+    # 話題そのものを踏んだ記述（道具层の答え・検索・KB の本文）が 1 つも無いなら、
+    # 索引から数えられる事実で一手足す。ターンごとに手が変わるので同じ相槌を返さない。
+    if not disclosed and frame.ask not in ("translation", "code", "compute") \
+            and not any(str(c.source).startswith(("tool", "web", "session")) or
+                        ("kb" in str(c.source) and topic_key and topic_key in str(c.content))
+                        for c in claims):
+        menu = _topic_moves(frame, text, kb=kb, turn=turn_no, history=history or [])
+        if menu:
+            # 同じ語を名指しで掘る手を選んだなら、ただの羅列は冗長なので引く
+            named = {str(c.extra.get("topic") or "") for c in menu if c.extra.get("topic")}
+            if named:
+                claims = [c for c in claims
+                          if c in menu or not (c.extra.get("suggest")
+                                               and any(f"「{t}」" in str(c.content) for t in named))]
+            claims.extend(menu)
+            thought.steps.append("手の選択: 索引から数えられる事実で一手足す")
+
+    if dossier_obj is not None and claims and not dossier_obj.claims:
+        dossier_obj.claims = list(claims)
+    if dossier_obj is None:
+        from ..ground.evidence import Dossier as _D
+
+        via = "tool" if any(c.source.startswith("tool") for c in claims) else (
+            "web" if any(c.source == "web" for c in claims) else "local")
+        dossier_obj = _D(claims=list(claims), coverage=1.0 if via == "tool" else 0.6,
+                         topic=frame.topic, via=via, notes=["直接回答"], evidence=[])
+        thought.dossier = dossier_obj.as_dict()
+    out = render(dossier_obj, frame, turn=turn_no, lm=lm, polisher=polisher)
+    if not out.text:
+        from ..ground.evidence import Dossier
+
+        out = render(Dossier(claims=claims, coverage=0.3, topic=frame.topic, via="lex",
+                             notes=[], evidence=[]), frame, turn=turn_no, lm=lm,
+                     polisher=polisher)
+    if move_info:
+        out.notes.append(f"move: {move_info}")
+    return _finalize(out, thought, frame, dossier_obj, claims)
+
+
+def _DossierLite(**kw):
+    from ..ground.evidence import Dossier
+
+    return Dossier(**kw)
+
+
+
+def _topic_moves(frame, text: str, *, kb=None, turn: int = 0,
+                 history: list[dict] | None = None) -> list[Claim]:
+    """語彙にしか無い話題について、「いま事実として言える別々のこと」から一手選ぶ。
+
+    話題ごとの定型文は持たない。すべて (1) 実辞書の索引 (2) 音の数 (3) 知識ベースの
+    隣接 —— という *いつだって検証できる材料* から作るので、どの名詞が来ても同じ手順で
+    返せる。ターンが進むと別の手に移るので、同じ相槌が繰り返されない。
+    """
+    b = lex.bank()
+    w = str(frame.topic or "").strip()
+    if not w:
+        return []
+    # 話題名に助詞が残っていたら落とす（「今日のニュース」型の取り込み防止）
+    w = re.sub(r"^(私の|僕の|俺の|ボクの)?", "", w)
+    said = " ".join(str(m.get("content") or "") for m in (history or [])
+                    if m.get("role") == "assistant")
+    menu: list[list[Claim]] = []
+
+    # (ア) 複合語の在庫 ── 語彙索引が実際に持っている数を言う
+    try:
+        comps = [x.surface for x in b.containing(w, limit=12) if x.surface != w]
+    except Exception:  # noqa: BLE001
+        comps = []
+    if comps:
+        menu.append([Claim(
+            kind="note",
+            content=f"「{w}」を含む語は手元の語彙に {len(comps)} 語見えて、"
+                    f"例は {'、'.join(comps[:3])} です。",
+            source="lex", weight=0.6, extra={"words": comps[:6]})])
+
+    # (イ) 音で連なる語 ── 読みを引けるので漢字表記でも壊れない
+    read = to_hiragana(lex.bank().reading(w) or "") or to_hiragana(w)
+    try:
+        kin = [x.surface for x in b.by_reading_prefix(read, limit=6, min_len=len(read) + 1)
+               if x.surface != w]
+    except Exception:  # noqa: BLE001
+        kin = []
+    if len(read) >= 2 and kin:
+        menu.append([Claim(
+            kind="note",
+            content=f"読み「{read}」で始まる語なら {'、'.join(kin[:3])} があります。",
+            source="lex", weight=0.58, extra={"words": kin[:6]})])
+
+    # (ウ) 拍の数 ── 音拍索引で数えた実数
+    n = mora_count(w)
+    if n >= 1:
+        try:
+            same = len(b.by_morae(int(n), limit=2000))
+        except Exception:  # noqa: BLE001
+            same = 0
+        # 索引は打ち切りがあるので、上限に当たった数は「以上」としか言えない。
+        tail = (f"同じ {int(n)} 拍の名詞は索引に {same} 語以上あります。"
+                if same >= 2000 else (f"同じ {int(n)} 拍の名詞は索引に {same} 語あります。" if same else ""))
+        menu.append([Claim(
+            kind="note",
+            content=f"「{w}」は {int(n)} 拍の語です。{tail}",
+            source="lex", weight=0.56, extra={"morae": int(n)})])
+
+    # (エ) 手元の隣接話題を 1 つ、名指しで説明する（羅列だけしない）
+    if kb is not None:
+        try:
+            near = [str(x) for x in (kb.suggest(text, top_k=5) or []) if x]
+        except Exception:  # noqa: BLE001
+            near = []
+        for cand in near[:5]:
+            try:
+                item = kb.exact_topic(cand) or {}
+            except Exception:  # noqa: BLE001
+                item = {}
+            line = str(item.get("def") or "").strip()
+            if line and line not in said:
+                menu.append([Claim(
+                    kind="note",
+                    content=f"手元に「{cand}」の記述もあるので、そちらも話せます。{line}",
+                    source="local:kb", weight=0.54, extra={"topic": cand})])
+                break
+
+    # (オ) 話題の続きを尋ねる（会話を止めない）
+    menu.append([Claim(
+        kind="question",
+        content=f"「{w}」はどんな場面で使う語ですか。用途を一言もらうと、そちらの言い方に合わせて組みます。",
+        source="lex", weight=0.5)])
+
+    live = [m for m in menu if not all(c.content in said for c in m)]
+    if not live:
+        live = menu
+    return list(live[int(turn) % len(live)])
+
+def _decompose_claims(frame, text: str, turn: int = 0) -> list[Claim]:
+    """語彙に無い語が来たとき、*分解して分かること* を出す（推測で埋めない）。"""
+    t = normalize(text)
+    pieces = [p for p, _ in lex.bank().segment(t) if len(p) >= 1][:8]
+    known = [p for p in pieces if lex.bank().has(p)]
+    bits = []
+    if known:
+        reads = "、".join(f"「{p}」{('(' + lex.bank().reading(p) + ')') if lex.bank().reading(p) else ''}"
+                          for p in known[:4])
+        bits.append(f"文を分解すると {reads} まで読めます")
+    else:
+        bits.append(f"入力 {char_count(t)} 文字は、こちらの手元の語彙では塊として引けませんでした")
+    if frame.needs_web:
+        tried = frame.flags.get("web_tried")
+        bits.append("ウェブ検索も試しましたが、使える記述は取れませんでした。"
+                    if tried else
+                    "ここではウェブ検索が使えない設定なので、推測で語義は埋めません。")
+    if frame.entities:
+        ent = frame.entities[0]
+        bits.append(f"対象は「{ent.surface}」としてそのまま扱います")
+    asks = ("何を答えたいですか（定義・手順・比較・値段のどれか）を一言で教えてください",
+            "どれを欲しがっていますか。意味・使い方・数量のどれかを一語でどうぞ",
+            "何が分かっていれば前に進めますか。切り口を一言ください")
+    bits.append(asks[int(turn) % len(asks)])
+    return [Claim(kind="note", content=_join_bits(bits), source="lex", weight=0.46)]
+
+
+def suggestion_claims(text: str, *, kb) -> list[Claim]:
+    from ..ground.evidence import suggestion_claims as _s
+
+    return _s(text, kb=kb)
+
+
+_FOLLOWUP_ASKS = {
+    "negative": ("どうしてそうなったか、語を一語で教えてもらえますか。",
+                 "いま一番しんどいのはどこですか。"),
+    "positive": ("いちばん良かったのはどこでしたか。",
+                 "次に同じことがあれば、何が足したいですか。"),
+    "neutral": ("どんな状況だったか、語を一語だけ教えてください。",
+                "そこから何を変えたかったですか。"),
+}
+
+
+def ask_pos(turn: int) -> str:
+    pool = ("いちばん良かった部分をどこに置きましたか。", "次はどんな風に進めたいですか。")
+    return pool[int(turn) % len(pool)]
+
+
+def _statement_claims(frame, turn: int = 0) -> list[Claim]:
+    """質問ではない平叙・報告。述語を受け取り、続きを問う（相手の語を使う）。"""
+    t = normalize(frame.raw).strip("。！？!? ")
+    if not t or len(t) > 40:
+        return []
+    from ..lang.phonetics import kana_ratio
+
+    if kana_ratio(t) < 0.35 or len(t) < 2:
+        return []          # 欧文の羅列・1 文字は「読めない入力」側に回す
+    pred = re.sub(r"(ですね|だよ|だわ|かな|のだった|のだ)$", "", t)
+    pred = re.sub(r"(について|の話を|について語って|語って|話して|話してよ|教えて|教えてよ|見せて|"
+                  r"してよ|してくれ|してほしい)+$", "", pred).strip("、。 ・")
+    if not pred or pred[-1] in "にでをがはのとつ":
+        pred = frame.topic or pred
+    lemma = morph.lemma_of(pred) or pred
+    # 相手の言い方をそのまま受け取る（活用を組み替えて「寒かっただった」のような
+    # 非文法を作るより、自然で安全）
+    ta = pred
+    if frame.mood == "neutral" and not lex.bank().entry(lemma) and len(pred) < 3:
+        return []
+    pool = _FOLLOWUP_ASKS.get(frame.mood, _FOLLOWUP_ASKS["neutral"])
+    ask = pool[int(turn) % len(pool)]
+    quoted = pred if re.search(r"[いうたでる]", pred[-1:]) or len(pred) > 8 else f"「{pred}」"
+    tail = "んですね" if quoted.endswith("い") else "なんですね"
+    body = f"{quoted}{tail}。{ask}"
+    return [Claim(kind="answer", content=body, subject=lemma, source="lex", weight=0.58,
+                  extra={"predicate": pred, "lemma": lemma})]
+
+
+_LANG_WORDS = ("英語", "日本語", "中国語", "中文", "韓国語", "朝鮮語", "フランス語", "ドイツ語",
+               "スペイン語", "イタリア語", "ポルトガル語", "ロシア語", "外国語", "ローマ字",
+               "タイ語", "インドネシア語", "越南語", "ベトナム語")
+_TRANSLATE_RE = re.compile(
+    r"[「『]?([^」』\n。]{1,24}?)[」』]?\s*(?:を|は)\s*(?:" + "|".join(_LANG_WORDS) + r")\s*(?:に|で)")
+
+
+def _join_bits(bits: list[str]) -> str:
+    """断片を 1 文に綴じる。敬体で言い切ったところでは読点でなく句点で切る。"""
+    parts: list[str] = []
+    for raw in bits:
+        x = str(raw).strip().rstrip("。")
+        if not x:
+            continue
+        if not parts:
+            parts.append(x)
+        elif parts[-1].endswith(("です", "ます", "ません", "しました", "でした", "でしたら")):
+            parts[-1] += "。"
+            parts.append(x)
+        else:
+            parts[-1] += "、" + x
+    out = "。".join(parts)
+    return (out + "。") if out and not out.endswith("。") else out
+
+
+def _translation_target(text: str) -> tuple[str, str]:
+    """「X を英語にして」型の依頼から、変換対象 X と目標言語を取り出す。"""
+    t = normalize(text)
+    lang = next((x for x in _LANG_WORDS if x in t), "外国語")
+    m = _TRANSLATE_RE.search(t)
+    src = (m.group(1) if m else "").strip(" 、。「」『』")
+    if not src:
+        m2 = re.search(r"([A-Za-z][A-Za-z0-9'\\-]{1,24})", t)
+        src = m2.group(1) if m2 else ""
+    return src, lang
+
+
+def _feeling_claims(frame, turn: int = 0) -> list[Claim]:
+    """「疲れた」「忙しい」など述語だけの発話への受け取り方（相手の語を組み替える）。"""
+    t = normalize(frame.raw)
+    # 依頼・命令・長い文は「こぼれ言」ではない。語をそのまま返すだけの応答になる。
+    if len(t) > 12 or re.search(r"(して|してよ|くれ|ください|教えて|訳し|翻訳|書いて|作って|"
+                                r"やりたい|したい|ほしい|方法|手順|いくら|何時|何年|何日)", t):
+        return []
+    pred = re.sub(r"[。！？!?ねよさわよ]+$", "", t)
+    if not pred:
+        return []
+    lemma = morph.lemma_of(pred)
+    ta = pred if re.search(r"(い|た|る|だ)$", pred) else pred + "の"
+    if frame.mood == "negative":
+        pool = (f"{ta}のは、今日だけのことですか。それとも続いていますか。"
+                f"続けられる範囲で、今日できることを一つだけ一緒に決めましょう。",
+                f"{ta}のはつらいですね。いちばんしんどいのはどこですか。休める時間はありますか。",
+                f"{ta}んですね。いつ頃から続いていますか。短く教えてもらえれば、そこから組みます。")
+        body = pool[int(turn) % len(pool)]
+    elif frame.mood == "positive":
+        pool = (f"{pred}、いいですね。きっかけを一言もらえますか。",
+                f"{pred}とのこと。一度きりでしたか、続いていますか。",
+                f"{pred}のはいいですね。{ask_pos(turn)}")
+        body = pool[int(turn) % len(pool)]
+    else:
+        body = f"{ta}んですね。どういう状況だったのか、語を一語でいいので教えてください。"
+    return [Claim(kind="answer", content=body, subject=lemma, source="lex", weight=0.6,
+                  extra={"predicate": pred, "lemma": lemma, "mood": frame.mood})]
+
+
+def _social_claims(frame, state: ConversationState) -> list[Claim]:
+    """挨拶・礼・謝罪は *相手の語を返して* 続ける（定型の一文を出さない）。"""
+    t = normalize(frame.raw)
+    words = [w for w, pos in lex.bank().segment(t)
+             if pos.split("/")[0] in {"名詞", "動詞", "形容詞"} and len(w) >= 2][:2]
+    if frame.act == "greet":
+        when = _when_phrase()
+        return [Claim(kind="answer",
+                      content=f"{_greeting_word(frame.norm)}。{when}、何を扱いますか。"
+                              f"語彙も計算もコードも、この場で組み立てます。",
+                      source="local", weight=0.7)]
+    if frame.act == "thanks":
+        return [Claim(kind="answer", content="いえいえ。続きがあれば、その語だけ送ってください。",
+                      source="local", weight=0.66)]
+    if frame.act == "apology":
+        return [Claim(kind="answer", content="問題ありません。言葉を足してもらえれば、そこから組み直します。",
+                      source="local", weight=0.6)]
+    if frame.act == "farewell":
+        return [Claim(kind="answer", content="では、また。次の会話でも分解から組み立てます。",
+                      source="local", weight=0.6)]
+    if frame.act in ("praise", "agree"):
+        echo = words[0] if words else "その反応"
+        return [Claim(kind="answer", content=f"{echo} の件、こちらもうまく通ってよかったです。",
+                      source="local", weight=0.62)]
+    if frame.act == "disagree":
+        echo = words[0] if words else "そこ"
+        return [Claim(kind="correction",
+                      content=f"{echo} の部分は私の側で根拠が弱かったです。どの点が違うのか、語を一語だけ教えてください。",
+                      source="local", weight=0.6)]
+    return []
+
+
+def _greeting_word(t: str) -> str:
+    n = normalize(t)
+    if "おはよう" in n:
+        return "おはようございます"
+    if "こんばんは" in n or "夜" in n:
+        return "こんばんは"
+    if "はじめまして" in n or "初めまして" in n:
+        return "はじめまして"
+    if "もしもし" in n:
+        return "もしもし"
+    return "こんにちは"
+
+
+def _when_phrase() -> str:
+    try:
+        from ..solve.facts import now
+
+        dt = now()
+        return f"{dt.month} 月 {dt.day} 日の {dt.strftime('%H:%M')}"
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+def _solve_claims(frame, text: str, *, tasks=None, thought: Thought | None = None) -> list[Claim]:
+    """計算・暦・文字操作・コード。ToolRouter より先に置かない（誤読を避ける）。"""
+    out: list[Claim] = []
+    from .. import solve as solver
+
+    # a) 厳密計算・暦・言葉の操作（frame の型で絞る）
+    if frame.ask in ("compute", "now", "when", "transform", "word_property", "reading",
+                    "translation", "example", "word_list", "count", "summarize", "extract",
+                    "synonym", "antonym", ""):
+        try:
+            got = solver.handle(text, hint="code" if frame.ask == "code" else "")
+        except Exception:  # noqa: BLE001
+            log.debug("solver.handle 失敗", exc_info=True)
+            got = None
+        if got is not None and got.solution is not None:
+            sol = got.solution
+            body = sol.answer
+            if sol.steps:
+                body = " → ".join(sol.steps) + "。答えは " + sol.answer + "。"
+            out.append(Claim(kind="result", content=body, subject=frame.topic,
+                             source=f"tool:{got.kind}", weight=0.95 if sol.verified else 0.8,
+                             extra=sol.as_dict()))
+            if thought is not None:
+                thought.steps.append(f"solver={got.kind} verified={sol.verified}")
+            return out
+    # b) コード（生成 → 実行 → 検証）
+    if frame.ask == "code":
+        try:
+            pair = solver.solve_code(text)
+        except Exception:  # noqa: BLE001
+            pair = None
+        if pair:
+            got, res = pair
+            sol = got.solution
+            out.append(Claim(kind="result", content=sol.answer, subject="code",
+                             source="tool:code", weight=0.95 if res.ok else 0.72,
+                             extra={"language": res.language, "ran": res.ran,
+                                    "stdout": res.stdout[:200], "notes": res.notes[:3]}))
+            if thought is not None:
+                thought.steps.append(f"code verified={res.ok} ran={res.ran} lang={res.language}")
+            return out
+    # c) 方程式・文章題・創作・比較は TaskRouter の厳密solversが詳しい
+    if tasks is not None:
+        try:
+            kind = tasks.classify(text, web=False)
+        except Exception:  # noqa: BLE001
+            kind = None
+        if kind in ("arithmetic", "equation", "word_problem", "unit", "compare", "greeting_name"):
+            try:
+                ans = tasks.answer(text, web=False)
+            except Exception:  # noqa: BLE001
+                ans = None
+            if ans is not None and getattr(ans, "text", ""):
+                out.append(Claim(kind="result", content=ans.text.strip(), subject=kind,
+                                 source=f"tool:{kind}", weight=float(ans.confidence or 0.9),
+                                 extra={"task": ans.as_dict()}))
+                if thought is not None:
+                    thought.steps.append(f"task={kind}")
+    return out
+
+
+__all__ = ["think", "Thought", "capability_claims", "identity_claims", "opaque_claims",
+           "play_turn", "propose_activity_claims"]

@@ -1,0 +1,13 @@
+{
+  "sentences": 240000,
+  "chars": 3828134,
+  "nouns": 5411,
+  "transitive": 143,
+  "intransitive": 116,
+  "adjectives": 83,
+  "frames": 76,
+  "seed": 20260912,
+  "out": "/home/user/Snipher/snipher/data/corpus.txt.gz",
+  "bytes": 2789824,
+  "seconds": 10.4
+}
