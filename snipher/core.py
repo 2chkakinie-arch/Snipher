@@ -774,6 +774,11 @@ class SnipherCore:
         st["lm_ready"] = lm is not None
         st["knowledge"] = self.kb.stats() if self.kb is not None else None
         st["research"] = self.research.status()
+        from .reasoning import ReasoningConfig
+        rc = ReasoningConfig.from_env()
+        st["reasoning"] = {"configured": rc.configured, "model": rc.model,
+                           "mode": os.getenv("SNIPHER_REASONING", "auto"),
+                           "verification": "output_contract_only"}
         st["neural_ready_any"] = self.any_neural()
         return st
 
@@ -873,6 +878,22 @@ class SnipherCore:
                      use_template: bool = True, system_prompt: str | None = None,
                      web: bool | None = None):
         """SSE 用イベントジェネレータ。Snipher Core の内部パイプライン本体。"""
+        # The production path resolves capabilities, never topic keywords. Legacy
+        # engines remain explicitly selectable for offline demos and comparison.
+        if os.getenv("SNIPHER_REASONING", "auto") != "legacy" and mode not in ("fast", "light"):
+            from .reasoning import ReasoningConfig, ReasoningEngine
+
+            cfg = ReasoningConfig.from_env()
+            if cfg.configured:
+                yield from ReasoningEngine(cfg).stream_reply(
+                    messages, web=web, max_new_tokens=max_new_tokens, system_prompt=system_prompt)
+            else:
+                yield {"type": "error", "code": "reasoning_not_configured",
+                       "message": "指示対応モデルを設定してください: SNIPHER_REASONING_URL / "
+                                  "SNIPHER_REASONING_MODEL / SNIPHER_REASONING_KEY。"
+                                  "旧デモは明示的にfastまたはlightで利用できます。"}
+            return
+
         last_user = next(
             (m.get("content", "") for m in reversed(messages) if m.get("role") == "user"), ""
         )
