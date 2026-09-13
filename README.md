@@ -155,7 +155,15 @@ SNIPHER_EDGE_SEARCH_URL=...  # エンドポイント差し替え
 | `しりとりしよ` / `回文を作って` | 索引から手を打ち、条件を実際に検算する（回文は左右対称を確認） |
 | `HTML で一覧を書いて` | タグの対応を `tag_balance()` で検査してから渡す |
 
-## 8. テストと計測
+## 8. API の見せるもの（間違われやすい点）
+
+- `POST /api/chat` … 会話本体（SSE）。上の思考ループが返し、`assist` イベントで
+  「どの証拠をどう使ったか」も一緒に流れます。UI（`/`）はこれだけを使っています。
+- `GET /analyze`・`POST /generate` … *パターン機関の見学者向けデモ*です。
+  品詞・文型テーブルから確率的に文を組んで解析結果を並べるもので、会話の応答ではありません
+  （壊れた文は `valid: false` と理由・整え案が付きます）。
+
+## 9. テストと計測
 
 ```bash
 .venv/bin/python -m pytest -q          # 436 passed, 3 skipped
@@ -166,7 +174,7 @@ SNIPHER_EDGE_SEARCH_URL=...  # エンドポイント差し替え
 `tests/test_mind.py`（frame/state/rules/play）、`tests/test_solve.py`（計算・コード・文字）、
 `tests/test_web_grounding.py`（検索と fetch）、`tests/test_v3_contract.py`（上の受け入れ条件）。
 
-## 9. 同梱データのライセンス
+## 10. 同梱データのライセンス
 
 辞書・語彙・知識ベースは出所を明示した再配布可能なデータからビルドしています。
 詳細は `NOTICE` と `snipher/data/*.meta.json` を見てください。

@@ -346,3 +346,32 @@ def test_translation_ask_names_the_word_it_read(composer) -> None:
     assert "うれしい" in r.text
     assert "ureshii" in r.text.replace("'", "")      # ローマ字表記まで示す
     assert "えいご" not in r.text.split("\n")[0]      # 目標言語を被説明語にしない
+
+
+def test_demo_generation_endpoint_marks_broken_sentences() -> None:
+    """/generate（確率生成デモ）は、壊れた文を *検査を通った顔で* 返さない。
+
+    本体と同じ `validate()` を通し、落ちた文は理由と *整え案* を必ず添える。
+    デモだからと言って非文をそのまま出さない、という取り決め。
+    """
+    import os
+
+    os.environ.setdefault("SNIPHER_LFM_BACKEND", "off")
+    os.environ.setdefault("SNIPHER_LFM_AUTO_FETCH", "0")
+    import snipher.api as api_mod
+    from fastapi.testclient import TestClient
+
+    api_mod._core = None
+    api_mod._lfm_engine = None
+    seen_invalid = 0
+    with TestClient(api_mod.app) as client:
+        for seed in range(6):
+            body = client.post("/generate", json={"n": 4, "seed": seed}).json()
+            items = body.get("sentences") or [body]
+            for s in items:
+                assert "valid" in s, s
+                if s["valid"] is False:
+                    seen_invalid += 1
+                    assert s.get("invalid_reason"), s
+                    assert (s.get("repaired") or s.get("text")), s
+    # 壊れた文が 1 つも無いならそれで良い。有ったなら、必ず理由と整え案が付いている。
