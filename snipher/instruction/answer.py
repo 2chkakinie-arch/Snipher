@@ -149,9 +149,9 @@ def gather_claims(d: "Directive", *, kb=None, web=None, history=None, lm=None,
             solid.append(Claim(kind="fact", content=sent, subject=subject,
                                source="prompt", weight=0.68))
         notes.append("材料: 指示文に書かれていた記述を使った")
-    need = int(d.fmt.target_chars or 0) or int(d.fmt.max_chars or 0)
-    have = sum(len(str(c.content or "")) for c in solid)
-    if not solid or (need and have < need * 0.8):
+    # 材料が *無い* ときだけ埋めます。長さが足りないだけで別話題を足すと、
+    # 指示の的がずれるので（v3 はここで隣の話題を貼り付けていました）、字数は文の選び方で調整します。
+    if not solid:
         # 材料が足りないぶんは、*確かめられること*（語彙・検索の状態・近い話題）で埋める。
         # 推測で語義を作ることはしないので、ここで足せるのは数えられる事実だけです。
         solid.extend(fallback_claims(question, frame, subject=subject, web=web,
@@ -446,6 +446,11 @@ def answer(d: "Directive", *, kb=None, web=None, history=None, lm=None, core=Non
     target = int(fmt.target_chars or 0)
     hard = int(fmt.max_chars or 0)
 
+    # 主語が *本当に二重に* 付いているときだけ直す（「GLM5.3 GLM5.3 は…」）
+    if subject and sentences:
+        dup = re.compile(rf"^{re.escape(subject)}\s*[、,・:]?\s*{re.escape(subject)}")
+        sentences = [dup.sub(subject, s.strip(), count=1) for s in sentences]
+
     opening = opening_line(d, subject, tone=tone, register=register)
     if opening:
         sentences = [opening] + sentences
@@ -497,9 +502,27 @@ def answer(d: "Directive", *, kb=None, web=None, history=None, lm=None, core=Non
         text = "\n".join(body) if len(body) > 1 else "".join(body)
 
     if sources and not fmt.strict:
-        cite = "\n".join(f"[{i}] {s.get('title') or s.get('url')} — {s.get('url')}"
-                         for i, s in enumerate(sources[:4], 1))
-        text = f"{text}\n出典:\n{cite}"
+        room = max(target or 0, hard or 0)
+        if room:
+            # 字数指定があるときは出典を 1 行に圧縮して *予算の中* に入れる（指定は厳守）
+            links = " / ".join(str(s.get("url") or "") for s in sources[:2] if s.get("url"))
+            cite = f"出典: {links}" if links else ""
+            budget = int(room * 1.1) - count_chars("\n" + cite)
+            kept, used = [], 0
+            for line in body:
+                n = count_chars(line)
+                if used + n > budget and len(kept) >= 2:
+                    continue
+                kept.append(line)
+                used += n
+            body = kept
+            text = "\n".join(body) if len(body) > 1 else "".join(body)
+            if cite:
+                text = f"{text}\n{cite}"
+        else:
+            cite = "\n".join(f"[{i}] {s.get('title') or s.get('url')} — {s.get('url')}"
+                             for i, s in enumerate(sources[:4], 1))
+            text = f"{text}\n出典:\n{cite}"
 
     conf = 0.6
     if any(str(c.source).startswith("tool") for c in claims):

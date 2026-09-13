@@ -393,6 +393,9 @@ def suggestion_claims(text: str, *, kb) -> list[Claim]:
         names = [str(x) for x in (kb.suggest(text, top_k=3) or []) if x]
     except Exception:  # noqa: BLE001
         names = []
+    q_chars = {c for c in normalize(text) if "一" <= c <= "龯" or c.isascii() and c.isalnum()}
+    if q_chars:
+        names = [n for n in names if len({c for c in n if c in q_chars}) >= 2]
     if not names:
         return out
     # 話題名の羅列（「〜のあたりを話せます」）は *何も答えていない* ので、

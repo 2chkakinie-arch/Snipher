@@ -591,6 +591,9 @@ def check_text(text: str) -> tuple[bool, str]:
         first = True
         for line in [x for x in body.split("\n") if x.strip()]:
             s = line.strip()
+            # 出典行・URL だけの行は文章ではなく注記なので、文末検査の数え対象から外す
+            if s.startswith("出典") or re.fullmatch(r"(?:\[\d+\]\s*)?\S*://\S+", s):
+                continue
             if s.startswith(("・", "-", "*", "出典", "[", "|")) or re.match(r"^\d+[.)、]", s):
                 s = re.sub(r"^(?:[・\-*]|\d+[.)、])\s*", "", s)
             # 文書の見出し行（`件名: …` / `取引先 ご担当者様` / タイトル 1 行）は *文* ではない
