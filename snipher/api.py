@@ -225,9 +225,13 @@ async function generate() {
     body: JSON.stringify(body)});
   const d = await r.json();
   const list = d.sentences || [d];
-  out.innerHTML = list.map(s =>
-    `<div class="sent"><strong>${s.text}</strong><br>
-     <span class="tag">${s.pattern_name} / 話題: ${s.topic || "-"}</span></div>`).join("");
+  out.innerHTML = list.map(s => {
+    const shown = (!s.valid && s.repaired) ? s.repaired : s.text;
+    const flag = s.valid === false
+      ? ` <span class="tag" style="color:#b45309">要校正: ${s.invalid_reason || "文法検査"}</span>` : "";
+    return `<div class="sent"><strong>${shown}</strong><br>
+     <span class="tag">${s.pattern_name} / 話題: ${s.topic || "-"}</span>${flag}</div>`;
+  }).join("");
 }
 (async () => {
   const r = await fetch("/info"); const d = await r.json();
@@ -253,13 +257,45 @@ def analyze(req: AnalyzeRequest):
 
 @app.post("/generate")
 def generate(req: GenerateRequest):
-    return engine.generate(
+    out = engine.generate(
         prompt=req.prompt,
         register=req.register_style,
         tense=req.tense,
         n=req.n,
         seed=req.seed,
     )
+    # 確率生成のデモでも、文章の検査は本体と同じものをとおします。
+    from .composer import validate as _validate
+
+    def mark(item: dict) -> dict:
+        ok, why = _validate(str(item.get("text") or ""), max_len=200)
+        item["valid"] = ok
+        if not ok:
+            item["invalid_reason"] = why
+            # 壊れた文は *壊れている* と分かる形で添えるだけ。整った言い方を composer が作り直す。
+            fixed = _tidy_demo_text(str(item.get("text") or ""))
+            if fixed and fixed != item.get("text"):
+                item["repaired"] = fixed
+        return item
+
+    if "sentences" in out:
+        out["sentences"] = [mark(x) for x in out["sentences"]]
+    else:
+        mark(out)
+    return out
+
+
+def _tidy_demo_text(text: str) -> str:
+    """生成デモの文から、明らかな重複語尾・二重敬体を寄せて返す（通らなければ空）。"""
+    import re as _re
+
+    from .composer import balance_quotes
+
+    t = balance_quotes(text)
+    t = _re.sub(r"(ます|です)\s*(ます|です)", r"\1", t)
+    t = _re.sub(r"(よ|ね|わ)(よ|ね|わ)", r"\1", t)
+    t = _re.sub(r"[。、]{2,}", "。", t).strip()
+    return t
 
 
 @app.get("/health")
