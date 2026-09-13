@@ -282,9 +282,11 @@ def test_repeated_statement_does_not_repeat_the_reply(composer) -> None:
     texts = [_compose(composer, "ぬるぬる猿について話したい", turn=i, web=False).text
              for i in range(1, 9)]
     assert len(set(texts)) >= 5, texts
-    # どれも語彙索引・拍数・知識ベースのいずれかを指している（空虚な相槌だけにならない）
+    # 手元に無い話題では、相手の文をそのまま返さない・辞書引き応答もしない
     for t in set(texts):
-        assert re.search(r"[\d「]", t), t
+        assert "ぬるぬる猿について話したい" not in t, t
+        assert not re.search(r"(拍|索引|品詞は|読みは|U\+)", t), t
+        assert len(t) >= 12, t
 
 
 def test_thin_topic_moves_are_verifiable_facts(composer) -> None:

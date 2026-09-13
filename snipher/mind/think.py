@@ -21,6 +21,7 @@ from dataclasses import dataclass, field
 
 from ..lang import lex, morph
 from ..lang.phonetics import char_count, kana_to_ro, mora_count, normalize, to_hiragana
+from .chat import claims_for as _chat_claims
 from .frame import Claim, split_sentences
 from .parse import build_frame, opaque_reason
 from .play import claims_for_move, judge, pick, word_from_turn
@@ -86,6 +87,9 @@ def opaque_claims(text: str, turn: int = 0) -> list[Claim]:
                            weight=0.8, extra={"numbers": nums}))
         return claims
     if reason == "single_char" and body:
+        # 「は？」「え？」は *聞き返しの記号*。字形の説明を返すと会話がちぐはぐになります。
+        if re.fullmatch(r"[はへえあうぉん]{1,3}", body) and re.search(r"[?？]", t):
+            return []
         ch = body[0]
         try:
             name = unicodedata.name(ch)
@@ -516,11 +520,17 @@ def think(text: str, *, history: list[dict] | None = None, kb=None, web=None, lm
     # ---- 0b) 入力が読めないとき: 読めた部分を確定させる -------------------- #
     if frame.flags.get("opaque") in ("digits_only", "single_char", "mojibake", "latin_noise"):
         claims.extend(opaque_claims(text, turn_no))
-        dossier_obj = _DossierLite(claims=claims, coverage=0.5, topic=frame.topic, via="tool",
-                                   sources=[], web_used=False, notes=["opaque input"], evidence=[])
-        out = render(dossier_obj, frame, turn=turn_no, lm=lm, polisher=polisher)
-        thought.dossier = {"via": "tool", "claims": [c.as_dict() for c in claims]}
-        return _finalize(out, thought, frame, dossier_obj, claims, plan_hint="opaque_input")
+        if not claims:
+            # 「は？」「え？」は聞き返し。文字の説明ではなく、何を読み直せばよいかを数える
+            claims.extend(_chat_claims(text, frame=frame, kb=kb, history=history, turn=turn_no))
+        if claims:
+            via = "tool" if claims[0].source.startswith("tool") else "local"
+            dossier_obj = _DossierLite(claims=claims, coverage=0.5, topic=frame.topic, via=via,
+                                       sources=[], web_used=False, notes=["opaque input"],
+                                       evidence=[])
+            out = render(dossier_obj, frame, turn=turn_no, lm=lm, polisher=polisher)
+            thought.dossier = {"via": via, "claims": [c.as_dict() for c in claims]}
+            return _finalize(out, thought, frame, dossier_obj, claims, plan_hint="opaque_input")
 
     # ---- 1) 進行中の手遊び / 遊びの提案 ------------------------------------- #
     move_info: dict = {}
@@ -598,22 +608,29 @@ def think(text: str, *, history: list[dict] | None = None, kb=None, web=None, lm
                             source="lex", weight=0.52))
         thought.steps.append("翻訳要求: 確認できる形の記述 + 検索で取れるものの案内")
 
-    # ---- 2b) 感情・状態のこぼれ言（質問形でない発話）は先に受け止める ------ #
-    if not claims and frame.act in ("declare", "wish") \
-            and not re.search(r"(とは|なぜ|どうして|何ですか|いくら|いつ|どこ|教えて|方法|手順|使い方)",
+    # ---- 2b) 日常の平叙・報告・こぼれ言 → chat 層（中身を見て組み立てる） ----- #
+    # v3 までは「相手の文をそのまま引用 → 語を一語ください」だけでした。chat 層は
+    # 発話行為・気分・内容語を読み、知識ベースから *その話題について言える事実* を引いて
+    # 組み立てます。長文（今日○に行く予定、等）もここで処理するので、40 字で打ち切りません。
+    if not claims and frame.act in ("declare", "wish", "invite") \
+            and not re.search(r"(とは|なぜ|どうして|何ですか|いくら|教えて|方法|手順|使い方)",
                               frame.norm) \
             and not _kb_has_actionable(text, kb=kb):
-        claims.extend(_feeling_claims(frame, turn_no) if frame.mood != "neutral"
-                      else _statement_claims(frame, turn_no))
-        thought.steps.append("平叙の受け取り（gather より先に）")
-        from ..ground.evidence import Dossier
+        claims.extend(_chat_claims(text, frame=frame, kb=kb, history=history, turn=turn_no))
+        if not claims:
+            claims.extend(_feeling_claims(frame, turn_no) if frame.mood != "neutral"
+                          else _statement_claims(frame, turn_no))
+        if claims:
+            thought.steps.append("平叙の受け取り: 発話行為と内容語から組み立てた")
+            from ..ground.evidence import Dossier
 
-        dossier_obj = Dossier(claims=claims, coverage=0.55, topic=frame.topic, via="local",
-                              notes=["statement"], evidence=[])
-        thought.dossier = dossier_obj.as_dict()
-        out = render(dossier_obj, frame, turn=turn_no, lm=lm, polisher=polisher)
-        if out.text:
-            return _finalize(out, thought, frame, dossier_obj, claims)
+            dossier_obj = Dossier(claims=claims, coverage=0.55, topic=frame.topic, via="local",
+                                  notes=["statement"], evidence=[])
+            thought.dossier = dossier_obj.as_dict()
+            out = render(dossier_obj, frame, turn=turn_no, lm=lm, polisher=polisher)
+            if out.text:
+                return _finalize(out, thought, frame, dossier_obj, claims)
+            claims = []
 
     # ---- 3) 厳密に解ける仕事（計算・暦・文字・コード） ---------------------- #
     # 先に TaskRouter の確定分野（ここは元々厳密に解いている）を見る
@@ -706,11 +723,13 @@ def think(text: str, *, history: list[dict] | None = None, kb=None, web=None, lm
         claims.extend(_feeling_claims(frame, turn_no))
         thought.steps.append("感情の受け取り: 述語を組み替り返す")
     if not claims:
-        from ..ground.evidence import lexical_claims, exact_definition
+        # 辞書の情報（読み・拍・品詞）は、*語そのものを尋ねる質問* の場合にだけ使います。
+        # 「今日のニュースは？」に拍数を返すのが v3 の事故だったので、ここでは門番を通す。
+        from ..ground.evidence import exact_definition
+        from ..mind.parse import wants_word_info
 
-        # 話題名そのものの定義が引けるときは、それを確からしく使う
-        claims.extend(lexical_claims(frame, limit=3))
-        # 手元で話せる話題は、語の分析を返すときでも必ず添える（探索の案内役）。
+        if wants_word_info(text, frame):
+            claims.extend(lexical_claims(frame, limit=3))
         have = {str(c.content) for c in claims}
         extra = [x for x in suggestion_claims(text, kb=kb) if str(x.content) not in have]
         claims.extend(extra)
@@ -731,7 +750,11 @@ def think(text: str, *, history: list[dict] | None = None, kb=None, web=None, lm
 
     # 話題そのものを踏んだ記述（道具层の答え・検索・KB の本文）が 1 つも無いなら、
     # 索引から数えられる事実で一手足す。ターンごとに手が変わるので同じ相槌を返さない。
-    if not disclosed and frame.ask not in ("translation", "code", "compute") \
+    from ..mind.parse import wants_word_info as _wants_word_info
+
+    _lex_ok = _wants_word_info(text, frame) or frame.ask in ("reading", "word_property",
+                                                              "synonym", "antonym", "word_list")
+    if not disclosed and _lex_ok and frame.ask not in ("translation", "code", "compute") \
             and not any(str(c.source).startswith(("tool", "web", "session")) or
                         ("kb" in str(c.source) and topic_key and topic_key in str(c.content))
                         for c in claims):

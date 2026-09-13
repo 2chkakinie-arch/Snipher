@@ -36,6 +36,19 @@ _PARTICLES = {"を", "は", "が", "に", "で", "と", "も", "の", "から", 
 # --------------------------------------------------------------------------- #
 # 問いの「主体」を読む（frame.topic が語彙の断片を拾ったときの補正）
 # --------------------------------------------------------------------------- #
+_PAREN_NOTE = re.compile(r"[（(][^（()）]{1,24}[）)]")
+
+
+def strip_parenthetical(text: str) -> str:
+    """「WebAssembly（Wasm）をブラウザで」から括弧注記を落として *語だけ* にする。
+
+    ここが残っていると「WebAssembly(」が話題名になり、索引を引き損ねて
+    辞書情報に逃げる（v3 が語彙ゴミを返した原因の一片）。
+    """
+    out = _PAREN_NOTE.sub("", str(text or ""))
+    return re.sub(r"[（(）)\s]+$", "", out).strip(" 、。・")
+
+
 def question_subject(question: str) -> str:
     """「質問：WebAssembly（Wasm）をブラウザで…」→ WebAssembly のように主体を取る。"""
     q = str(question or "").strip()
@@ -43,17 +56,17 @@ def question_subject(question: str) -> str:
     m = re.match(r"^[「『\"']?([^「」『』\"'？?をはがにでと]{2,28}?)[」』\"']?\s*"
                  r"(?:とは|って何|とは何|を|は|が|に|で|の|って|についての|について)", body)
     if m:
-        cand = m.group(1).strip(" 　、,")
+        cand = strip_parenthetical(m.group(1))
         if cand and cand not in _PARTICLES:
             return cand
     m_what = re.search(r"([^\n「」『』？?]{2,24}?)\s*(?:とは|って)\s*(?:何|なん|どういう)", body)
     if m_what:
-        cand = m_what.group(1).strip(" 　、,。をはがにでとも")
+        cand = strip_parenthetical(m_what.group(1)).strip(" 　、,。をはがにでとも")
         if len(cand) >= 2:
             return cand
     m2 = re.search(r"([A-Za-z][A-Za-z0-9.+#_\-]{2,})", body)
     if m2:
-        return m2.group(1)
+        return strip_parenthetical(m2.group(1))
     m3 = re.search(r"([ァ-ヶー一-龯]{2,10})", body)
     return m3.group(1) if m3 else body[:12]
 
@@ -185,93 +198,141 @@ def _relevant(claim: Claim, question: str, subject: str) -> bool:
 # --------------------------------------------------------------------------- #
 # 材料が薄いときの手（数えられる事実だけ）
 # --------------------------------------------------------------------------- #
+def _ask_frame(question: str) -> str:
+    """問いの切り口を 1 つに絞る（答えの組み立て方を変えるための材料）。"""
+    q = normalize(question)
+    for pat, label in (("(メリット|利点|長所|何がよく|どこがよく|よさは)", "merit"),
+                       ("(デメリット|短所|欠点|弱点|problem)", "demerit"),
+                       ("(作り方|手順|どうや|やり方|方法|設定の仕方)", "how"),
+                       ("(なぜ|理由|どうして|しくみ|仕組み)", "why"),
+                       ("(比較|違い|どっち|どちら)", "compare"),
+                       ("(いつ|時期|何年)", "when"),
+                       ("(いくら|値段|費用|コスト)", "cost")):
+        if re.search(pat, q):
+            return label
+    return "general"
+
+
+_INFER: dict[str, tuple[str, ...]] = {
+    "merit": ("得をするのは、上の記述が揃う場面を先に選べるところです。",
+              "いちばん効くのは、準備の順を固定できるところだと上の記述から言えます。"),
+    "demerit": ("損が出るのは、上の条件が揃わないまま進めたときです。",
+                "上の記述を逆に読むと、崩れやすい場所が見えてきます。"),
+    "how": ("進め方は、上の記述の順をそのまま手順にすると安定します。",
+            "手順は、上の記述のうち先に決まるものから順に潰します。"),
+    "why": ("理由は、上の記述が成立する条件を並べると見えてきます。",
+            "なぜそうなるかは、上の手前側の条件をたどると説明がつきます。"),
+    "compare": ("比べるなら、上の記述で揃っている条件と揃っていない条件を分けるのが速いです。",
+                "差が出るのは、上の記述のうち運用コストが絡む部分です。"),
+    "when": ("時期は、上の記述で先に決まる条件を基準にすると絞り込めます。",),
+    "cost": ("費用は、上の記述のうち人が動く部分がどこかで見積もれます。",),
+    "general": ("上の記述を合わせると、決めるべき点は 1 つに絞れます。",
+                "ここまでを材料にすると、次に見る場所が決まります。"),
+}
+
+
 def fallback_claims(question: str, frame, *, subject: str, web=None, kb=None,
                     notes: list[str] | None = None, tried: bool = False,
                     dossier=None) -> list[Claim]:
-    """問いの語そのものについて、*確かめられること* だけを並べる。"""
-    notes = notes if notes is not None else []
-    b = lex.bank()
-    words: list[str] = []
-    for ent in getattr(frame, "entities", [])[:6]:
-        w = str(ent.surface or "").strip()
-        if not w or w in _PARTICLES or len(w) < 2 or w in words:
-            continue
-        words.append(w)
-    if subject and subject not in words:
-        words.insert(0, subject)
-    known: list[str] = []
-    unknown: list[str] = []
-    whole = normalize(question or "")
-    for w in words[:6]:
-        if any(w != o and w in o for o in words):
-            continue                       # 別の語の断片（「ブラウザ」の中の「ブラ」）は材料にしない
-        if w and not _stands_alone(w, whole):
-            continue                       # 長い語の一部（「ブラウザ」の「ブラ」）は語として立たない
-        if re.fullmatch(r"[ぁ-ん]{1,3}", w):
-            continue                       # かな 1〜3 文字は語として立たない
-        if b.has(w):
-            pos = str(b.pos(w) or "")
-            if pos.split("/")[0] in ("動詞", "形容詞", "副詞", "助詞", "助動詞", "接続詞"):
-                continue                   # 問いの中の動詞の辞書情報は答えにならない
-            known.append(w)
-        else:
-            unknown.append(w)
+    """材料が薄いときの埋め方。*できない話で止めず*、近い記述から推理して組みます。
 
+    v3 までは「語彙バンクに無い語です」「検索に出られないので埋めません」と並べて
+    会話を止めていました。いまは (1) 発話が踏んでいる語を索引から引いて本文を出し、
+    (2) その本文を材料にした推論の 1 文を必ず添えます。
+    """
+    notes = notes if notes is not None else []
     out: list[Claim] = []
-    if unknown:
-        bits = "・".join(unknown[:3]).replace(" ", "")
-        out.append(Claim(kind="note",
-                         content=f"問われている {bits} は、手元の語彙バンク "
-                                 f"{b.stats()['words']:,} 語の見出しには無い語です。",
-                         subject=subject, source="lex", weight=0.6))
-    if known:
-        w = known[0]
-        read = b.reading(w) or to_hiragana(w)
-        out.append(Claim(kind="lexical",
-                         content=f"「{w}」は見出しにあって、読みは「{read}」・"
-                                 f"{mora_count(read or w)} 拍・品詞 {b.pos(w) or '不明'}です。",
-                         subject=w, source="lex", weight=0.55))
-    tried = bool(tried or getattr(frame, "flags", {}).get("web_tried"))
-    available = False
-    if web is not None:
-        try:
-            available = bool(web.available())
-        except Exception:  # noqa: BLE001
-            available = False
-    if available and not tried:
-        out.append(Claim(kind="note",
-                         content="検索は使える設定なので、裏取りに出れば出典つきの記述を"
-                                 "持ってこられます。",
-                         source="local:meta", weight=0.56))
-    elif tried:
-        out.append(Claim(kind="note",
-                         content="検索には出ましたが、証拠にできる文は取れませんでした。",
-                         source="local:meta", weight=0.56))
-    if tried and getattr(dossier, "sources", None):
-        out.append(Claim(kind="note",
-                         content=f"取れた出典は {len(dossier.sources)} 件なので、"
-                                 "そこを起点に本文を読み直します。",
-                         source="local:meta", weight=0.54))
-    else:
-        out.append(Claim(kind="note",
-                         content="この設定ではウェブ検索に出られないので、推測で語義は埋めません。",
-                         source="local:meta", weight=0.56))
+    text = f"{subject or ''} {question}"
+    items: list[dict] = []
     if kb is not None:
         try:
-            near = [x for x in kb.suggest(question, top_k=3) if x]
+            from ..mind.chat import topic_items
+
+            items = topic_items(text, kb=kb, limit=3, min_score=0.36)
         except Exception:  # noqa: BLE001
-            near = []
-        if near:
-            out.append(Claim(kind="note",
-                             content=f"手元の知識ベースで近い話題は {'、'.join('「' + x + '」' for x in near[:3])} "
-                                     f"なので、そこなら定義も理由も本文から引けます。",
-                             source="local:kb", weight=0.52))
-    out.append(Claim(kind="ask",
-                     content=f"{subject or 'この語'}について、どの切り口（意味・利点・手順・比較・値段）が"
-                             "必要かを一言もらえれば、その欄を狙って組み立てます。",
+            items = []
+    used: list[str] = []
+    for it in items:
+        for line in _kb_lines(it):
+            if line and line not in used:
+                used.append(line)
+            if len(used) >= 3:
+                break
+        if len(used) >= 3:
+            break
+    for line in used:
+        out.append(Claim(kind="fact", content=line, subject=subject, source="local:kb",
+                         weight=0.84, extra={"via": "fallback:kb"}))
+    if used:
+        pool = _INFER.get(_ask_frame(question)) or _INFER["general"]
+        infer = pool[len(used) % len(pool)]
+        out.append(Claim(kind="inference", content=infer, subject=subject, source="local:infer",
+                         weight=0.62))
+        notes.append("材料が薄い: 近い記述を引いて推論の 1 文を添えた")
+        return out
+
+    # 索引にも無い語のときも、問いの語を割り直して答えにいく（辞書の語彙情報は出さない）
+    rebuilt = _recompose_from_words(question, kb=kb)
+    if rebuilt:
+        out.extend(rebuilt)
+        notes.append("材料が薄い: 発話の語を割り直して本文を引いた")
+        return out
+    out.append(Claim(kind="note",
+                     content=f"{subject or 'その話'}は、こちらの扱う範囲の語に割り直して組み立てます。",
                      subject=subject, source="local:meta", weight=0.5))
-    notes.append("材料が薄い: 問いの語について数えられる事実を出した")
+    out.append(Claim(kind="ask",
+                     content=f"{subject or 'この語'}について、どの切り口（意味・利点・手順・比較）で"                             "必要かを一言もらえれば、その形に組み替えます。",
+                     subject=subject, source="local:meta", weight=0.48))
+    notes.append("材料が薄い: 問いの形を数え直して切り口を聞いた")
     return out
+
+
+def _kb_lines(item: dict) -> list[str]:
+    """1 話題から使える本文を順に（辞書の語彙情報は除外）。"""
+    pool = [str(item.get("def") or "").strip()]
+    pool += [str(x).strip() for x in (item.get("facts") or [])]
+    pool += [str(x).strip() for x in (item.get("why") or [])]
+    pool += [str(x).strip() for x in (item.get("tips") or [])]
+    out: list[str] = []
+    for line in pool:
+        if not (12 <= len(line) <= 120) or not line.endswith(("。", "！", "？")):
+            continue
+        if re.search(r"(拍|索引|品詞|読みは|U\+)", line):
+            continue
+        out.append(line)
+    return out
+
+
+def _recompose_from_words(question: str, *, kb) -> list[Claim]:
+    """発話を構成語に割って、それぞれの本文から 1 文ずつ拾う（知らない語のときの組み方）。"""
+    if kb is None:
+        return []
+    words = [w for w in re.findall(r"[ァ-ヶー一-龯]{2,6}|[A-Za-z][A-Za-z0-9+#_.\-]{2,}",
+                                   normalize(question))
+             if w not in _PARTICLES_SET]
+    out: list[Claim] = []
+    seen: set[str] = set()
+    for w in words:
+        try:
+            item = kb.exact_topic(w) or {}
+        except Exception:  # noqa: BLE001
+            item = {}
+        head = str(item.get("def") or "").strip()
+        if not head or head in seen:
+            continue
+        seen.add(head)
+        out.append(Claim(kind="fact", content=head, subject=w, source="local:kb", weight=0.78,
+                         extra={"via": f"recompose:{w}"}))
+        if len(out) >= 2:
+            break
+    if out:
+        out.append(Claim(kind="inference",
+                         content="割り直した語の記述を合わせると、問いの中心は上の 1 文に収まります。",
+                         source="local:infer", weight=0.6))
+    return out
+
+
+_PARTICLES_SET = set("はがをにでとものやへかのにやねよみなますだれたてもとだけもし")
 
 
 # --------------------------------------------------------------------------- #
@@ -409,6 +470,22 @@ def answer(d: "Directive", *, kb=None, web=None, history=None, lm=None, core=Non
     styled, fixes = restyle("\n".join(body), tone=tone, register=register)
     notes.extend(fixes)
     body = [x for x in styled.split("\n") if x.strip()]
+
+    # 口調の整形で文が伸びるので、*整形後* に字数契約を数え直す（指定は厳守）
+    limit = max(target or 0, hard or 0)
+    if limit and len(body) > 2 and count_chars("\n".join(body)) > int(limit * 1.2):
+        room = int(limit * 1.15)
+        kept = [body[0]]
+        used = count_chars(body[0])
+        for i, sent in enumerate(body[1:], start=1):
+            n = count_chars(sent)
+            if used + n > room and len(kept) >= 2:
+                continue
+            kept.append(sent)
+            used += n
+        if len(kept) < len(body):
+            notes.append(f"length: 整形後の {limit} 字契約に合わせて {len(body) - len(kept)} 文落とした")
+        body = kept
 
     if bullets:
         if fmt.numbered:

@@ -78,6 +78,8 @@ QTYPE_PATTERNS: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("where", ("どこ", "何処", "場所", "どのあたり", "どこで")),
     ("who", ("だれ", "誰", "どの人", "何人")),
     ("cost", ("いくら", "値段", "価格", "費用", "料金", "コスト", "何円")),
+    ("pros_cons", ("メリット", "デメリット", "利点", "短所", "長所", "欠点", "弱点", "強み",
+                   "弱み", "欠所", "よさ", "どこが良い", "何が悪い", "何がダメ")),
     ("opinion", ("好き", "嫌い", "おすすめ", "どう思う", "感想", "どんな感じ", "おいしい",
                  "美味しい", "楽しい", "興味", "推し")),
     ("count", ("いくつ", "何個", "何種類", "何匹", "何本")),
@@ -131,6 +133,10 @@ def question_type(text: str) -> str:
     if t.rstrip().endswith(("?", "？")):
         return "general_q"
     return "general"
+
+
+_QUESTIONISH = re.compile(r"(\?|？|ですか|ですかね|ますか|とは|って何|どう|なぜ|いくら|いつ|どこ|何|方法|"
+                          r"手順|使い方|つくり方|作り方|メリット|デメリット|違い|比較|おすすめ)")
 
 
 def bigrams(text: str) -> set[str]:
@@ -701,6 +707,29 @@ class KnowledgeBase:
             if qa_hit is not None:
                 return qa_hit[1], "qa"
             return first(item.get("facts")), "fact"
+        if qtype == "pros_cons":
+            marks = ("メリット", "デメリット", "利点", "短所", "長所", "欠点", "弱点", "強み", "弱み",
+                     "速い", "遅い", "向い", "向か", "苦手")
+            pairs = item.get("qa") or []
+            best = ""
+            for q, a in (list(pairs) if isinstance(pairs, list) else []):
+                try:
+                    qq, aa = str(q), str(a)
+                except Exception:  # noqa: BLE001
+                    continue
+                if any(m in qq for m in marks) and any(m in query for m in marks):
+                    best = aa.strip()
+                    break
+            if best:
+                return best, "qa"
+            t2 = first(item.get("tips"))
+            if t2:
+                return t2, "tips"
+            t3 = first(item.get("opinion"))
+            if t3:
+                return t3, "opinion"
+            t4 = first(item.get("def"))
+            return (t4, "def") if t4 else (first(item.get("facts")), "fact")
         if qtype == "why":
             if item.get("why"):
                 return first(item.get("why")), "why"
@@ -809,6 +838,7 @@ class KnowledgeBase:
             if h.get("topic_hit") and (float(h["score"]) >= min_score):
                 cov = float(h.get("coverage", 0.0))
                 covered_n = int(h.get("covered_n", 0))
+                item0 = h.get("item") or {}
                 # 話題名が実際に発話に出ていて、かつ発話の内容語の多くがその話題のもの
                 # であること。未知語（ゾルタクス等）が混ざる発話を別話題の定義で
                 # 答えてしまわないよう、内容語が多いときは被覆率を必ず見ます。
@@ -821,6 +851,24 @@ class KnowledgeBase:
                 if int(h.get("covered_n", 0)) >= 2 and float(h.get("coverage", 0.0)) >= min_cov:
                     strong_hit = h
                     break
+        if strong_hit is None and _QUESTIONISH.search(normalized_query):
+            # 質問の形で *話題名そのもの* を踏んでいるなら、被覆率が低くてもその話題の質問です
+            # （「WebAssembly をブラウザで動かすメリット」は WebAssembly の話）。長い名前を優先するので、
+            # 「観葉植物」と「植物」が競合ときは詳しい側を選びます。
+            best: tuple[int, dict] | None = None
+            for h in hits:
+                item0 = h.get("item") or {}
+                name = str(item0.get("topic") or "")
+                if len(name) < 3 or not h.get("topic_hit"):
+                    continue
+                if float(h.get("score") or 0.0) < 0.5:
+                    continue
+                if name.lower() not in normalized_query.lower():
+                    continue
+                if best is None or len(name) > best[0]:
+                    best = (len(name), h)
+            if best is not None:
+                strong_hit = best[1]
         if strong_hit is not None:
             chosen = dict(strong_hit)
             chosen["via"] = "word"

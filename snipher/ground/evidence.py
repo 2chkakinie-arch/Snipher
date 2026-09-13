@@ -393,10 +393,26 @@ def suggestion_claims(text: str, *, kb) -> list[Claim]:
         names = [str(x) for x in (kb.suggest(text, top_k=3) or []) if x]
     except Exception:  # noqa: BLE001
         names = []
-    if names:
+    if not names:
+        return out
+    # 話題名の羅列（「〜のあたりを話せます」）は *何も答えていない* ので、
+    # 近い話題の本文を 1 文引いて返します。本文が無いときだけ名前を添えます。
+    for name in names[:3]:
+        try:
+            item = kb.exact_topic(name) or {}
+        except Exception:  # noqa: BLE001
+            item = {}
+        body = str(item.get("def") or "").strip()
+        if len(body) < 10:
+            continue
+        out.append(Claim(kind="fact", content=body if body.endswith("。") else body + "。",
+                         subject=name, source="local:kb", weight=0.6,
+                         extra={"suggest": name, "coverage": 0.5}))
+        break
+    if not out:
         out.append(Claim(kind="note",
-                         content=f"手元では「{'」「'.join(names[:3])}」のあたりを話せます。",
-                         source="local:kb", weight=0.62, extra={"suggest": names[:3]}))
+                         content=f"手元の索引には {'・'.join(names[:3])} の記述があります。",
+                         source="local:kb", weight=0.5, extra={"suggest": names[:3]}))
     return out
 
 
@@ -435,10 +451,14 @@ def _compound_claims(head: str, *, kb, frame) -> tuple[list[Claim], dict]:
         field, body = "def", str(item.get("def")).strip()
     if not body:
         return out, meta
-    out.append(Claim(kind="note",
-                     content=f"「{head}」は単独の項目を持っていないので、構成語「{topic}」の知識で答えます。",
-                     subject=head, source="local:kb", weight=0.52,
-                     extra={"hypernym": topic, "surface": head}))
+    if head == topic:
+        return out, meta
+    _is_japanese_word = bool(re.search(r"[ぁ-ん一-龯]", head))
+    if _is_japanese_word:      # 複合語を借りた事実だけを明示する（欧文語では発火させない）
+        out.append(Claim(kind="note",
+                         content=f"「{head}」は単独の項目を持っていないので、構成語「{topic}」の知識で答えます。",
+                         subject=head, source="local:kb", weight=0.52,
+                         extra={"hypernym": topic, "surface": head}))
     out.append(Claim(kind=_kind_for_field(field), content=body if body.endswith("。") else body + "。",
                      subject=topic, source="local:kb", slot=field, weight=0.66,
                      extra={"coverage": 0.5, "via": f"compound:{matched}"}))
@@ -541,7 +561,11 @@ def gather(frame, *, kb=None, web: WebGrounding | None = None,
             if not any(k.content == c.content for k in d.claims):
                 d.claims.append(c)
 
-    lex_claims = [] if d.coverage >= 0.5 else lexical_claims(frame)
+    # 辞書情報（表記・読み・拍・品詞）は、語そのものを尋ねる発話にだけ使います。
+    # 話題の質問に辞書引きで答えるのが v3 の最大の欠点だったので、ここで門番を通します。
+    from ..mind.parse import wants_word_info
+
+    lex_claims = [] if d.coverage >= 0.5 or not wants_word_info(q, frame) else lexical_claims(frame)
     if lex_claims:
         d.claims.extend(lex_claims)
         if d.via == "none":

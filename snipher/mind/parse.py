@@ -383,10 +383,40 @@ def _mood(t: str) -> str:
     return "neutral"
 
 
+# --------------------------------------------------------------------------- #
+# 「語そのもの」に関する質問か（辞書情報を使って良いかの門番）
+# --------------------------------------------------------------------------- #
+_WORD_INFO_ASK = ("reading", "word_property", "synonym", "antonym", "word_list", "example")
+_WORD_INFO_MARK = re.compile(
+    r"(とは|って何|ってどんな|読み方|怎么|何と読む|なんて読む|よみ|ふりがな|読みは|読みを|"
+    r"何文字|なんもじ|何音|拍数|何拍|画数|品詞|活用|活用形|スペル|綴り|ローマ字|"
+    r"意味は|語義|ことばの意味|どんな語|どんな言葉)")
+_ANSWERED_BY_LEXICON = re.compile(r"(拍|文字数|読み|意味|語源|品詞|活用)")
+
+
+def wants_word_info(text: str, frame=None) -> bool:
+    """発話が *語そのもの* について聞いているか。
+
+    知識ベースに話題が無いとき、v3 は「読み・拍・品詞」を返して誤魔化していました。
+    語を素材として尋ねている場合だけ辞書を使い、それ以外は別の経路（検索・生成）に
+    回すための判定です。
+    """
+    t = normalize(str(text or ""))
+    if frame is not None and str(getattr(frame, "ask", "") or "") in _WORD_INFO_ASK:
+        return True
+    head = t.strip("。！？!?、 ")
+    if len(head) > 34:            # 長い文は語彙の質問ではなく *内容* の質問
+        return False
+    if not _WORD_INFO_MARK.search(head):
+        return False
+    # 「天気とは」のように語が既 knowledge に在る場合は、そちらを先に使う（呼び出し側の役目）
+    return bool(_ANSWERED_BY_LEXICON.search(head) or re.search(r"(とは|って何|読み|拍|品詞|活用)", head))
+
+
 def short(text: str, limit: int = 24) -> str:
     t = normalize(text)
     return t if len(t) <= limit else t[:limit] + "…"
 
 
 __all__ = ["build_frame", "classify_ask", "detect_act", "extract_entities", "opaque_reason",
-           "short", "ASK_KINDS", "turn_word"]
+           "short", "ASK_KINDS", "turn_word", "wants_word_info"]
