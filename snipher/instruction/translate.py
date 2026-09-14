@@ -802,4 +802,45 @@ def translate(source: str, target: str = "en") -> tuple[str, list[str]]:
     return to_japanese(src) if not _JP_CHAR.search(src) else to_english(src)
 
 
-__all__ = ["translate", "to_english", "to_japanese", "is_translation_request", "detect_target"]
+__all__ = ["translate", "to_english", "to_japanese", "is_translation_request", "detect_target",
+           "words_en"]
+
+
+# --------------------------------------------------------------------------- #
+# 語の写し（語だけを英語にする）
+# --------------------------------------------------------------------------- #
+_ARTICLE = re.compile(r"^(?:a|an|the|some)\s+", re.IGNORECASE)
+
+
+def _bare_en(gloss: str) -> str:
+    """対応表の語を、並べられる形にする（"a dog" → "dog"）。"""
+    return _ARTICLE.sub("", str(gloss or "").strip()).strip()
+
+
+def words_en(words: list[str]) -> list[str]:
+    """語の並びを英語に写す（対応表にある語だけ。無い語は落として呼び手に伝える）。
+
+    「犬と猫」→ ["dog", "cat"] のように、*語彙の対応表そのもの* を使います。
+    文型の組み替え（to_english）は述語のある文のためで、こちらは名詞の並び用です。
+    """
+    out: list[str] = []
+    for w in words or []:
+        key = str(w or "").strip().strip("「」『』 　")
+        if not key:
+            continue
+        gloss = _JA_WORDS.get(key)
+        if not gloss and key in _VERBS:
+            gloss = _VERBS[key][0]
+        if not gloss:
+            # 辞書の見出し（活用形 → 原形）でも引く
+            try:
+                from ..lang import lex as _lex
+
+                entry = _lex.lookup(key)
+                base = str((entry or {}).get("dictform") or "")
+                gloss = _JA_WORDS.get(base) or ((_VERBS.get(base) or ("",))[0])
+            except Exception:  # noqa: BLE001
+                gloss = ""
+        if gloss:
+            out.append(_bare_en(gloss))
+    return out

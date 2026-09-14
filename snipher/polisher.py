@@ -35,8 +35,12 @@ class Polisher:
         self._adj_by_surface = {a["s"]: a for a in self.lex.adjectives}
 
     # ------------------------------------------------------------------ #
-    def polish(self, text: str, register: str = "polite") -> dict:
-        """text を修理する。→ {"text": str, "fixes": [ルール名, ...]}"""
+    def polish(self, text: str, register: str = "polite", *, bare: bool = False) -> dict:
+        """text を修理する。→ {"text": str, "fixes": [ルール名, ...]}
+
+        `bare=True` は「答えだけをそのまま返す」指定（数字だけ／1 語だけ等）のとき。
+        文末の句点補完と敬体化は行いません（"8" を "8。" にすると指定した形ではなくなる）。
+        """
         original = text
         fixes: list[str] = []
         if not text or not text.strip():
@@ -60,11 +64,12 @@ class Polisher:
         text = self._fix_verb_masu(text, fixes)
 
         # 3/5. 丁寧体ターゲットなら文末の「だ。」を「です。」に
-        if register == "polite":
+        if register == "polite" and not bare:
             text = self._fix_polite_ending(text, fixes)
 
-        # 1/6. 文末の句点補完
-        text = self._fix_terminal_punct(text, fixes)
+        # 1/6. 文末の句点補完（形を指定された答えには足さない）
+        if not bare:
+            text = self._fix_terminal_punct(text, fixes)
 
         # 7. 日本語と英数字のあいだの空白（技術系の文の読みやすさ）
         text = self._fix_ascii_spacing(text, fixes)

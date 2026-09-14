@@ -24,6 +24,47 @@ from .tasks import TaskRouter
 
 _RULE_CONFIDENCE = 0.95
 
+#: 「今・明日の事実」を尋ねる形（天気・株価・ニュース…）。会話テーブル（「良い天気だと
+#: 散歩にも行きたくなりますね。」）で答えると、事実を確かめずに断定したことになります。
+_REALTIME_FACT = re.compile(
+    r"(?:今日|きょう|明日|あした|明後日|昨日|今|現在|いま|最新|本日)[^。！？]{0,8}?"
+    r"(天気|天気予報|予報|気温|降水確率|株価|為替|相場|ニュース|試合の結果|為替レート)")
+
+#: 分野ごとの *一次情報*（次の一手）。事実ではなく「どこで確かめるか」の案内。
+_REALTIME_SOURCES = {
+    "天気": "気象庁の予報と、お住まいの市区町村の防災ページ",
+    "天気予報": "気象庁の予報と、お住まいの市区町村の防災ページ",
+    "予報": "気象庁の予報と、お住まいの市区町村の防災ページ",
+    "気温": "気象庁の観測値と予報",
+    "降水確率": "気象庁の予報",
+    "株価": "取引所・証券会社の公式ページ",
+    "為替": "銀行・取引所の公式レート",
+    "為替レート": "銀行・取引所の公式レート",
+    "相場": "取引所の公式ページ",
+    "ニュース": "報道機関の一次記事と公式発表",
+    "試合の結果": "主催団体の公式結果",
+}
+
+
+def realtime_fact_answer(text: str) -> str:
+    """今・明日の事実を尋ねられたときの正直な返し（記録が無い＋どこで確かめるか）。"""
+    raw = str(text or "")
+    m = _REALTIME_FACT.search(raw)
+    if not m:
+        return ""
+    # *値* を尋ねているときだけ。雑談（「今日はいい天気だね」）は相槌のままでよい。
+    tail = raw.strip().rstrip("。！!？? 　")
+    asks = bool(raw.strip().endswith(("?", "？"))) \
+        or bool(re.search(r"(?:ですか|でしょうか|ますか|教えて|どうなる|どう？|だっけ)", raw)) \
+        or bool(re.search(r"(?:天気|天気予報|予報|気温|降水確率|株価|為替|相場|ニュース|試合の結果)$", tail))
+    if not asks:
+        return ""
+    what = m.group(1)
+    src = _REALTIME_SOURCES.get(what, "一次情報のページ")
+    return (f"今の{what}は手元に記録がありません（数時間で変わるので、覚えている値を"
+            f"答えると外れます）。確かめるなら{src}が確実です。場所や名前を教えてもらえれば、"
+            f"見るページを絞ります。")
+
 # 普通体(タメ口)判定の目安。応答は常に丁寧体で返すが、解析の参考にする。
 _CASUAL_MARKS = ("だね", "だよ", "じゃん", "だろ", "だな", "わかん", "めっちゃ", "超")
 
@@ -76,6 +117,14 @@ class Responder:
                 "use_generator": False,
                 "task": task.as_dict(),
             }
+
+        # 0') 「今・明日の事実」の質問は、会話テーブルの相槌で答えない。
+        real = realtime_fact_answer(text)
+        if real:
+            return {"text": real, "base_text": real, "intent": "realtime",
+                    "topic": topic, "confidence": 0.6, "use_generator": False,
+                    "task": {"kind": "realtime", "verified": True,
+                             "metadata": {"topic": topic, "source_hint": True}}}
 
         # 1) キーワード一致の意図テーブル
         for intent in self.intents:

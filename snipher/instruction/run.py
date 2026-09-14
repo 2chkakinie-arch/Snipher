@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import json
 import re
+from pathlib import Path
 
 from . import answer as _answer
 from . import code as _code
@@ -22,6 +23,9 @@ from . import extract as _extract
 from . import summarize as _summarize
 from .parser import Directive, parse
 from .style import count_chars, is_predicate_end
+
+#: 同梱データの置き場（礼の表現集など、実行時に読む小さな語彙）
+_DATA_DIR = Path(__file__).resolve().parents[1] / "data"
 
 CAN_NOT_SAY = ("できません", "出来ません", "分かりません", "わかりません", "回答でき",
                "答えられ", "対応しておりません", "持ち合わせて", "学習されてい",
@@ -406,7 +410,15 @@ def _core_answer(body: str) -> str:
     cand = re.sub(r"[、,・\s]+.*$", "", cand)
     if re.fullmatch(r"[一-龯ァ-ヶーA-Za-z0-9．.]{1,12}", cand):
         return cand
-    return ""
+    # 1 語に落とせないときは、定義文の核（「Xは…な Y です」→「…な Y です。」）を使う。
+    # 長い説明を「一言で」と言われて丸ごと返すのを防ぐ（材料は元の文のまま）。
+    try:
+        from ..solve import jp as _jp
+
+        core = _jp.definition_core(body)
+    except Exception:  # noqa: BLE001
+        core = ""
+    return core
 
 
 def _do_answer(d: Directive, *, kb=None, web=None, history=None, lm=None, core=None,
@@ -770,9 +782,38 @@ def _compose_document(d: Directive) -> dict:
             "meta": {"artifact": kind, "purpose": purpose, "audience": audience or None}}
 
 
+#: 「短文」「一言」「紹介文」のような *短い一枚* の依頼（文書テンプレートに渡さない）
+_SHORT_ART = re.compile(r"短文|一言|ひとこと|一行|キャッチコピー|見出し|タイトル|"
+                        r"紹介文|説明文|(?:[0-9０-９]+|[一二三四五六七八九十]+)\s*(?:文字|字)\s*(?:以内|以下|程度|で)")
+
+
+_QUOTED_TOPIC = re.compile(r"""[「『"']([^「」『』"']{1,24})[」』"']\s*(?:について|に関する|の)""")
+
+
+def _quoted_topic(raw: str) -> str:
+    """「〜について」の直前に引用符で差し出された話題を読む（「猫」についての短文 → 猫）。"""
+    m = _QUOTED_TOPIC.search(str(raw or ""))
+    return m.group(1).strip() if m else ""
+
+
 def _do_write(d: Directive, *, history=None, kb=None, web=None, lm=None, core=None,
               turn: int = 0) -> dict:
     raw = str(d.raw or "")
+    # 「〜についての短文を N 文字以内で」は *文書* ではなく短い一文の依頼。材料
+    # （知識ベースの定義・事実）から、字数に収まる一文だけを組み立てます。
+    limit = int(d.fmt.max_chars or 0) or int(d.fmt.target_chars or 0)
+    if _SHORT_ART.search(raw) and limit and not _DOC_ARTIFACT.search(raw):
+        from ..solve import jp as _jp
+
+        topic = _quoted_topic(raw) or topic_from_instruction(d.instruction or raw)
+        if topic:
+            sol = _jp.short_text(topic, max_chars=max(limit, 6), kb=kb, lm=lm)
+            if sol is not None:
+                return {"text": sol.answer, "confidence": 0.88, "kind": "short",
+                        "verified": bool(sol.verified), "notes": list(sol.steps or []),
+                        "topic": topic, "chars": len(sol.answer)}
+        return {"text": "", "confidence": 0.0, "verified": False,
+                "notes": [f"短文: 「{topic or raw[:12]}」について、字数に収まる材料が無い"]}
     # 続きを書く系は文書テンプレートではなく物語の続きとして扱う
     payload = str(d.payload or "").strip()
     instr = str(d.instruction or raw)
@@ -817,7 +858,7 @@ def _do_write(d: Directive, *, history=None, kb=None, web=None, lm=None, core=No
         seed = len(str(history or "")) % 997
         body, genre, meta = _write(raw, seed=seed)
         return {"text": body, "confidence": 0.88, "genre": genre, "meta": meta}
-    if _DOC_ARTIFACT.search(raw) or not _FICTION_WORD.search(raw):
+    if _DOC_ARTIFACT.search(raw):
         # 「メールを作って」「記事を書いて」は *業務の文書*（物語生成器には渡さない）
         got = _compose_document(d)
         if got.get("text"):
@@ -910,6 +951,223 @@ def _do_classify(d: Directive) -> dict:
     text = "\n".join(lines)
     return {"text": text, "items": items, "cats": cats, "confidence": 0.92, "notes": ["分類: 指示のカテゴリで割り振りました"]}
 
+# --------------------------------------------------------------------------- #
+# 言葉の仕事（空欄補充・かな書き・選択・語の関係・語の写し・論理・礼）
+# --------------------------------------------------------------------------- #
+def _do_fill(d: Directive, *, lm=None) -> dict:
+    """空欄に入る助詞を 1 つだけ返す（5-gram の審判つき）。"""
+    from ..solve import jp as _jp
+
+    sol = _jp.fill_particle(d.raw, lm=lm)
+    if sol is None:
+        return {"text": "", "confidence": 0.0, "verified": False,
+                "notes": ["空欄補充: 材料（空欄を含む文）か審判（5-gram）が無い"]}
+    # 「1 文字で」は形そのものの指定。助詞 1 字だけを返す（飾りを付けない）。
+    return {"text": sol.answer, "confidence": 0.86 if sol.verified else 0.6, "kind": "fill",
+            "verified": bool(sol.verified), "answer": sol.answer,
+            "candidates": (sol.detail or {}).get("candidates"),
+            "notes": list(sol.steps or [])}
+
+
+def _do_kana(d: Directive) -> dict:
+    """かな書き（山羊 → やぎ／りんご → リンゴ）。読みは実辞書から引く。"""
+    from ..solve import jp as _jp
+
+    job = getattr(d, "job", None)
+    word = (getattr(job, "word", "") or "").strip() or (d.payload or "")
+    sol = _jp.kana_write(str(d.raw or ""), kind="")
+    if sol is None or (word and sol.answer == word):
+        # 読みが引けない語は書き換えない（同じ字を「書き換えました」と言わない）
+        return {"text": "", "confidence": 0.0, "verified": False,
+                "notes": [f"かな書き: 実辞書に「{word or '対象の語'}」の読みが無い"]}
+    return {"text": sol.answer, "confidence": 0.94, "kind": "kana",
+            "verified": bool(sol.verified), "notes": list(sol.steps or []),
+            "reading": (sol.detail or {}).get("reading")}
+
+
+def _do_select(d: Directive, *, kb=None) -> dict:
+    """「〜の中から〈カテゴリ〉だけ」を、材料の分類だけで決める。"""
+    from ..solve import jp as _jp
+
+    sol = _jp.select_items(d.raw, kb=kb)
+    if sol is None:
+        return {"text": "", "confidence": 0.0, "verified": False,
+                "notes": ["選択: 材料（語の並びとカテゴリ）が読めない"]}
+    return {"text": "、".join(sol.detail.get("chosen") or []), "confidence": 0.9,
+            "kind": "select", "verified": bool(sol.verified),
+            "items": sol.detail.get("chosen"), "why": sol.detail.get("why"),
+            "notes": list(sol.steps or [])}
+
+
+def _do_relations(d: Directive) -> dict:
+    """類義語・対義語を、実データの語義（英語グロス）で引く。"""
+    from ..solve import jp as _jp
+
+    job = getattr(d, "job", None)
+    kind = "antonym" if re.search(r"対義語|反対語|反対の意味|逆の意味", str(d.raw or "")) else "synonym"
+    sol = _jp.word_relation(str(d.raw or ""), kind=kind)
+    if sol is None:
+        word = (getattr(job, "word", "") or (d.payload or "")).strip()
+        return {"text": "", "confidence": 0.0, "verified": False,
+                "notes": [f"語の関係: 実データに「{word}」の語義が無い"]}
+    return {"text": sol.answer, "confidence": 0.88, "kind": "relation",
+            "verified": bool(sol.verified),
+            "relation": kind, "notes": list(sol.steps or [])}
+
+
+def _do_gloss(d: Directive) -> dict:
+    """語の写し（犬と猫 → dog and cat）。対応表は実データの語義グロスだけ。"""
+    from . import translate as _tr
+
+    job = getattr(d, "job", None)
+    words = list(getattr(job, "items", []) or [])
+    if not words:
+        words = [x.strip() for x in re.split(r"[、,]", d.payload or "") if x.strip()]
+    pairs: list[tuple[str, str]] = []
+    missing: list[str] = []
+    for w in words[:8]:
+        out = _tr.words_en([w])
+        if out:
+            pairs.append((w, out[0]))
+        else:
+            missing.append(w)
+    if not pairs:
+        return {"text": "", "confidence": 0.0, "verified": False,
+                "notes": [f"語の写し: 対応表に無い語 {missing}"]}
+    joined = ", ".join(en for _w, en in pairs)
+    if len(pairs) == 2 and re.search(r"と|and", str(d.raw or "")):
+        joined = f"{pairs[0][1]} and {pairs[1][1]}"
+    notes = [f"{w} → {en}（対応表）" for w, en in pairs]
+    if missing:
+        notes.append(f"対応表に無い語は写せないので残した: {', '.join(missing)}")
+    return {"text": joined, "confidence": 0.9 if not missing else 0.74, "kind": "gloss",
+            "verified": not missing, "pairs": pairs, "notes": notes}
+
+
+def _do_logic(d: Directive) -> dict:
+    """前提（全称命題・規則）から結論を出す。材料の文だけで推論する。"""
+    from ..solve import logic as _logic
+
+    raw = str(d.raw or "")
+    job = getattr(d, "job", None)
+    wants_yn = bool(re.search(r"はい|いいえ", raw)) or "ますか" in raw
+    sol = _logic.syllogism(raw) if wants_yn else None
+    if sol is None:
+        sol = _logic.apply_rule(raw)
+    if sol is None:
+        sol = _logic.syllogism(raw)
+    if sol is None:
+        return {"text": "", "confidence": 0.0, "verified": False,
+                "notes": ["論理: 前提が材料の中に見つからない"]}
+    steps = list(sol.steps or [])
+    return {"text": sol.answer, "confidence": 0.9, "kind": sol.kind,
+            "verified": bool(sol.verified), "notes": steps, "detail": sol.detail,
+            "hint": getattr(job, "reason", "")}
+
+
+def _one_line(text: str, *, limit: int = 160) -> str:
+    """材料を 1 行に畳む（改行と連続空白だけを縮める。語は変えない）。"""
+    return re.sub(r"\s*\n+\s*", " ", str(text or "")).strip()[:limit]
+
+
+def _do_audit(d: Directive) -> dict:
+    """指示文と入力データの分離を点検し、材料をそのまま直した版を返す。
+
+    ここでやるのは *構造の点検* だけです（中身の足し算はしない）。指示文・入力データは
+    `jobs.split_material` がタグ／見出し語／段落から切り分け、材料は 1 字も変えずに
+    「指示 → 材料（引用）」の順に置き直します。
+    """
+    from .jobs import split_material
+
+    raw = str(d.raw or "")
+    parts = split_material(raw)
+    ins, inp = parts["instruction"], parts["input"]
+    how = parts["how"]
+    issues = list(parts["issues"])
+    if not (ins and inp):
+        return {"text": "", "confidence": 0.0, "verified": False,
+                "notes": ["点検: 指示文と入力データの切り分けが材料から読めません"]}
+
+    separated = how in ("tag", "label")
+    if separated and not issues:
+        verdict = ("判定: 指示文と入力データは分かれていて、指示は先頭にあり、材料は"
+                   "データとして読めます。指示の適用そのものは妥当です。")
+    elif separated:
+        verdict = ("判定: 指示文と入力データは分かれていますが、そのまま読ませると"
+                   "危険な箇所があります（下の問題）。")
+    else:
+        verdict = ("判定: 指示文と入力データが区切られていないため、材料の中の命令文も"
+                   "指示として読まれかねません（分離できていません）。")
+
+    if not issues:
+        issues.append("材料の区切りが弱い（引用符かタグで囲むと、指示との境目が確定します）")
+
+    fixed_label = "\n".join([
+        "修正版:",
+        f"指示: {_one_line(ins)}",
+        f"材料: 「{_one_line(inp)}」",
+    ])
+    fixed_tag = "\n".join([
+        "<instruction>",
+        _one_line(ins),
+        "</instruction>",
+        "<input>",
+        _one_line(inp),
+        "</input>",
+    ])
+    steps = [
+        f"切り分け方: {how}",
+        "材料は書き換えず、指示を先頭・材料を引用（またはタグ）で囲む形に置き直した",
+    ]
+    body = "\n".join([verdict,
+                      *[f"問題{i}: {x}" for i, x in enumerate(issues, 1)],
+                      fixed_label,
+                      "機械可読版:",
+                      fixed_tag,
+                      "この形なら、材料の中の命令文はデータとして扱われ、指示は 1 か所に集まります。"])
+    return {"text": body, "confidence": 0.86, "kind": "audit", "verified": True,
+            "notes": steps, "how": how, "issues": issues,
+            "instruction": _one_line(ins), "input": _one_line(inp)}
+
+
+#: 礼の表現（定型の語彙）。禁止語があるときは、その語を含まないものだけを使う。
+def _courtesy_lines() -> dict:
+    try:
+        data = json.loads((_DATA_DIR / "courtesy.json").read_text(encoding="utf-8"))
+    except Exception:  # noqa: BLE001
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _do_thanks(d: Directive, *, lm=None) -> dict:
+    """「ありがとう」を使わずに感謝を表す（禁止語は指示から読む）。"""
+    job = getattr(d, "job", None)
+    banned = list(getattr(job, "forbidden", []) or [])
+    lines = [str(x) for x in (_courtesy_lines().get("gratitude") or [])]
+    if not lines:
+        return {"text": "", "confidence": 0.0, "verified": False,
+                "notes": ["礼: 表現集（data/courtesy.json）が無い"]}
+    ok = [x for x in lines if not any(b in x for b in banned)]
+    if not ok:
+        return {"text": "", "confidence": 0.0, "verified": False,
+                "notes": [f"礼: 禁止語 {banned} を避けられる表現が無い"]}
+    scored: list[tuple[float, str]] = []
+    for line in ok:
+        score = 0.0
+        if lm is not None:
+            try:
+                score = float(lm.score(line).get("confidence", 0.0))
+            except Exception:  # noqa: BLE001
+                score = 0.0
+        scored.append((score, line))
+    scored.sort(key=lambda x: (-x[0], x[1]))
+    best = scored[0][1]
+    steps = [f"禁止語 {banned} を含まない表現を {len(ok)} 件から選んだ",
+             f"5-gram の審判で最上位: {best}"]
+    return {"text": best, "confidence": 0.86, "kind": "thanks", "verified": True,
+            "banned": banned, "notes": steps}
+
+
 def execute(d: Directive, *, kb=None, web=None, history=None, lm=None, core=None, turn: int = 0,
             room_bonus: int = 0) -> dict:
     task = d.task
@@ -930,6 +1188,22 @@ def execute(d: Directive, *, kb=None, web=None, history=None, lm=None, core=None
         return _do_list(d, kb=kb, web=web, history=history)
     if task == "write":
         return _do_write(d, history=history, kb=kb, web=web, lm=lm, core=core, turn=turn)
+    if task == "fill":
+        return _do_fill(d, lm=lm)
+    if task == "kana":
+        return _do_kana(d)
+    if task == "select":
+        return _do_select(d, kb=kb)
+    if task == "relations":
+        return _do_relations(d)
+    if task == "gloss":
+        return _do_gloss(d)
+    if task == "logic":
+        return _do_logic(d)
+    if task == "thanks":
+        return _do_thanks(d, lm=lm)
+    if task == "audit":
+        return _do_audit(d)
     return {"text": "", "confidence": 0.0, "notes": [f"未知のタスク: {task}"]}
 
 
@@ -1034,6 +1308,16 @@ def verify(d: Directive, text: str, got: dict) -> list[dict]:
         checks.append({"name": name, "ok": bool(ok), "why": why or ("ok" if ok else "")})
 
     add("non_empty", bool(body.strip()), "出力が空")
+    if str(d.task or "") == "audit":
+        add("audit_verdict", bool(re.search(r"^判定:", body, re.M)),
+            "「判定:」の行が無い")
+        add("audit_fixed", "修正版:" in body, "「修正版:」の行が無い")
+    # 【 】は *材料が無い* 印。成果物（メール・記事・報告書）でなければ残してはいけない
+    blanks = re.findall(r"【[^】]{0,20}】", body)
+    if blanks:
+        artifact = bool(_DOC_ARTIFACT.search(str(d.raw or "")))
+        add("no_placeholders", artifact,
+            f"材料の無い空欄 {len(blanks)} 個（{blanks[0]}）が残っている")
     for banned in CAN_NOT_SAY:
         if banned in body:
             add("no_refusal", False, f"「{banned}」を含む")
@@ -1075,8 +1359,12 @@ def verify(d: Directive, text: str, got: dict) -> list[dict]:
         lines = [x for x in lines if not x.startswith("出典")]
         bullet_lines = [x for x in lines
                         if re.match(r"^\s*(?:[・\-*•●○]|\d+[.)、．])\s*", x)]
-        add("bullet_count", len(bullet_lines) == d.fmt.bullets,
-            f"{len(bullet_lines)} 行（指定 {d.fmt.bullets}）")
+        # 言葉の仕事（語を 1 つ返す等）では、印の無い 1 行も「1 項目」として数える
+        # （「1つ挙げてください」に語を 1 つ返すのは指定どおり）。
+        count = len(bullet_lines)
+        if getattr(d, "job", None) is not None and not count:
+            count = len(lines)
+        add("bullet_count", count == d.fmt.bullets, f"{count} 行（指定 {d.fmt.bullets}）")
         if d.task in ("summarize", "answer", "write"):
             for line in bullet_lines:
                 core_text = re.sub(r"^\s*(?:[・\-*•●○]|\d+[.)、．])\s*", "", line).strip().rstrip("。")

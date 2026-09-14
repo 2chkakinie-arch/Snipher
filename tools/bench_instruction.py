@@ -196,8 +196,44 @@ CONVERSATIONAL = [
     "こんにちは", "いま何時？", "ラーメンとは何ですか？", "しりとりしよう", "ありがとう",
     "12+7 はいくつ？", "今日はいい天気だね", "名前は何ていうの？", "もう少し詳しく",
     "pythonって何", "疲れた", "明日の予定は？", "自己紹介して", "何ができるの？",
-    "猫", "67", "asdfgh", "GLM5.3とは", "三毛猫とは", "「うれしい」を英語にして",
+    "猫", "67", "asdfgh", "GLM5.3とは", "三毛猫とは", "おはよう",
 ]
+
+
+# --------------------------------------------------------------------------- #
+# 実運用ログの 14 問（core 経路で測る）
+# --------------------------------------------------------------------------- #
+#: `tools/bench_following.py` と同じ検査を *core* を通して回します。指示の型は
+#: instruction 層だけで閉じるとは限らない（計算は道具、天気は知識＋正直さ）ので、
+#: ここは 1 通を丸ごと投げて「頼まれた形で返ったか」を見ます。
+def measure_log_cases(runs: int = 1, *, web: bool = False) -> dict:
+    sys.path.insert(0, str(ROOT / "tools"))
+    from bench_following import CASES, _ask, check_case          # noqa: E402
+    from snipher.core import SnipherCore                          # noqa: E402
+
+    core = SnipherCore()
+    rows: list[dict] = []
+    timings: list[float] = []
+    for _ in range(max(1, runs)):
+        for case in CASES:
+            t0 = time.perf_counter()
+            text, stats = _ask(core, case["prompt"], web=web, mode="auto")
+            dt = (time.perf_counter() - t0) * 1000
+            timings.append(dt)
+            failed = check_case(case, text)
+            rows.append({"case": case["name"], "ok": not failed, "failed": failed,
+                         "ms": round(dt, 1), "route": stats.get("route"),
+                         "text": (text or "")[:120]})
+    ok_n = sum(1 for r in rows if r["ok"])
+    return {
+        "n_cases": len(rows),
+        "ok": ok_n,
+        "log_follow_rate": round(ok_n / max(1, len(rows)), 4),
+        "cases_failed": [r for r in rows if not r["ok"]],
+        "ms_median": round(statistics.median(timings), 1) if timings else 0.0,
+        "ms_max": round(max(timings), 1) if timings else 0.0,
+        "rows": rows,
+    }
 
 
 def _check_map(res) -> dict[str, bool]:
@@ -288,12 +324,14 @@ def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--runs", type=int, default=1)
     ap.add_argument("--json", action="store_true")
+    ap.add_argument("--web", action="store_true", help="実運用ログの 14 問でウェブ裏取りを許可する")
     a = ap.parse_args()
     gc.disable()
     data = measure(runs=a.runs)
+    log_data = measure_log_cases(runs=1, web=a.web)
     gc.enable()
     if a.json:
-        print(json.dumps(data, ensure_ascii=False, indent=1))
+        print(json.dumps({**data, "log_suite": log_data}, ensure_ascii=False, indent=1))
         return 0
     print(f"=== 指示追従 実測（{data['n_cases']} 指示 / {data['suite_size']} 種 × {data['runs']} 回）")
     print(f"  指示追従率 {data['instruction_follow_rate'] * 100:.1f}%"
@@ -310,9 +348,17 @@ def main() -> int:
         print("    ! 逃げ", line)
     for row in data["cases_failed"]:
         print(f"    ! {row['case']}: {row['failed']}")
-    # 合格線は「全指示が仕様どおり・誤検出ゼロ・逃げゼロ」。1 つでも外したら NG。
+    print(f"=== 実運用ログの指示追従（{log_data['n_cases']} 問 / core 経路）")
+    print(f"  指示追従率 {log_data['log_follow_rate'] * 100:.1f}%"
+          f"（中央値 {log_data['ms_median']}ms / 最大 {log_data['ms_max']}ms）")
+    for row in log_data["rows"]:
+        mark = "o" if row["ok"] else "x"
+        print(f"    {mark} {row['case'][:34]:36s} {str(row['route'])[:8]:>8s} {row['text'][:36]}")
+        for why in row["failed"]:
+            print(f"      ↳ {why}")
+    # 合格線は「全指示が仕様どおり・実運用ログも全問・誤検出ゼロ・逃げゼロ」。1 つでも外したら NG。
     ok = (data["instruction_follow_rate"] >= 1.0 and data["false_positive_count"] == 0
-          and data["refusal_count"] == 0)
+          and data["refusal_count"] == 0 and log_data["log_follow_rate"] >= 1.0)
     print("  判定:", "PASS" if ok else "NG")
     return 0 if ok else 1
 

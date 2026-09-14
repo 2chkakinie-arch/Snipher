@@ -273,6 +273,7 @@ class Directive:
     question: str = ""                   # 「質問：〜」で差し出された問い
     fmt: FormatSpec = field(default_factory=FormatSpec)
     role: str = ""                       # 「あなたは〜です」で与えられた役割
+    job: object | None = None             # jobs.detect が読んだ「言葉の仕事」の型
     confidence: float = 0.0
     signals: list[str] = field(default_factory=list)
     markers: list[str] = field(default_factory=list)   # 根拠にした指示語（UI 表示用）
@@ -1098,6 +1099,24 @@ def parse(text: str, *, min_score: float = 0.55) -> Directive | None:
     role = parse_role(raw)
     verbs = _imperatives(instruction or raw)
     task = classify_task(instruction, fmt, payload=payload, question=question)
+    # 言葉の仕事（空欄補充・選択・語の関係・論理・語の写し・礼）は *材料の形* で
+    # 決まるので、分類器の判断より先に確定させる。ここを分類器に任せると
+    # 「同じような意味」が write（文書の作成）に化ける。
+    job = None
+    try:
+        from .jobs import detect as _detect_job
+
+        job = _detect_job(raw)
+    except Exception:  # noqa: BLE001
+        job = None
+    if job is not None:
+        task = job.task
+        # 引用符で差し出された語・並びも *材料*（指示文と混ぜない）
+        if not payload:
+            if job.items:
+                payload = "、".join(job.items)
+            elif job.word:
+                payload = job.word
     if not task and role:
         # role-specified greeting like 「語尾に〜ロボをつけるロボットです。挨拶を」
         task = "answer"
@@ -1106,6 +1125,10 @@ def parse(text: str, *, min_score: float = 0.55) -> Directive | None:
 
     score = 0.0
     signals: list[str] = []
+    if job is not None:
+        score += 0.34
+        signals.append(job.as_signal())
+        signals.append(f"job-reason:{job.reason[:24]}")
     if payload and len(payload) >= 8:
         score += 0.30
         signals.append(f"payload:{len(payload)}字")
@@ -1223,8 +1246,9 @@ def parse(text: str, *, min_score: float = 0.55) -> Directive | None:
     d = Directive(task=task, raw=raw, instruction=instruction.strip(), payload=payload.strip(),
                   question=question.strip(), fmt=fmt, role=role.strip(), confidence=score,
                   signals=signals, markers=[m for m in marks if m],
-                  rules=list(fmt.extra_rules),
-                  notes=[f"指示部 {len(instruction)} 字 / 材料部 {len(payload)} 字"])
+                  rules=list(fmt.extra_rules), job=job,
+                  notes=[f"指示部 {len(instruction)} 字 / 材料部 {len(payload)} 字",
+                         *([f"型: {job.task}（{job.reason}）"] if job is not None else [])])
     return d
 
 
