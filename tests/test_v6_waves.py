@@ -116,14 +116,21 @@ def test_steer_mid_generation_changes_the_output() -> None:
 
     # 生成を別スレッドで走らせ、途中で「波」を投げ込む
     results: dict = {}
+    first_token = threading.Event()
 
     def worker() -> None:
-        results["text"] = run()
+        out = []
+        for ev in light.stream_chat(msgs, max_new_tokens=14, temperature=0.9, top_k=30):
+            if ev.get("type") == "delta":
+                out.append(ev["text"])
+                first_token.set()          # 1 トークン目が出た = 生成はまだ続いている
+        results["text"] = "".join(out)
 
     t = threading.Thread(target=worker)
     t.start()
-    # 最初の数トークンが出た頃に介入（生成は止めない）
-    time.sleep(0.02)
+    # 1 トークン目の直後に介入する（固定 sleep だと、速い環境では生成が終わってから
+    # 波を投げることになり、このテストが時々落ちる）。
+    assert first_token.wait(timeout=30), "最初のトークンが出ない"
     sid = bus.steer("猫猫猫猫猫猫猫", strength=6.0, ttl=40)
     t.join(timeout=30)
     assert sid >= 0

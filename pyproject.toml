@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "snipher"
-version = "6.0.0"
+version = "7.0.0"
 description = "その場で日本語を組み立てる会話 AI — 確率の波（リアルタイム・ステアリング / Web検索 / 並列熟考）が生成中のロジットへ干渉。実辞書・厳密計算・蒸留ニューラルコアを同梱（DL 0・依存 numpy のみ）"
 readme = "README.md"
 requires-python = ">=3.10"

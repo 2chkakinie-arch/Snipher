@@ -6,6 +6,8 @@
 
 from __future__ import annotations
 
+import re
+
 from . import code, facts, math as mathlab, text as textops
 
 
@@ -22,6 +24,20 @@ class SolveResult:
         d.update({"kind": self.kind, "answer": self.solution.answer,
                   "steps": self.solution.steps, "verified": self.solution.verified})
         return d
+
+
+#: 「計算結果だけを数字で」「答えだけを返して」— 出力の *形* まで指定する言い方。
+#: 道具は答えを持っているので、飾り（式・手順・出典）を付けるかどうかはここで決める。
+_ONLY_ANSWER = re.compile(
+    r"(?:計算)?(?:結果|答え|値)\s*(?:だけ|のみ)|"
+    r"(?:だけ|のみ)\s*(?:を)?\s*(?:数字|数値|半角|そのまま)?\s*(?:で)?\s*"
+    r"(?:答え|返して|出力|書いて)|"
+    r"(?:一言|一語|ひとこと)で")
+
+
+def wants_only_answer(text: str) -> bool:
+    """答えだけを返すべきか（形の指定があるか）。"""
+    return bool(_ONLY_ANSWER.search(str(text or "")))
 
 
 def solve_math(text: str) -> SolveResult | None:

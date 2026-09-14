@@ -292,7 +292,14 @@ def solve_arithmetic_task(text: str) -> TaskAnswer | None:
         value = safe_arithmetic(expr_match.group(0))
     except (ValueError, SyntaxError, ZeroDivisionError, OverflowError):
         return None
-    return TaskAnswer(f"計算すると {expr_match.group(0)} = {_fmt(value)} です。", "math:arithmetic", 0.999, "math", {"value": _fmt(value)})
+    # 「計算結果だけを数字で」のように *出力の形* まで指定されたら、数値だけを返す
+    # （道具の答えを飾りで包むと、指定された形に合わなくなる）
+    from .solve import wants_only_answer as _only_answer
+
+    only = _only_answer(raw)
+    body = _fmt(value) if only else f"計算すると {expr_match.group(0)} = {_fmt(value)} です。"
+    return TaskAnswer(body, "math:arithmetic", 0.999, "math",
+                      {"value": _fmt(value), "digits_only": only, "bare": only})
 
 
 # ---------------------------------------------------------------------------

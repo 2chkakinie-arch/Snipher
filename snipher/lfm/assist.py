@@ -84,8 +84,12 @@ class HybridAssist:
         """
         t0 = time.time()
         r = self.responder.reply(user_text)
-        base = self.polisher.polish(r.get("base_text", r["text"]), register="polite")
-        p = self.polisher.polish(r["text"], register="polite")
+        # 下書きが *形の指定つきの答え*（数字だけ／1 語だけ）なら、句点や敬体を足さない。
+        # ここで足すと「計算結果だけを数字で」に "8。" と返してしまう。
+        meta = ((r.get("task") or {}).get("metadata") or {})
+        bare = bool(meta.get("bare") or meta.get("digits_only"))
+        base = self.polisher.polish(r.get("base_text", r["text"]), register="polite", bare=bare)
+        p = self.polisher.polish(r["text"], register="polite", bare=bare)
         r["text"] = p["text"]
         r["base_text"] = base["text"]
         r["fixes"] = p["fixes"]

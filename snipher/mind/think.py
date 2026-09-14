@@ -1800,7 +1800,8 @@ def _solve_claims(frame, text: str, *, tasks=None, thought: Thought | None = Non
         if got is not None and got.solution is not None:
             sol = got.solution
             body = sol.answer
-            if sol.steps:
+            # 形の指定（「結果だけを数字で」）があるときは、手順を付けず答えだけを返す
+            if sol.steps and not solver.wants_only_answer(text):
                 body = " → ".join(sol.steps) + "。答えは " + sol.answer + "。"
             out.append(Claim(kind="result", content=body, subject=frame.topic,
                              source=f"tool:{got.kind}", weight=0.95 if sol.verified else 0.8,

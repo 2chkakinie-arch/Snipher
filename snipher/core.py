@@ -1629,7 +1629,10 @@ class SnipherCore:
 
         # ---- 3) 助動詞の補い（内蔵コアの神経系） -------------------------------- #
         added = ""
-        if core is not None and _looks_incomplete(text):
+        # 「数字だけで」のような *形の指定* があるときは、語尾を補わない（"8。" にしない）
+        bare = bool((((reply.notes or {}).get("task") or {}).get("metadata") or {}).get("bare")) \
+            or bool((((reply.notes or {}).get("task") or {}).get("metadata") or {}).get("digits_only"))
+        if core is not None and _looks_incomplete(text) and not bare:
             used_core = True
             try:
                 comp = core.complete(text)
@@ -1661,7 +1664,7 @@ class SnipherCore:
                 pass
 
         # ---- 4) 磨いて出す ---------------------------------------------------- #
-        polished = self.polisher.polish(f"{text}{extra}", register="polite")
+        polished = self.polisher.polish(f"{text}{extra}", register="polite", bare=bare)
         fixes = list(polished["fixes"])
         if added:
             fixes.append("neural_completion")

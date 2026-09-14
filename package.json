@@ -1,6 +1,6 @@
 {
   "name": "snipher-pages",
-  "version": "6.0.0",
+  "version": "7.0.0",
   "private": true,
   "type": "module",
   "description": "Snipher の Cloudflare Pages 用アセット（静的 UI + Pages Function）",
