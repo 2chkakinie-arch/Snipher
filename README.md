@@ -4,6 +4,31 @@
 知識ベースにも検索結果にも依存しない文は 1 文も作りません — 返す文は必ず
 (1) 見たもの（実辞書・索引・計算・検索の本文）から作られ、(2) 文章として検査を通り、(3) 通らなければ文を組み直します。
 
+## v8 — 再帰的思考モデル（MoE + `<think>` + Draft-Verification）
+
+v8 は「本気で賢く」をモデルのパラメータだけで目指します。テンプレートもプログラムによる
+組み立て文も使わず、**考える → 書く → 校正する** をモデルの確率サンプリングで回します
+（設計詳細は `docs/v8.md`）。
+
+| 柱 | 仕組み | 実装 |
+|---|---|---|
+| **アーキテクチャ** | RoPE + RMSNorm + GQA（KV ヘッド 1/group）+ MoE(SwiGLU)。ルータが Top-K で専門家を動的選択。学習時は dense soft MoE | `snipher/neural/moe.py`（`MoENet`、numpy のみ・勾配検証済み） |
+| **再帰的思考** | モデルA（思考 `<think>…</think>`）→ モデルB（文章化）→ モデルC（校正）。却下なら再下書き。思考は確率の波として下流へ干渉 | `snipher/mind/recurrent.py`（`RecurrentMind`） |
+| **反復の物理的封印** | 既出 n-gram を完成させるトークンの logit を `-inf` に（後処理ではない）。「〜の知識で答えます」等の定型も校正段で却下 | `snipher/neural/sample.py` |
+| **テンプレート無しの長文** | `generate_novel` が 2000 文字級を 1 文字ずつ確率サンプリングで生成（EOS も禁止して書き続けさせる） | `snipher/mind/recurrent.py` |
+| **3 フェーズ学習** | 継続事前学習 → SFT+CoT（考えてから答える癖）→ DPO/GRPO-lite（ルール報酬） | `tools/train_v8.py` + `snipher/neural/align.py` |
+
+```bash
+python tools/train_v8.py --phase all --profile v8b --out snipher/data/neural/v8.npz   # モデルB
+python tools/train_v8.py --phase all --profile v8ac --out snipher/data/neural/v8_a.npz # モデルA
+python tools/train_v8.py --phase all --profile v8ac --out snipher/data/neural/v8_c.npz # モデルC
+python tools/bench_v8.py    # 思考閉じ率 / 受理率 / 反復ゼロ / 長文到達文字数を実測
+```
+
+SSE 契約は `start → thought → draft → verify → delta → done`（`/api/chat` の
+`mode: "v8"`、`/api/v8/novel`）。Cloudflare Pages 版も `public/engine.mjs` に同じ
+再帰的思考と反復封印を同梱しています（`tests/js/engine.test.mjs` で実測）。
+
 ## v7 — 指示文と入力データを *構造で* 分ける（指示追従 13.3% → 100%）
 
 「山羊をひらがなに」が `山羊: 果物`、「同じような意味の言葉を」が

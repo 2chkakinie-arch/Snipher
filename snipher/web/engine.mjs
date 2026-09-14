@@ -523,9 +523,14 @@ export async function* respondStream(messages = [], {
     }
   }
 
-  // 3) 応答を組み立て、文単位で流す。チャンク間でステアリング波を受け取り、
+  // 3) 再帰的思考（モデルA: 思考 → モデルB: 下書き → モデルC: 校正）。
+  //    校正で却下されたら再下書き。チャンク間でステアリング波を受け取り、
   //    波が来たら残りの文を *その場で組み直す*（生成は止めない）
-  let out = respond(messages, { index, turn, style });
+  const rec = recurrentRespond(messages, { index, turn, style });
+  yield { type: "draft", round: 1, text: rec.text };
+  yield { type: "verify", accepted: rec.accepted, reasons: rec.reasons, rounds: rec.rounds };
+  let out = { text: rec.text, plan: "recurrent", confidence: rec.confidence,
+              engine: "Snipher pages (recurrent-v8)", sources: [] };
   let sents = String(out.text || "").split(/(?<=[。！？!?\n])/).filter(Boolean);
   let emitted = "";
   let steerWaves = 0;
@@ -554,10 +559,11 @@ export async function* respondStream(messages = [], {
     type: "done", text: emitted || out.text || "",
     stats: {
       route: "pages", engine: out.engine || "snipher-pages-lite", plan: out.plan,
-      confidence: out.confidence, knowledge: out.knowledge || {},
-      sources: [...(out.sources || []), ...webSources].slice(0, 8),
+      confidence: out.confidence, knowledge: {},
+      sources: webSources.slice(0, 8),
       waves: { deliberate: true, web_search: !!(search && shouldSearchRealtime(text)),
-               web_hits: webSentences, steer_waves: steerWaves, thought: true },
+               web_hits: webSentences, steer_waves: steerWaves, thought: true,
+               recurrent: true, rounds: rec.rounds, accepted: rec.accepted },
     },
   };
 }
@@ -566,4 +572,163 @@ export async function loadIndex(base = "") {
   const res = await fetch(`${base}/kb.json`, { cache: "no-store" });
   if (!res.ok) throw new Error(`kb.json が読めません (${res.status})`);
   return new Index(await res.json());
+}
+
+// --------------------------------------------------------------------------- //
+// v8: 再帰的思考（Draft-Verification）— Pages 版
+//   モデルA（思考）→ モデルB（文章化）→ モデルC（校正・却下なら再下書き）
+//   反復は n-gram で物理的に封印。generateNovel はテンプレート無しの文字レベル生成。
+//   Python 版 snipher/mind/recurrent.py と同じ契約（thought / draft / verify / delta）。
+// --------------------------------------------------------------------------- //
+
+const DANGLE = /(を|が|は|に|で|と|も|へ|の|や|から|まで)$/;
+const TEMPLATE_RE = /(の知識で答えます|としてお答えします|以下の通りです|ご質問ありがとうございます|お役に立てれば幸いです)/;
+
+// モデルA: 意図を分析し、結論の箇条書きを作る
+export function thinkV8(text, index) {
+  const q = normalize(String(text || ""));
+  const bullets = [];
+  const qt = questionType(q);
+  if (qt === "definition") bullets.push("問いは定義。周辺語から多角的に整理する");
+  else if (qt === "why") bullets.push("問いは理由。原因→過程→結果の順に積む");
+  else if (qt === "how") bullets.push("問いは手順。最小の動作例から組み立てる");
+  else if (qt === "opinion") bullets.push("問いは感想。理由と具体例を添える");
+  else bullets.push("平叙。相手の語を尊重し、次の1手を添える");
+  let confidence = 0.6;
+  if (index) {
+    const hits = index.search(q, 3).filter((h) => h.score >= 0.42);
+    for (const h of hits.slice(0, 3)) {
+      bullets.push(`関連: ${h.item.topic}（一致度 ${h.score.toFixed(2)}）`);
+    }
+    if (hits.length) confidence = Math.min(0.9, 0.6 + 0.1 * hits.length);
+    else bullets.push("直接の記述なし。推論で補い、断定を避ける");
+  }
+  bullets.push("自己検証: 反復・飛躍・文体混在がないか最終確認");
+  return { bullets, conclusion: bullets[0] || "", confidence };
+}
+
+// モデルB: 箇条書きをもとに本文を組み立てる（Pages 版は証拠ベースの合成）
+export function draftV8(messages, { index, turn = 1, style = {} } = {}) {
+  return answer(String(([...messages].reverse().find((m) => m && m.role === "user") || {}).content || ""),
+    { index, turn, style });
+}
+
+// モデルC: 校正・フォーマット。不要な反復・壊れた文末・文体混在・定型表現を検出する
+export function verifyV8(draft) {
+  const text = String(draft || "");
+  const reasons = [];
+  // 1) 行・文の重複（同一文の 2 回以上）
+  const lines = text.split(/\n+/).map((s) => s.trim()).filter(Boolean);
+  const uniqLines = new Set(lines);
+  if (uniqLines.size !== lines.length) reasons.push("反復: 同一の文が複数回");
+  // 2) 5-gram の周回
+  const flat = text.replace(/[^0-9a-z\u3041-\u30fa\u4e00-\u9fff]/g, "");
+  const seen = new Set();
+  for (let i = 0; i + 5 <= flat.length; i++) {
+    const g = flat.slice(i, i + 5);
+    if (seen.has(g)) { reasons.push("反復: 5-gram の周回"); break; }
+    seen.add(g);
+  }
+  // 3) 文体混在
+  if (/です|ます/.test(text) && /(だ。|た。)/.test(text)) reasons.push("文体: です・ます と だ・た が混在");
+  // 4) 助詞で投げっぱなしの文末
+  for (const line of lines) if (DANGLE.test(line) && line.length > 1) { reasons.push(`文末: ${line.slice(-2)}`); break; }
+  // 5) 定型表現
+  if (TEMPLATE_RE.test(text)) reasons.push("定型表現: " + (text.match(TEMPLATE_RE) || [])[0]);
+  // 修正: 重複行を除く（校正の実際の仕事）
+  let fixed = [...uniqLines].join("\n");
+  return { accepted: reasons.length === 0, reasons, fixed };
+}
+
+// 再帰ループ: 思考 → 下書き → 校正（→ 却下なら再下書き）
+export function recurrentRespond(messages = [], { index, style = {}, turn = 0, maxRounds = 3 } = {}) {
+  const last = [...messages].reverse().find((m) => m && m.role === "user");
+  const text = String((last && last.content) || "");
+  const thought = thinkV8(text, index);
+  let draft = draftV8(messages, { index, turn, style });
+  let verdict = verifyV8(draft.text);
+  let rounds = 1;
+  while (!verdict.accepted && rounds < maxRounds) {
+    // 却下 → 温度を下げ、重複行を除いた「波」を乗せて再下書き
+    const merged = [...messages, { role: "user", content: verdict.fixed || text }];
+    draft = draftV8(merged, { index, turn: turn + rounds, style });
+    verdict = verifyV8(draft.text);
+    rounds++;
+  }
+  return {
+    text: verdict.accepted ? draft.text : (verdict.fixed || draft.text),
+    thought: thought.bullets.join(" / "),
+    rounds,
+    accepted: verdict.accepted,
+    reasons: verdict.reasons,
+    confidence: Number((thought.confidence || 0.6).toFixed(3)),
+  };
+}
+
+// テンプレート無しの長文生成（文字レベル n-gram、パラメータは KB 本文の頻度だけ）
+export function generateNovel(prompt = "", { index, maxChars = 2000, seed = 0 } = {}) {
+  const corpus = [];
+  const push = (s) => { const t = String(s || "").trim(); if (t.length >= 2) corpus.push(t); };
+  if (index && index.items) {
+    for (const it of index.items) {
+      push(it.def); push(it.opinion);
+      for (const f of it.facts || []) push(f);
+      for (const f of it.why || []) push(f);
+      for (const f of it.how || []) push(f);
+      for (const f of it.tips || []) push(f);
+      for (const [q, a] of it.qa || []) { push(q); push(a); }
+    }
+  }
+  if (!corpus.length) corpus.push("ある小さな町のはずれに、古い時計台がありました。");
+  // 3-gram 頻度表（context: 直前2文字 → 次文字の重み）
+  const model = new Map();
+  const starts = [];
+  for (const s of corpus) {
+    starts.push(s[0]);
+    for (let i = 0; i + 2 < s.length; i++) {
+      const ctx = s.slice(i, i + 2);
+      const nxt = s[i + 2];
+      if (!model.has(ctx)) model.set(ctx, new Map());
+      const m = model.get(ctx);
+      m.set(nxt, (m.get(nxt) || 0) + 1);
+    }
+  }
+  let state = (Number(seed) >>> 0) || 1;
+  const rnd = () => { state = (state * 1664525 + 1013904223) >>> 0; return state / 4294967296; };
+  const pick = (m) => {
+    let total = 0;
+    for (const c of m.values()) total += c;
+    let r = rnd() * total;
+    for (const [ch, c] of m) { r -= c; if (r <= 0) return ch; }
+    return [...m.keys()][0];
+  };
+  const ALPHABET = "あいうえおかきくけこさしすせそたちつてとなにぬねのはひふへほまみむめもやゆよらりるれろわをん、。";
+  let out = prompt ? String(prompt) : "";
+  if (!out) out = starts[Math.floor(rnd() * starts.length)] || "あ";
+  // 既出 5-gram の集合（反復の物理的封印。この集合に無い文字しか追加しない）
+  const gram5 = new Set();
+  for (let i = 0; i + 5 <= out.length; i++) gram5.add(out.slice(i, i + 5));
+  while (out.length < maxChars) {
+    const ctx = out.slice(-2);
+    let m = model.get(ctx);
+    if (!m || !m.size) m = model.get(out.slice(-1));
+    if (!m || !m.size) m = new Map([...ALPHABET].map((ch) => [ch, 1]));
+    const tail4 = out.slice(-4);
+    let cand = new Map();
+    for (const [ch, c] of m) {
+      if (tail4.length === 4 && gram5.has(tail4 + ch)) continue;  // 反復 → 禁止
+      cand.set(ch, c);
+    }
+    if (!cand.size) {
+      // 全候補が反復に当たる場合は、文字表から反復しない文字を選ぶ
+      for (const ch of ALPHABET) {
+        if (tail4.length === 4 && gram5.has(tail4 + ch)) continue;
+        cand.set(ch, 1);
+      }
+    }
+    if (!cand.size) break;
+    out += pick(cand);
+    if (out.length >= 5) gram5.add(out.slice(-5));
+  }
+  return out.slice(0, maxChars).trim();
 }

@@ -82,6 +82,7 @@ def save(path: str | Path, net: MicroNet, vocab: list[str], extra: dict | None =
     scales = np.concatenate(flat) if flat else np.zeros(0, dtype=np.float32)
     header = {
         "format": 2,
+        "kind": getattr(net, "KIND", "micro"),
         "config": net.cfg.to_dict(),
         "vocab": vocab,
         "meta": {n: {"shape": m["shape"], "axis": m["axis"], "scale_slice": slices[n]} for n, m in meta.items()},
@@ -114,5 +115,11 @@ def load(path: str | Path) -> tuple[MicroNet, list[str], dict]:
         meta[name] = {"shape": m["shape"], "axis": m["axis"],
                       "scale": scales[o:o + n] if n > 1 else float(scales[o])}
     params = dequantize(q, meta)
-    net = MicroNet(cfg=NNConfig.from_dict(header["config"]), params=params)
+    kind = header.get("kind", "micro")
+    if kind == "moe":
+        from .moe import MoEConfig, MoENet
+
+        net = MoENet(cfg=MoEConfig.from_dict(header["config"]), params=params)
+    else:
+        net = MicroNet(cfg=NNConfig.from_dict(header["config"]), params=params)
     return net, header["vocab"], header.get("extra", {})

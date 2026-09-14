@@ -13,6 +13,8 @@ from __future__ import annotations
 import re
 
 # 意味を持つ制御トークン。ID は固定（学習時・推論時でズレないようにする）。
+# 注意: <think>/</think> は専用トークンにしない（既存コアの ID と語彙を変えないため）。
+#       思考区間は文字列リテラルとして扱い、snipher/mind/recurrent.py が解釈する。
 SPECIAL_TOKENS = ["<pad>", "<unk>", "<bos>", "<eos>", "<user>", "<asst>", "<sys>"]
 
 PAD, UNK, BOS, EOS, USER, ASST, SYS = range(len(SPECIAL_TOKENS))
