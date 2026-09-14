@@ -66,15 +66,22 @@ def test_index_html_falls_back_to_the_bundled_engine() -> None:
 # --------------------------------------------------------------------------- #
 # Pages Function
 # --------------------------------------------------------------------------- #
-def test_pages_function_covers_the_api_contract() -> None:
-    fn = FUNCS / "api" / "[[path]].js"
-    assert fn.exists(), "functions/api/[[path]].js がありません"
-    src = fn.read_text(encoding="utf-8")
-    for needle in ("/api/status", "/api/chat", 'type: "start"', 'type: "delta"', 'type: "done"',
-                   "SNIPHER_API_ORIGIN", "env.ASSETS.fetch"):
-        assert needle in src, needle
-    assert "_engine/engine.mjs" in src
-    assert (FUNCS / "_engine" / "engine.mjs").exists()
+    def test_pages_function_covers_the_api_contract() -> None:
+        fn = FUNCS / "api" / "[[path]].js"
+        assert fn.exists(), "functions/api/[[path]].js がありません"
+        src = fn.read_text(encoding="utf-8")
+        for needle in ("/api/status", "/api/chat", "/api/steer",
+                       "SNIPHER_API_ORIGIN", "env.ASSETS.fetch"):
+            assert needle in src, needle
+        assert "_engine/engine.mjs" in src
+        eng = FUNCS / "_engine" / "engine.mjs"
+        assert eng.exists()
+        # SSE のイベント形（start/delta/done + v6 の波イベント）は共有エンジンが保証する
+        esrc = eng.read_text(encoding="utf-8")
+        for needle in ('type: "start"', 'type: "delta"', 'type: "done"',
+                       'type: "thought"', 'type: "web"', 'type: "steer"',
+                       "respondStream"):
+            assert needle in esrc, needle
 
 
 def test_pages_function_does_not_call_localhost() -> None:

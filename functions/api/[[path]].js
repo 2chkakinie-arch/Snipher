@@ -1,11 +1,18 @@
 // Cloudflare Pages Function — /api/* をさばく 1 本。
 //
 //  1) `SNIPHER_API_ORIGIN` が設定されていれば、そのまま本体 API に流す（全機能）
-//  2) 無ければ、Pages に同梱した `engine.mjs` + `kb.json` で答える（静的デモ）
+//  2) 無ければ、Pages に同梱した `engine.mjs` + `kb.json` で答える（波付き静的デモ）
 //
-// SSE の形（start / delta / done）は FastAPI 版と揃えてあるので、UI は同じコードで動きます。
+// v6: 静的デモでも「確率の波」が動く。
+//   - /api/steer は isolate 内のステアリングキューへ積まれ、生成中の応答が
+//     チャンク間で拾って残りの文を *その場で組み直す*（出力は止めない）
+//   - 挨拶以外の全プロンプトで出力中に Web 検索が走り、結果が波として干渉する
+//   - 並列熟考（deliberateMini）の思考過程が thought イベントとして流れる
+//
+// SSE の形（start / delta / done + web / thought / steer）は FastAPI 版と揃えて
+// あるので、UI は同じコードで動きます。
 
-import { respond, status, Index } from "../_engine/engine.mjs";
+import { respond, respondStream, status, Index } from "../_engine/engine.mjs";
 
 const CORS = {
   "Access-Control-Allow-Origin": "*",
@@ -14,6 +21,9 @@ const CORS = {
 };
 
 let cachedIndex = null;
+
+// ステアリングキュー（isolate 内で生存。生成中の応答がチャンク間で拾う）
+const steerQueue = [];
 
 // 静的アセットは Pages Function からも env.ASSETS で読める（追加のストレージ不要）
 async function localIndex(env) {
@@ -31,26 +41,49 @@ function jsonReply(obj, status = 200) {
   });
 }
 
-// 1 応答を SSE に流す（本文は行単位で刻む。本体 API と同じイベント形）
-function sseReply(build) {
+// リアルタイム Web 検索（ベストエフォート）。Workers からの fetch で SERP を叩き、
+// スニペットを証拠文として返す。失敗しても生成は止めない（波は 0 件で継続）。
+async function webSearch(query, env) {
+  if (env && env.SNIPHER_WEB === "off") return { sentences: [], sources: [] };
+  const endpoint = (env && env.SNIPHER_SERP_URL)
+    || "https://html.duckduckgo.com/html/?q=";
+  const ctl = new AbortController();
+  const timer = setTimeout(() => ctl.abort(), 2500);
+  try {
+    const res = await fetch(endpoint + encodeURIComponent(query), {
+      signal: ctl.signal,
+      headers: { "User-Agent": "Mozilla/5.0 (compatible; Snipher/6.0)" },
+    });
+    if (!res.ok) return { sentences: [], sources: [] };
+    const html = await res.text();
+    const sentences = [];
+    const sources = [];
+    const re = /<a[^>]+class="result__a"[^>]+href="([^"]+)"[^>]*>([\s\S]*?)<\/a>[\s\S]*?(?:<a[^>]+class="result__snippet"[^>]*>([\s\S]*?)<\/a>)?/g;
+    let m;
+    while ((m = re.exec(html)) !== null && sources.length < 4) {
+      const url = decodeURIComponent(String(m[1]).replace(/^.*uddg=/, "").replace(/&rut=.*$/, ""));
+      const title = String(m[2] || "").replace(/<[^>]+>/g, "").trim();
+      const snippet = String(m[3] || "").replace(/<[^>]+>/g, "").replace(/&amp;/g, "&").trim();
+      if (!/^https?:/.test(url)) continue;
+      sources.push({ url, title });
+      if (snippet.length >= 12) sentences.push(snippet);
+    }
+    return { sentences, sources };
+  } catch (e) {
+    return { sentences: [], sources: [] };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+// 波付き SSE: respondStream のイベントをそのまま流す
+function sseStream(gen) {
   const enc = new TextEncoder();
   const stream = new ReadableStream({
     async start(controller) {
       const send = (obj) => controller.enqueue(enc.encode(`data: ${JSON.stringify(obj)}\n\n`));
       try {
-        send({ type: "start", engine: "Snipher pages (lite)" });
-        const out = await build();
-        const text = String(out.text || "");
-        for (const piece of text.split(/(?<=\n)/)) {
-          if (piece) send({ type: "delta", text: piece });
-        }
-        send({
-          type: "done", text,
-          stats: {
-            route: "pages", engine: out.engine || "snipher-pages-lite", plan: out.plan,
-            confidence: out.confidence, knowledge: out.knowledge || {}, sources: out.sources || [],
-          },
-        });
+        for await (const ev of gen) send(ev);
       } catch (err) {
         send({ type: "error", message: String((err && err.message) || err) });
       } finally {
@@ -101,7 +134,7 @@ export async function onRequest(context) {
   if (url.pathname === "/api/status") {
     let idx = null;
     try { idx = await localIndex(env); } catch (e) { idx = null; }
-    return jsonReply(status(idx));
+    return jsonReply({ ...status(idx), steering: { pending: steerQueue.length } });
   }
 
   let body = {};
@@ -110,17 +143,27 @@ export async function onRequest(context) {
   }
 
   if (url.pathname === "/api/chat") {
-    return sseReply(async () => {
-      const idx = await localIndex(env);
-      return respond(body.messages || [], {
-        index: idx, turn: Number(body.turn || 1), style: body.style || {},
-      });
-    });
+    const idx = await localIndex(env).catch(() => null);
+    steerQueue.length = 0;
+    const search = (env && env.SNIPHER_WEB !== "off")
+      ? (q) => webSearch(q, env)
+      : null;
+    return sseStream(respondStream(body.messages || [], {
+      index: idx,
+      turn: Number(body.turn || 1),
+      style: body.style || {},
+      pollSteer: () => steerQueue.splice(0, steerQueue.length),
+      search,
+    }));
   }
 
   if (url.pathname === "/api/steer") {
-    // Pages 静的デモではステアリングは no-op だが 200 を返す (前端の生成を止めない)
-    return jsonReply({ ok: true, queued: String((body && body.text) || ""), mode: "pages-lite" });
+    // 生成中でもノンストップで受け付け、確率波としてキューへ積む（出力は止まらない）
+    const text = String((body && body.text) || "").trim();
+    if (!text) return jsonReply({ ok: false, error: "text が空です" });
+    steerQueue.push({ text, strength: Number((body && body.strength) || 1.0), at: Date.now() });
+    return jsonReply({ ok: true, queued: text.slice(0, 80), mode: "pages-waves",
+                       active_waves: steerQueue.length });
   }
 
   if (url.pathname === "/api/answer") {

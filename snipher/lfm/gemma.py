@@ -189,16 +189,64 @@ class GemmaEngine:
         if not self.is_ready or self.base is None:
             return ""
         self._ensure_gemma()
-        # Gemma 風のパラメータでラップして蒸留コアを呼ぶ
         temp = temperature if temperature is not None else self.config.temperature
         k = top_k if top_k is not None else self.config.top_k
         p = top_p if top_p is not None else self.config.top_p
-        # DistilledCore の generate は内部で temperature/top_k を使うが、
-        # top_p 相当をここでエミュレートするため logits 操作を追加
-        # 简易: temperature を top_p で補正
-        adj_temp = temp * (0.85 + 0.3 * p)
-        return self.base.generate(prompt, max_chars=max_chars,
-                                  temperature=adj_temp, top_k=k, seed=seed)
+        ids = self.base.tok.encode(prompt) if self.base.tok is not None else []
+        from ..neural.tokenizer import BOS, ASST
+        out_ids = self.base.generate_ids([BOS, ASST] + list(ids), max_new=max_chars,
+                                         temperature=temp, top_k=k, top_p=p, seed=seed)
+        return self.base.tok.decode(out_ids) if self.base.tok is not None else ""
+
+    def reply(self, user_text: str, *, max_chars: int = 72, temperature: float | None = None,
+              top_k: int | None = None, seed: int | None = None,
+              context: list[dict] | None = None) -> str:
+        """発話への返答生成を Gemma 2 のサンプリング設定（top_p 込み）で行う。"""
+        if self.base is None or not self.is_ready:
+            return ""
+        return self.base.reply(
+            user_text, max_chars=max_chars,
+            temperature=temperature if temperature is not None else self.config.temperature,
+            top_k=top_k if top_k is not None else self.config.top_k,
+            seed=seed, context=context, top_p=self.config.top_p,
+        )
+
+    def digest_long(self, text: str, *, budget: int = 220) -> str:
+        """長文読解: 長い材料文を、確率的コアの文脈窓に収まる要約材料へ縮める。
+
+        文単位に割って n-gram LM で「日本語として壊れていないか」を測り、
+        先頭・末尾・高得点文を優先して budget 文字ぶんだけ残す（抽出型）。
+        生成モデルはこれを文脈として読み、続きを確率的に組み立てる。
+        """
+        t = str(text or "").strip()
+        if not t or self.base is None:
+            return t[:budget]
+        sents = [s.strip() for s in re.split(r"(?<=[。！？!?])", t) if s and s.strip()]
+        if len(t) <= budget or len(sents) <= 2:
+            return t[:budget]
+        scored: list[tuple[float, str]] = []
+        for s in sents:
+            try:
+                sc = float((self.base.score(s) or {}).get("confidence", 0.5))
+            except Exception:  # noqa: BLE001
+                sc = 0.5
+            scored.append((sc, s))
+        head = sents[0][: budget // 3]
+        tail = sents[-1][: budget // 3]
+        mid_budget = max(0, budget - len(head) - len(tail))
+        mids = [s for _sc, s in sorted(scored[1:-1], key=lambda x: -x[0])]
+        picked: list[str] = []
+        used = 0
+        for s in mids:
+            if used + len(s) > mid_budget:
+                continue
+            picked.append(s)
+            used += len(s)
+        ordered: list[str] = []
+        for s in sents[1:-1]:
+            if s in picked and s not in ordered:
+                ordered.append(s)
+        return (head + "".join(ordered) + tail)[:budget]
 
     def stream_chat(self, messages: list[dict], **kwargs):
         """Gemma 2 準拠のストリーミング生成 (確率的逐次サンプリング)。
@@ -219,17 +267,49 @@ class GemmaEngine:
             return
         t0 = time.time()
         max_new = kwargs.get("max_new_tokens") or kwargs.get("max_new") or 96
-        temp = kwargs.get("temperature", self.config.temperature)
-        top_k = kwargs.get("top_k", self.config.top_k)
+        temp = kwargs.get("temperature") or self.config.temperature
+        top_k = kwargs.get("top_k") or self.config.top_k
         # Gemma 推奨: top_p 0.92 をデフォルトに
-        top_p = kwargs.get("top_p", self.config.top_p)
+        top_p = kwargs.get("top_p") or self.config.top_p
+        # 長文読解: 材料が長いときは抽出型ダイジェストを system に載せる
+        system_prompt = kwargs.get("system_prompt")
+        try:
+            last_user = next((str(m.get("content", "")) for m in reversed(messages)
+                              if m.get("role") == "user"), "")
+            if len(last_user) >= 600:
+                digest = self.digest_long(last_user)
+                system_prompt = (str(system_prompt or "") +
+                                 f"\n（長文材料の要点: {digest}）").strip()
+        except Exception:  # noqa: BLE001
+            pass
+        base_stream = getattr(base, "stream_chat", None)
+        if not callable(base_stream):
+            # 基盤がストリーミングを持たない実装でも Gemma の顔で応答を流す
+            yield {"type": "start", "engine": self.engine_name(),
+                   "template_mode": "gemma-reply", "gemma": True, "probabilistic": True}
+            last_user = next((str(m.get("content", "")) for m in reversed(messages)
+                              if m.get("role") == "user"), "")
+            text = ""
+            try:
+                text = self.reply(last_user, context=messages, max_chars=int(max_new),
+                                  temperature=temp, top_k=top_k) or ""
+            except Exception:  # noqa: BLE001
+                text = ""
+            for ch in text:
+                yield {"type": "delta", "text": ch}
+            yield {"type": "done", "text": text, "stats": {
+                "engine": self.engine_name(), "model": self.config.model,
+                "probabilistic": True, "char_level": True, "gemma": True,
+                "new_tokens": len(text), "top_p": top_p,
+            }}
+            return
         # DistilledCore の stream_chat を呼ぶが、前後で Gemma メタを付与
         yielded = False
-        for ev in base.stream_chat(messages, max_new_tokens=max_new,
-                                   temperature=temp, top_k=top_k,
-                                   repetition_penalty=kwargs.get("repetition_penalty", 1.08),
-                                   use_template=kwargs.get("use_template", True),
-                                   system_prompt=kwargs.get("system_prompt")):
+        for ev in base_stream(messages, max_new_tokens=max_new,
+                              temperature=temp, top_k=top_k, top_p=top_p,
+                              repetition_penalty=kwargs.get("repetition_penalty", 1.08),
+                              use_template=kwargs.get("use_template", True),
+                              system_prompt=system_prompt):
             if ev.get("type") == "start":
                 ev["engine"] = self.engine_name()
                 ev["gemma"] = True
@@ -239,6 +319,8 @@ class GemmaEngine:
                 ev["stats"]["model"] = self.config.model
                 ev["stats"]["probabilistic"] = True
                 ev["stats"]["char_level"] = True
+                ev["stats"]["gemma"] = True
+                ev["stats"]["top_p"] = top_p
             yielded = True
             yield ev
         if not yielded:

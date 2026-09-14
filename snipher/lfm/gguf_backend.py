@@ -265,12 +265,55 @@ class GgufBackend:
             self._lock.release()
 
     # ---- llama-cpp-python ---- #
+    def _steer_processors(self):
+        """リアルタイム・ステアリングのロジット・プロセッサ（生成中に確率波を干渉）。
+
+        SteeringBus の合成バイアスを「トークン文字列」で受け取り、GGUF 側の
+        BPE 語彙で再エンコードして logits に加算する。生成は止めない。
+        """
+        try:
+            from .steering import get_steering_bus
+            bus = get_steering_bus()
+        except Exception:  # noqa: BLE001
+            return None
+        if bus is None or self._llm is None:
+            return None
+        cache: dict[str, list[int]] = {}
+
+        def _proc(past_tokens, logits):
+            try:
+                biases = bus.active_text_biases()
+                if not biases:
+                    return logits
+                hit = 0
+                for text, weight in biases.items():
+                    ids = cache.get(text)
+                    if ids is None:
+                        try:
+                            ids = [int(t) for t in
+                                   self._llm.tokenize(text.encode("utf-8"), add_bos=False)]
+                        except Exception:  # noqa: BLE001
+                            ids = []
+                        cache[text] = ids
+                    for tid in ids[-1:]:       # 末尾トークンに確率波を乗せる
+                        if 0 <= tid < logits.shape[-1]:
+                            logits[tid] += float(weight)
+                            hit += 1
+                if hit:
+                    bus.note_applied(n_tokens=hit)
+                return logits
+            except Exception:  # noqa: BLE001
+                return logits
+
+        return [_proc]
+
     def _stream_python_binding(self, msgs, max_new, temp, top_k, rep, use_template):
         t0 = time.time()
         mode = MODE_NATIVE if use_template else MODE_RAW
         n_pieces = 0
         text_out: list[str] = []
         t_first: float | None = None
+        procs = self._steer_processors()
         try:
             if use_template and _has_chat_template(self._llm):
                 # GGUF 埋め込みの chat template を自動適用
@@ -278,6 +321,7 @@ class GgufBackend:
                     return self._llm.create_chat_completion(
                         messages=msgs, stream=True, max_tokens=max_new,
                         temperature=max(temp, 1e-4), top_k=top_k, repeat_penalty=rep,
+                        logits_processor=procs,
                     )
                 pieces = _iter_chat_stream(_make_stream())
             else:
@@ -293,6 +337,7 @@ class GgufBackend:
                         prompt, stream=True, max_tokens=max_new,
                         temperature=max(temp, 1e-4), top_k=top_k, repeat_penalty=rep,
                         stop=LLAMA_STOP_TOKENS if use_template else None,
+                        logits_processor=procs,
                     )
                 pieces = _iter_completion_stream(_make_stream())
 

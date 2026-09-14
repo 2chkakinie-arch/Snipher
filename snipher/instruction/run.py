@@ -296,6 +296,19 @@ def _limit_sentences(text: str, n: int) -> str:
     return sep.join(parts[:n])
 
 
+def _cite_kb_en(body: str) -> str:
+    """英語の答えに出典（knowledge base）を文頭で明示する。
+
+    文頭に埋め込むので文数の指定は壊さない（日本語の「出典:」行に相当）。
+    """
+    body = str(body or "").strip()
+    if not body or "knowledge base" in body.lower():
+        return body
+    head, tail = body[:1], body[1:]
+    head = head.lower() if head.isupper() else head
+    return f"According to the knowledge base, {head}{tail}"
+
+
 _EN_ASK = re.compile(r"^(?:what|why|how|who|when|where|which)\s+"
                      r"(?:is|are|was|were|does|do|did|will|would|can|could|should\s+be)?\s*"
                      r"(.+?)\s*\??$", re.IGNORECASE)
@@ -433,6 +446,9 @@ def _do_answer(d: Directive, *, kb=None, web=None, history=None, lm=None, core=N
                                 question=d.question or d.raw or "")
             if kb_en:
                 body = _limit_sentences(kb_en, d.fmt.sentences or 3)
+                # 出典を英語で明示する（日本語の「出典:」と同じ役割。
+                # 文頭に埋め込むので文数指定は壊さない）
+                body = _cite_kb_en(body)
                 got["text"] = body
                 got["notes"] = list(got.get("notes") or []) + \
                     ["出力言語: 英語（知識ベースの英語説明を使った）"]
