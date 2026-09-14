@@ -211,3 +211,48 @@ test("respondStream: 生成中のステアリング波が残りの文を組み�
   assert.ok(kinds.indexOf("delta") < kinds.lastIndexOf("delta") || kinds.filter((k) => k === "delta").length >= 1);
   assert.equal(kinds[kinds.length - 1], "done");
 });
+
+// --------------------------------------------------------------------------- //
+// v8: 再帰的思考（Draft-Verification）— Pages 版の実測
+// --------------------------------------------------------------------------- //
+import { thinkV8, verifyV8, recurrentRespond, generateNovel } from "../../public/engine.mjs";
+
+test("thinkV8: 問いの型を読んで結論の箇条書きを作る", () => {
+  const t = thinkV8("なぜ空は青いの？", index);
+  assert.ok(t.bullets.length >= 3);
+  assert.ok(t.conclusion.length > 4);
+  assert.ok(t.confidence > 0 && t.confidence <= 0.95);
+});
+
+test("verifyV8: 反復・定型表現・文体混在を検出する", () => {
+  const looped = verifyV8("こんにちは。\nこんにちは。");
+  assert.equal(looped.accepted, false);
+  assert.ok(looped.reasons.some((r) => r.includes("反復")), looped.reasons.join(","));
+  const templated = verifyV8("私の知識で答えます。猫は動物です。");
+  assert.equal(templated.accepted, false);
+  assert.ok(templated.reasons.some((r) => r.includes("定型表現")));
+  const clean = verifyV8("猫は小さな動物です。");
+  assert.equal(clean.accepted, true, clean.reasons.join(","));
+});
+
+test("recurrentRespond: 思考と本文を返し、反復を校正で除去する", () => {
+  const r = recurrentRespond([{ role: "user", content: "WebAssembly とは何ですか？" }], { index, turn: 1 });
+  assert.ok(r.text.length > 4, r.text);
+  assert.ok(r.thought.length > 4);
+  assert.ok(r.rounds >= 1);
+  assert.equal(r.accepted, true);
+});
+
+test("generateNovel: テンプレート無しで長文を生成し、5-gram を周回させない", () => {
+  const novel = generateNovel("小さな町の話", { index, maxChars: 2000, seed: 1 });
+  assert.ok(novel.length >= 1990, String(novel.length));
+  assert.ok(!novel.includes("の知識で答えます"));
+  assert.ok(!novel.includes("<think>") && !novel.includes("</think>"));
+  // 5-gram の反復がない（反復の物理的封印）
+  const seen = new Set();
+  for (let i = 0; i + 5 <= novel.length; i++) {
+    const g = novel.slice(i, i + 5);
+    assert.ok(!seen.has(g), `5-gram が反復: ${g}`);
+    seen.add(g);
+  }
+});

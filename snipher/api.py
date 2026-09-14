@@ -51,6 +51,28 @@ def _maybe_start_lfm() -> None:
 _core = None
 _core_lock = threading.Lock()
 
+_recurrent = None
+_recurrent_lock = threading.Lock()
+
+
+def recurrent_mind():
+    """v8 再帰的思考モデル（RecurrentMind）のシングルトン。
+
+    重み（v8_a/v8/v8_c.npz）が無い環境では None を返す（graceful に縮退）。
+    """
+    global _recurrent
+    try:
+        from snipher.mind.recurrent import RecurrentMind
+    except Exception:  # noqa: BLE001
+        return None
+    with _recurrent_lock:
+        if _recurrent is None:
+            try:
+                _recurrent = RecurrentMind()
+            except Exception:  # noqa: BLE001
+                _recurrent = False
+        return _recurrent if _recurrent else None
+
 
 def core():
     """SnipherCore のシングルトン（LFM2.5-1.2B-JP = 内部ニューラルコア）。"""
@@ -326,10 +348,11 @@ class ChatRequest(BaseModel):
     web_search: bool | None = Field(None, description="web の旧互換 bool。指定時は web より優先")
     mode: str = Field(
         "auto",
-        pattern="^(auto|fast|lfm|neural|light)$",
+        pattern="^(auto|fast|lfm|neural|light|v8)$",
         description=(
             "auto=内部パイプライン(確実な定形は即答/確率的に不安な応答は LFM2.5 が生成), "
-            "fast=高速コアのみ, lfm=常に LFM2.5 が生成, light=内蔵蒸留コア＋知識ベース固定"
+            "fast=高速コアのみ, lfm=常に LFM2.5 が生成, light=内蔵蒸留コア＋知識ベース固定, "
+            "v8=再帰的思考モデル（<think> 思考 → 下書き → 校正のドラフト検証ループ）"
         ),
     )
     hybrid: bool | None = Field(
@@ -370,8 +393,15 @@ def api_status():
     st = c.status()
     ready = bool(st.get("neural_ready"))
     light = st.get("light") or {"state": c._light_state}
+    v8 = None
+    try:
+        mind = recurrent_mind()
+        v8 = mind.status() if mind else None
+    except Exception:  # noqa: BLE001
+        v8 = None
     return {
         "deps": deps,
+        "v8": v8,
         "backend": st.get("backend_kind"),
         "lfm": st,
         "acquire": st.get("acquire"),
@@ -429,6 +459,39 @@ def api_neural_probe(req: NeuralProbeRequest):
     sc = c.score(req.text)
     return {"ok": True, "generate": gen, "complete": comp, "score": sc,
             "seconds": round(time.time() - t0, 3)}
+
+
+# ---------------- v8 再帰的思考モデル（MoE + <think> + Draft-Verification） ----- #
+class V8NovelRequest(BaseModel):
+    prompt: str = Field("", max_length=2000)
+    max_chars: int = Field(2000, ge=32, le=4000)
+    temperature: float = Field(0.9, ge=0.0, le=2.0)
+    with_think: bool = True
+
+
+@app.get("/api/v8/status")
+def api_v8_status():
+    """v8 再帰的思考モデルの状態（重みが無ければ縮退情報を返す）。"""
+    mind = recurrent_mind()
+    if mind is None:
+        return {"available": False, "reason": "v8 コア未ビルド（tools/train_v8.py）"}
+    st = mind.status()
+    return {"available": mind.available, **st}
+
+
+@app.post("/api/v8/novel")
+def api_v8_novel(req: V8NovelRequest):
+    """テンプレート無し・パラメータだけで長文を生成する（小説・説明文）。"""
+    mind = recurrent_mind()
+    if mind is None:
+        return {"ok": False, "reason": "v8 コア未ビルド（tools/train_v8.py）"}
+    import time
+
+    t0 = time.time()
+    text = mind.generate_novel(req.prompt, max_chars=req.max_chars,
+                               temperature=req.temperature, with_think=req.with_think)
+    return {"ok": True, "text": text, "chars": len(text),
+            "seconds": round(time.time() - t0, 2)}
 
 
 # ---------------- 内蔵ニューラルコアの再蒸留（全自動・任意実行） ------------- #
@@ -679,6 +742,16 @@ def api_chat(req: ChatRequest):
 
     def gen():
         try:
+            if mode == "v8":
+                mind = recurrent_mind()
+                if mind is None:
+                    yield _sse({"type": "error", "message":
+                                "v8 コアが未ビルドです（tools/train_v8.py）"})
+                    return
+                user_text = msgs[-1]["content"] if msgs else ""
+                for ev in mind.respond_stream(user_text, max_chars=req.max_new_tokens, seed=0):
+                    yield _sse(ev)
+                return
             for ev in c.stream_reply(
                 msgs,
                 mode=mode,

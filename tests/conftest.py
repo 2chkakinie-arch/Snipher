@@ -55,3 +55,43 @@ def fresh_engine():
     eng = lfm_engine_mod.LfmEngine(cfg)
     lfm_engine_mod._ENGINE = eng
     return eng
+
+
+# --------------------------------------------------------------------------- #
+# v8（MoE + 再帰的思考）テスト用の小型学習済みコア
+# --------------------------------------------------------------------------- #
+_V8_CORPUS = [
+    "<user>赤信号ではどうする？\n<asst><think>信号の意味を思い出す。赤は停止。だから止まる。</think>\n止まります。",
+    "<user>3×7は？\n<asst><think>3を7回足すと21。</think>\n21",
+    "<user>私は猫が\n<asst>好きです。毎日なでています。",
+    "<user>雨の日は何をする？\n<asst><think>濡れない工夫を考える。傘を持つ。部屋で本を読む。</think>\n家で本を読みます。",
+    "<user>好きな食べ物は？\n<asst><think>好きな物を思い浮かべる。果物とごはん。</think>\n果物が好きです。",
+]
+
+
+@pytest.fixture(scope="session")
+def tiny_moe(tmp_path_factory):
+    """v8 テスト用の小型学習済み MoE コア（MoECore）。制限アルファベットで
+    学習するので UNK がほぼ出ず、決定的で速い。"""
+    pytest.importorskip("numpy")
+    import numpy as np
+
+    from snipher.neural.moe import MoEConfig, MoENet
+    from snipher.neural.moe_core import MoECore
+    from snipher.neural.moe_train import MoETrainer
+    from snipher.neural.tokenizer import BOS, CharTokenizer, EOS
+    from snipher.neural.train import TextDataset, TrainConfig
+
+    corpus = _V8_CORPUS * 60
+    tok = CharTokenizer.from_text("\n".join(corpus), max_vocab=160)
+    ids: list[int] = []
+    for t in corpus:
+        ids += [BOS] + tok.encode(t) + [EOS]
+    cfg = MoEConfig(n_vocab=tok.size(), d_model=32, n_layers=2, n_heads=4, n_kv_heads=2,
+                    n_experts=4, top_k=2, expert_dim=40, max_pos=128)
+    net = MoENet.random(cfg, seed=7)
+    ds = TextDataset(np.array(ids, dtype=np.int64), 48, np.random.default_rng(0))
+    tc = TrainConfig(seq_len=48, batch=32, epochs=3, lr=8e-3, min_lr=1e-4, warmup_ratio=0.0)
+    MoETrainer(net, ds, ds, tc).train()
+    return {"core": MoECore(net=net, tok=tok), "tok": tok, "net": net,
+            "path": str(tmp_path_factory.mktemp("v8"))}
