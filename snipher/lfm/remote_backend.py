@@ -136,6 +136,36 @@ class RemoteLfmBackend:
             order.insert(0, self.style)
         return [(s, "/api/chat" if s == "snipher" else "/v1/chat/completions") for s in order]
 
+    def _steer_forwarder(self, stop: threading.Event) -> None:
+        """生成中に届いたステアリング波をリモートの /api/steer へ転送する裏スレッド。
+
+        リモートが Snipher なら、向こう側の SteeringBus が同じ確率波を
+        ロジットに干渉させる（出力は止まらない）。ベストエフォート。
+        """
+        try:
+            from .steering import get_steering_bus
+            bus = get_steering_bus()
+        except Exception:  # noqa: BLE001
+            return
+        if bus is None:
+            return
+        last_id = bus.last_id()
+        while not stop.wait(0.2):
+            try:
+                for sig in bus.snapshot_new(last_id):
+                    last_id = max(last_id, sig.id)
+                    if sig.kind != "prompt":
+                        continue
+                    try:
+                        with self._req("/api/steer", {"text": sig.text,
+                                                      "strength": sig.strength},
+                                       timeout=2.0) as resp:
+                            resp.read(256)
+                    except Exception:  # noqa: BLE001
+                        pass
+            except Exception:  # noqa: BLE001
+                pass
+
     def stream_chat(self, messages: list[dict], *, max_new_tokens: int | None = None,
                     temperature: float | None = None, top_k: int | None = None,
                     repetition_penalty: float | None = None, use_template: bool = True,
@@ -147,97 +177,105 @@ class RemoteLfmBackend:
         if not self.probe():
             yield {"type": "error", "message": self.error or "リモートに接続できません"}
             return
-        payload = {
-            "messages": messages,
-            "mode": "lfm",
-            "max_new_tokens": int(max_new_tokens or 128),
-            "temperature": float(temperature if temperature is not None else 0.3),
-            "top_k": int(top_k or 50),
-            "repetition_penalty": float(repetition_penalty or 1.05),
-        }
-        if system_prompt:
-            payload["system_prompt"] = system_prompt
-        last_err = None
-        for style, path in self._candidate_paths():
-            body = dict(payload)
-            if style == "openai":
-                body = {"model": self.model, "messages": messages,
-                        "max_tokens": payload["max_new_tokens"], "temperature": payload["temperature"],
-                        "stream": True}
-            self._cancel.clear()
-            t0 = time.time()
-            collected: list[str] = []
-            done_stats: dict = {}
-            yielded_start = False
-            try:
-                with self._req(path, body) as resp:
-                    ctype = (resp.headers.get("Content-Type") or "").lower()
-                    with self._lock:
-                        self._detected = style
-                        if self.load_seconds is None:
-                            self.load_seconds = round(time.time() - t0, 3)
-                    if "text/event-stream" in ctype:
-                        for raw in resp:
-                            if self._cancel.is_set():
-                                break
-                            line = raw.decode("utf-8", "replace").strip()
-                            if not line.startswith("data:"):
-                                continue
-                            chunk = line[5:].strip()
-                            if not chunk or chunk == "[DONE]":
-                                continue
-                            try:
-                                ev = json.loads(chunk)
-                            except json.JSONDecodeError:
-                                continue
-                            ev = _normalize(ev, style)
-                            et = ev.get("type")
-                            if et == "delta":
-                                if not yielded_start:
-                                    yielded_start = True
-                                    yield {"type": "start", "engine": self.engine_name(),
-                                           "template_mode": f"remote-{style}"}
-                                collected.append(ev.get("text", ""))
-                                yield ev
-                            elif et == "done":
-                                done_stats = dict(ev.get("stats") or {})
-                                done_stats.setdefault("text", ev.get("text"))
-                            elif et == "error":
-                                raise RuntimeError(ev.get("message") or "リモート側でエラー")
-                            else:
-                                if et == "start":
-                                    yielded_start = True      # 二重 start を防ぐ
-                                yield ev
-                    else:                                     # 非ストリーミング JSON
-                        obj = json.loads(resp.read().decode("utf-8", "replace") or "{}")
-                        text = _extract_text(obj, style)
-                        yield {"type": "start", "engine": self.engine_name(),
-                               "template_mode": f"remote-{style}"}
-                        if text:
-                            collected.append(text)
-                            yield {"type": "delta", "text": text}
-                        done_stats = {"new_tokens": len(text)}
-            except Exception as exc:  # noqa: BLE001
-                last_err = f"{type(exc).__name__}: {exc}"
-                log.warning("リモート LFM2.5 生成失敗 (%s %s): %s", style, path, exc)
-                if collected:                # 途中で切れてもここまでを返す
-                    dt = max(1e-6, time.time() - t0)
-                    done_stats.setdefault("tokens_per_second", round(len(collected) / dt, 1))
-                    done_stats["remote_truncated"] = last_err
-                    break
-                continue                     # 次のスタイルを試す
-            dt = max(1e-6, time.time() - t0)
-            text = "".join(collected).strip()
-            stats = {"engine": self.engine_name(), "backend": "remote", "remote_style": style,
-                     "new_tokens": done_stats.get("new_tokens") or len(text),
-                     "tokens_per_second": done_stats.get("tokens_per_second")
-                     or round(len(text) / dt, 1),
-                     "seconds": round(dt, 3), "remote_url": self.base_url}
-            stats.update({k: v for k, v in done_stats.items() if k in
-                          ("template_mode", "remote_truncated", "prompt_tokens")})
-            yield {"type": "done", "text": text, "stats": stats}
-            return
-        yield {"type": "error", "message": f"リモート LFM2.5 を使えませんでした ({last_err})"}
+        # リアルタイム・ステアリング: 生成中に届いた介入プロンプトをリモートへ転送
+        stop_steer = threading.Event()
+        fwd = threading.Thread(target=self._steer_forwarder, args=(stop_steer,),
+                               daemon=True, name="snipher-steer-fwd")
+        fwd.start()
+        try:
+            payload = {
+                "messages": messages,
+                "mode": "lfm",
+                "max_new_tokens": int(max_new_tokens or 128),
+                "temperature": float(temperature if temperature is not None else 0.3),
+                "top_k": int(top_k or 50),
+                "repetition_penalty": float(repetition_penalty or 1.05),
+            }
+            if system_prompt:
+                payload["system_prompt"] = system_prompt
+            last_err = None
+            for style, path in self._candidate_paths():
+                body = dict(payload)
+                if style == "openai":
+                    body = {"model": self.model, "messages": messages,
+                            "max_tokens": payload["max_new_tokens"], "temperature": payload["temperature"],
+                            "stream": True}
+                self._cancel.clear()
+                t0 = time.time()
+                collected: list[str] = []
+                done_stats: dict = {}
+                yielded_start = False
+                try:
+                    with self._req(path, body) as resp:
+                        ctype = (resp.headers.get("Content-Type") or "").lower()
+                        with self._lock:
+                            self._detected = style
+                            if self.load_seconds is None:
+                                self.load_seconds = round(time.time() - t0, 3)
+                        if "text/event-stream" in ctype:
+                            for raw in resp:
+                                if self._cancel.is_set():
+                                    break
+                                line = raw.decode("utf-8", "replace").strip()
+                                if not line.startswith("data:"):
+                                    continue
+                                chunk = line[5:].strip()
+                                if not chunk or chunk == "[DONE]":
+                                    continue
+                                try:
+                                    ev = json.loads(chunk)
+                                except json.JSONDecodeError:
+                                    continue
+                                ev = _normalize(ev, style)
+                                et = ev.get("type")
+                                if et == "delta":
+                                    if not yielded_start:
+                                        yielded_start = True
+                                        yield {"type": "start", "engine": self.engine_name(),
+                                               "template_mode": f"remote-{style}"}
+                                    collected.append(ev.get("text", ""))
+                                    yield ev
+                                elif et == "done":
+                                    done_stats = dict(ev.get("stats") or {})
+                                    done_stats.setdefault("text", ev.get("text"))
+                                elif et == "error":
+                                    raise RuntimeError(ev.get("message") or "リモート側でエラー")
+                                else:
+                                    if et == "start":
+                                        yielded_start = True      # 二重 start を防ぐ
+                                    yield ev
+                        else:                                     # 非ストリーミング JSON
+                            obj = json.loads(resp.read().decode("utf-8", "replace") or "{}")
+                            text = _extract_text(obj, style)
+                            yield {"type": "start", "engine": self.engine_name(),
+                                   "template_mode": f"remote-{style}"}
+                            if text:
+                                collected.append(text)
+                                yield {"type": "delta", "text": text}
+                            done_stats = {"new_tokens": len(text)}
+                except Exception as exc:  # noqa: BLE001
+                    last_err = f"{type(exc).__name__}: {exc}"
+                    log.warning("リモート LFM2.5 生成失敗 (%s %s): %s", style, path, exc)
+                    if collected:                # 途中で切れてもここまでを返す
+                        dt = max(1e-6, time.time() - t0)
+                        done_stats.setdefault("tokens_per_second", round(len(collected) / dt, 1))
+                        done_stats["remote_truncated"] = last_err
+                        break
+                    continue                     # 次のスタイルを試す
+                dt = max(1e-6, time.time() - t0)
+                text = "".join(collected).strip()
+                stats = {"engine": self.engine_name(), "backend": "remote", "remote_style": style,
+                         "new_tokens": done_stats.get("new_tokens") or len(text),
+                         "tokens_per_second": done_stats.get("tokens_per_second")
+                         or round(len(text) / dt, 1),
+                         "seconds": round(dt, 3), "remote_url": self.base_url}
+                stats.update({k: v for k, v in done_stats.items() if k in
+                              ("template_mode", "remote_truncated", "prompt_tokens")})
+                yield {"type": "done", "text": text, "stats": stats}
+                return
+            yield {"type": "error", "message": f"リモート LFM2.5 を使えませんでした ({last_err})"}
+        finally:
+            stop_steer.set()
 
     def complete(self, fragment: str) -> dict:
         """断片文の補完をリモートに依頼する（内蔵コアと同じ戻り値形式）。"""

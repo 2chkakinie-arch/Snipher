@@ -1,24 +1,40 @@
 # Snipher
 
-**その場で日本語を組み立てる会話 AI。v4 は「定型文の引き当て」と「辞書を引き返す」応答を、構造から完全に除去しました。**
+**その場で日本語を組み立てる会話 AI。v6 は「確率の波」で動く — 出力を止めずに、検索・熟考・追加プロンプトが生成中の確率分布へリアルタイムで干渉します。**
 知識ベースにも検索結果にも依存しない文は 1 文も作りません — 返す文は必ず
 (1) 見たもの（実辞書・索引・計算・検索の本文）から作られ、(2) 文章として検査を通り、(3) 通らなければ文を組み直します。
 
-| | Snipher v3 | LFM2.5-1.2B-JP |
+## v6 — リアルタイム・ウェーブ・アーキテクチャ
+
+3 本の柱がすべて *生成中に* 動き、その関わりは全部チャットラインへ流れます（Agent 化）。
+
+| 柱 | 仕組み | 実装 |
 |---|---|---|
-| 重み | **16.2 MB 同梱（DL 0）** | 731 MB（GGUF）〜2.2 GB |
-| パラメータ | 3.48M（内蔵コア・int8）+ 5.63M エントリの n-gram | 1,170M |
-| 1 応答 | **中央値 2.36 ms**（44.7 応答/秒、p95 151 ms） | 秒単位 + GPU 推奨 |
-| 常駐 | **37 MiB** | GB 単位 |
-| 依存 | numpy（API は FastAPI） | transformers 系 |
-| 日本語の正しさ | `validate()` + n-gram + 規則の三重、通過率 100%（18 発話 × 3 ターン, tools/bench.py） | 生成次第 |
-| 振る舞い | `tools/bench_v4.py` で **100%**（16 ケース / 50 検査、応答の揺れ 6/6） | 生成次第 |
+| **リアルタイム・ステアリング** | 出力中でも `/api/steer` へプロンプトを投げられる。即座にトークン化→ロジット・バイアス化され、次のサンプリングから確率の波として乗る。出力は止まらない | `snipher/lfm/steering.py`（SteeringBus）+ 全バックエンドのロジット経路（蒸留コア `_sample` / GGUF `logits_processor` / リモート転送） |
+| **リアルタイム Web 検索** | 挨拶・相槌以外の *あらゆる* プロンプトで、入力受信と同時に検索を開始。証拠文が届き次第 SteeringBus へ注入され、生成中の確率に干渉する（無限知識の再現）。検索の開始/結果/出典は `web` イベントとして表示 | `snipher/ground/realtime.py` + `core.py::_WaveTracker` |
+| **並列熟考モデル** | 裏で問いの分解→知識照合→因果設計→自己検証を並走。結論が確率波として出力モデルに干渉し、思考過程は `thought` イベントとして展開表示 | `snipher/mind/deliberate.py` |
+| **Gemma 2 準拠の確率的生成** | 文字単位の logits → softmax → sampling（temperature/top_k/**top_p**/反復罰）。テンプレートが無い自由応答・長文読解（`digest_long` の抽出型ダイジェスト）を確率的に生成 | `snipher/lfm/gemma.py`（GemmaEngine） |
+
+SSE イベント（すべて同じ UI で描画）:
+`assist`（経路判定）→ `start` → `thought`/`web`/`steer`（波の実況）→ `delta`（本文）→ `done`（`stats.waves` に波の統計）。
+挨拶・短い相槌は波を起動しないので高速経路は無傷（中央値 ~5ms）。
 
 ```bash
 pip install -r requirements.txt
 uvicorn snipher.api:app --host 0.0.0.0 --port 8000    # → http://localhost:8000
-python tools/bench.py                                  # 上の表を実測で作り直す
+python tools/bench.py                                  # 下の表を実測で作り直す
 ```
+
+| | Snipher v6 | LFM2.5-1.2B-JP |
+|---|---|---|
+| 重み | **16.2 MB 同梱（DL 0）** | 731 MB（GGUF）〜2.2 GB |
+| パラメータ | 3.48M（内蔵コア・int8）+ 5.63M エントリの n-gram | 1,170M |
+| 1 応答 | **中央値 ~5 ms**（p95 ~17 ms、tools/bench.py 実測） | 秒単位 + GPU 推奨 |
+| 常駐 | **37 MiB** | GB 単位 |
+| 依存 | numpy（API は FastAPI） | transformers 系 |
+| 日本語の正しさ | `validate()` + n-gram + 規則の三重、通過率 100%（18 発話 × 3 ターン, tools/bench.py） | 生成次第 |
+| 振る舞い | `tools/bench_v4.py` で **100%**（16 ケース / 50 検査、応答の揺れ 6/6） | 生成次第 |
+| 出力中の介入 | **ステアリング波 / Web 波 / 熟考波がロジットへ干渉**（tests/test_v6_waves.py） | 生成が終わるまで不可 |
 
 ---
 
@@ -234,10 +250,18 @@ SNIPHER_EDGE_SEARCH_URL=...  # エンドポイント差し替え
 ## 9. テストと計測
 
 ```bash
-.venv/bin/python -m pytest -q               # 480 passed, 3 skipped
+.venv/bin/python -m pytest -q               # 553 passed, 3 skipped
 .venv/bin/python tools/bench.py             # 速度・常駐・規模・文章の健全性
+.venv/bin/python tools/bench_v4.py          # 振る舞い 100%（16 ケース / 50 検査）
 .venv/bin/python tools/bench_instruction.py # 指示追従率・誤検出・逃げ（合格線で exit code）
+node --test tests/js/engine.test.mjs        # Pages 用エンジン（波の実装込み・20 本）
 ```
+
+v6 の波は *動いていること* を機械判定します（`tests/test_v6_waves.py`）:
+ステアリング波が減衰しながら実際にロジットを曲げること、生成中の `steer()` で
+出力が（止まらずに）変わること、挨拶以外で `web` イベントが流れ出典が
+`done.stats.sources` に合流すること、挨拶では検索が 1 回も走らないこと、
+`thought` イベントの思考過程が流れること、Gemma 経路が top_p で確率的に揺れること。
 
 `tools/bench_instruction.py --runs 2` の実測（30 種の指示 × 2 回、`SNIPHER_WEB=off`）:
 

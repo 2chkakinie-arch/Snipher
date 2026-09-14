@@ -448,6 +448,117 @@ export function status(index) {
     facts: index ? index.meta.facts : 0,
     qa: index ? index.meta.qa : 0,
     ready: !!index,
+    steering: true,
+    deliberative: true,
+    infinite_knowledge: true,
+    features: ["fast-path", "logit-steering", "parallel-deliberation", "realtime-web-wave"],
+  };
+}
+
+// --------------------------------------------------------------------------- //
+// v6: リアルタイム波（ステアリング / 並列熟考 / リアルタイムWeb）— Pages 版
+// Python 版 snipher/lfm/steering.py・mind/deliberate.py・ground/realtime.py と同じ契約。
+// --------------------------------------------------------------------------- //
+
+// 挨拶・礼・謝罪・短い相槌は検索しない（高速経路を維持）。それ以外はすべて検索。
+const SIMPLE_RE = /^(こんにちは|こんばんは|おはよう|はじめまして|やあ|もしもし|ありがとう|ありがと|感謝|すみません|ごめん|おつかれ|お疲れ|さようなら|さよなら|またね|バイバイ|おやすみ|はい|いいえ|うん|ええ|そう|なるほど|わかった|了解|おけ|ok|草|w+|笑)+[。！？!?.]*$/i;
+
+export function shouldSearchRealtime(text) {
+  const t = normalize(String(text || ""));
+  if (!t || t.length < 2) return false;
+  if (SIMPLE_RE.test(t)) return false;
+  if (/^[ぁ-んァ-ヶー]{1,2}[？?。]*$/.test(t)) return false;
+  return true;
+}
+
+// 並列熟考（ミニ版）: 問いの構造を分解し、結論を確率波の材料にする
+export function deliberateMini(text, index) {
+  const q = String(text || "").trim();
+  const steps = [`問いを分解: ${q.slice(0, 60)}`];
+  let conclusion = "相手の語を尊重し、具体例と次の1手を添える";
+  let confidence = 0.62;
+  const qt = questionType(q);
+  if (qt === "definition") { steps.push("定義要求 → 周辺知識から多角的に整理"); conclusion = "周辺語から推論し、断定は避けて多面的に定義する"; confidence = 0.7; }
+  else if (qt === "why") { steps.push("理由の問い → 因果を分解して順序を決める"); conclusion = "原因→過程→結果の順で、検証可能な事実から積み上げる"; confidence = 0.7; }
+  else if (qt === "how") { steps.push("手順の問い → 最小の動作例から組み立てる"); conclusion = "最小の動作例から始め、端数ケースを追加する"; confidence = 0.72; }
+  if (index) {
+    const hits = index.search(q, 1);
+    if (hits.length && hits[0].score >= 0.42) {
+      steps.push(`知識ベースに関連記述あり: ${hits[0].item.topic}`);
+      confidence += 0.08;
+    } else steps.push("知識ベースに直接の記述なし、推論で補う");
+  }
+  steps.push("自己検証: 矛盾・飛躍がないか最終チェック");
+  return { query: q.slice(0, 80), steps, conclusion, confidence: Math.min(0.95, confidence),
+           keywords: tokens(q).slice(0, 8) };
+}
+
+// 生成を文単位で刻み、チャンク間にステアリング波を差し込む（出力は止めない）
+export async function* respondStream(messages = [], {
+  index, style = {}, turn = 0, pollSteer = null, search = null, chunkDelayMs = 14,
+} = {}) {
+  const last = [...messages].reverse().find((m) => m && m.role === "user");
+  const text = String((last && last.content) || "");
+  yield { type: "start", engine: "Snipher pages (lite · waves)" };
+
+  // 1) 並列熟考（同期ミニ版 — 出力前に思考の骨格を作り、確率波の材料にする）
+  const thought = deliberateMini(text, index);
+  yield { type: "thought", state: "start" };
+  yield { type: "thought", state: "done", ...thought };
+
+  // 2) リアルタイムWeb（挨拶以外はすべて。出力中に検索し、証拠を確率波として干渉）
+  let webSentences = 0;
+  const webSources = [];
+  if (search && shouldSearchRealtime(text)) {
+    yield { type: "web", state: "start", query: text.slice(0, 80) };
+    try {
+      const res = await search(text);
+      const sents = (res && res.sentences) || [];
+      const srcs = (res && res.sources) || [];
+      webSentences = sents.length;
+      for (const s of srcs.slice(0, 4)) webSources.push({ url: s.url, title: s.title || "" });
+      yield { type: "web", state: "done", sentences: webSentences, sources: webSources };
+    } catch (e) {
+      yield { type: "web", state: "done", sentences: 0, sources: [], error: String((e && e.message) || e) };
+    }
+  }
+
+  // 3) 応答を組み立て、文単位で流す。チャンク間でステアリング波を受け取り、
+  //    波が来たら残りの文を *その場で組み直す*（生成は止めない）
+  let out = respond(messages, { index, turn, style });
+  let sents = String(out.text || "").split(/(?<=[。！？!?\n])/).filter(Boolean);
+  let emitted = "";
+  let steerWaves = 0;
+  for (let i = 0; i < sents.length; i++) {
+    if (pollSteer) {
+      const waves = pollSteer() || [];
+      for (const w of waves) {
+        const steerText = String((w && w.text) || "").trim();
+        if (!steerText) continue;
+        steerWaves++;
+        yield { type: "steer", text: steerText.slice(0, 80), signals: 1 };
+        // 確率波として残りの生成に干渉: ステアの語を材料に残りを組み直す
+        const merged = [...messages, { role: "user", content: steerText }];
+        const rerolled = respond(merged, { index, turn, style });
+        const rest = String(rerolled.text || "");
+        if (rest && rest !== emitted) sents = [rest];
+      }
+    }
+    const piece = sents[i] || "";
+    emitted += piece;
+    if (piece) yield { type: "delta", text: piece };
+    if (chunkDelayMs > 0) await new Promise((r) => setTimeout(r, chunkDelayMs));
+  }
+
+  yield {
+    type: "done", text: emitted || out.text || "",
+    stats: {
+      route: "pages", engine: out.engine || "snipher-pages-lite", plan: out.plan,
+      confidence: out.confidence, knowledge: out.knowledge || {},
+      sources: [...(out.sources || []), ...webSources].slice(0, 8),
+      waves: { deliberate: true, web_search: !!(search && shouldSearchRealtime(text)),
+               web_hits: webSentences, steer_waves: steerWaves, thought: true },
+    },
   };
 }
 

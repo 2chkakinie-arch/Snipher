@@ -6,11 +6,13 @@
     プロンプトを送信できる技術。
 
 実装:
-    - 生成ループは 1 トークンごとに `SteeringBus` をポーリングする
+    - 生成ループは 1 トークンごとに `SteeringBus.active_biases()` を参照する
     - 外部から `steer(text)` で投げられた介入プロンプトは、即座に
       トークン化 → 埋め込み → ロジットバイアス へ変換される
     - バイアスは減衰付きで加算され、次のサンプリングに確率の波として乗る
     - Web 検索結果も同様に `inject_evidence(texts)` で流せる
+    - バイアスが実際にロジットへ加算された瞬間を **適用イベント** として記録し、
+      ストリーム側は `take_events()` で取り出して UI に可視化できる（Agent 化）
 
 これにより、ユーザーが生成中に追加指示を送っても生成を中断せず、
 確率分布を滑らかに曲げて出力をステアできる。出力が止まることはない。
@@ -18,30 +20,35 @@
 
 from __future__ import annotations
 
-import math
-import re
 import threading
 import time
 from dataclasses import dataclass, field
-from collections import deque
 
 import numpy as np
 
 
 @dataclass
 class SteeringSignal:
+    """1 発の介入プロンプト（確率の波）。"""
+
+    id: int
     text: str
-    bias: dict[int, float]  # token_id -> logit bias
+    bias: dict[int, float]          # token_id -> logit bias
+    kind: str = "prompt"            # prompt / evidence / deliberation
     strength: float = 1.0
     decay: float = 0.92
-    ttl: int = 16  # 何トークン有効か
+    ttl: int = 16                   # 何トークン有効か
     created_at: float = field(default_factory=time.time)
+    applied_tokens: int = 0         # 実際に何トークンのロジットに乗ったか
+
+    def factor(self, age: int) -> float:
+        return (self.decay ** age) * self.strength
 
     def effective_bias(self, age: int) -> dict[int, float]:
-        factor = (self.decay ** age) * self.strength
-        if factor < 0.05:
+        f = self.factor(age)
+        if f < 0.05:
             return {}
-        return {tid: v * factor for tid, v in self.bias.items()}
+        return {tid: v * f for tid, v in self.bias.items()}
 
 
 class LogitModulator:
@@ -53,14 +60,19 @@ class LogitModulator:
 
     def __init__(self, tokenizer=None, vocab_size: int = 640):
         self.tokenizer = tokenizer
-        self.vocab_size = vocab_size
+        tok_size = 0
+        if tokenizer is not None:
+            try:
+                tok_size = int(tokenizer.size())
+            except Exception:  # noqa: BLE001
+                tok_size = 0
+        self.vocab_size = tok_size or vocab_size
 
     def text_to_bias(self, text: str, *, strength: float = 2.2) -> dict[int, float]:
         text = str(text or "").strip()
         if not text or self.tokenizer is None:
             return {}
         bias: dict[int, float] = {}
-        # 介入テキスト中の内容語をバイアス対象にする
         try:
             # トークナイズして各トークンにバイアスを付与
             ids = self.tokenizer.encode(text)
@@ -75,9 +87,9 @@ class LogitModulator:
                         for tid in cid[:2]:
                             if 0 <= tid < self.vocab_size:
                                 bias[tid] = bias.get(tid, 0.0) + strength * 0.3
-                    except Exception:
+                    except Exception:  # noqa: BLE001
                         pass
-        except Exception:
+        except Exception:  # noqa: BLE001
             # フォールバック: 文字コードベースの簡易バイアス
             for ch in text[:16]:
                 tid = ord(ch) % self.vocab_size
@@ -92,52 +104,61 @@ class LogitModulator:
                 bias[tid] = bias.get(tid, 0.0) + v * 0.5
         return bias
 
-    def apply(self, logits: np.ndarray, signals: list[SteeringSignal],
-              age_map: dict[int, int] | None = None) -> np.ndarray:
-        if not signals:
-            return logits
-        out = logits.astype(np.float32).copy()
-        for idx, sig in enumerate(signals):
-            age = age_map.get(idx, 0) if age_map else 0
-            eff = sig.effective_bias(age)
-            for tid, v in eff.items():
-                if 0 <= tid < out.shape[-1]:
-                    out[tid] += v
-        return out
+    def token_text(self, tid: int) -> str:
+        """token_id → 文字列 (GGUF など別語彙のバックエンドへの橋渡し用)。"""
+        if self.tokenizer is None:
+            return ""
+        try:
+            return str(self.tokenizer.itos.get(tid, ""))
+        except Exception:  # noqa: BLE001
+            return ""
 
 
 class SteeringBus:
     """ノンストップで介入を受け付けるバス。
 
-    生成スレッドは `poll()` で最新のバイアスを取得する。
+    生成スレッドは `active_biases()` で最新の合成バイアスを取得する。
     UI / API スレッドは `steer(text)` / `inject_evidence(sentences)` で
     いつでも介入できる。生成を止める必要はない。
+
+    適用イベント:
+        バイアスが実際に生成へ乗ると `note_applied` が記録され、
+        `take_events()` がそれを SSE イベントとして取り出せる。
     """
 
-    def __init__(self, modulator: LogitModulator | None = None):
+    def __init__(self, modulator: LogitModulator | None = None, max_events: int = 64):
         self.modulator = modulator or LogitModulator()
-        self._signals: deque[SteeringSignal] = deque(maxlen=16)
         self._lock = threading.RLock()
+        self._signals: dict[int, SteeringSignal] = {}
         self._age: dict[int, int] = {}
         self._next_id = 0
-        self._id_map: dict[int, SteeringSignal] = {}
+        self._events: list[dict] = []
+        self._max_events = max_events
+        self._applied_total = 0
 
-    def steer(self, text: str, *, strength: float = 2.2, ttl: int = 16) -> int:
+    # ------------------------------------------------------------------ #
+    # 介入の受付（生成中でもいつでも呼べる）
+    # ------------------------------------------------------------------ #
+    def steer(self, text: str, *, strength: float = 2.2, ttl: int = 16,
+              kind: str = "prompt", tokenizer=None) -> int:
         text = str(text or "").strip()
         if not text:
             return -1
-        bias = self.modulator.text_to_bias(text, strength=strength)
+        mod = self.modulator
+        if tokenizer is not None and mod.tokenizer is None:
+            mod.tokenizer = tokenizer
+            mod.vocab_size = int(tokenizer.size())
+        bias = mod.text_to_bias(text, strength=strength)
         if not bias:
             return -1
-        sig = SteeringSignal(text=text, bias=bias, strength=strength,
-                             ttl=ttl, created_at=time.time())
+        sig = SteeringSignal(id=-1, text=text, bias=bias, kind=kind,
+                             strength=strength, ttl=ttl)
         with self._lock:
-            sid = self._next_id
+            sig.id = self._next_id
             self._next_id += 1
-            self._signals.append(sig)
-            self._id_map[sid] = sig
-            self._age[sid] = 0
-        return sid
+            self._signals[sig.id] = sig
+            self._age[sig.id] = 0
+        return sig.id
 
     def inject_evidence(self, sentences: list[str], *, strength: float = 1.6) -> int:
         sentences = [s for s in sentences if s and s.strip()][:6]
@@ -146,65 +167,141 @@ class SteeringBus:
         bias = self.modulator.evidence_to_bias(sentences, strength=strength)
         if not bias:
             return -1
-        sig = SteeringSignal(text="|".join(sentences[:2]), bias=bias,
-                             strength=strength, ttl=20, created_at=time.time())
+        sig = SteeringSignal(id=-1, text=" | ".join(sentences[:2]), bias=bias,
+                             kind="evidence", strength=strength, ttl=20)
         with self._lock:
-            sid = self._next_id
+            sig.id = self._next_id
             self._next_id += 1
-            self._signals.append(sig)
-            self._id_map[sid] = sig
-            self._age[sid] = 0
-        return sid
+            self._signals[sig.id] = sig
+            self._age[sig.id] = 0
+        return sig.id
 
-    def poll(self) -> list[SteeringSignal]:
+    # ------------------------------------------------------------------ #
+    # 生成ループ側
+    # ------------------------------------------------------------------ #
+    def active_signals(self) -> list[SteeringSignal]:
+        """生きているシグナル（TTL/時間で失効したものを掃除して返す）。"""
+        now = time.time()
         with self._lock:
-            # TTL 切れを除去
-            alive: deque[SteeringSignal] = deque(maxlen=16)
-            new_age: dict[int, int] = {}
-            for sid, sig in list(self._id_map.items()):
-                age = self._age.get(sid, 0)
-                if age >= sig.ttl:
-                    continue
-                # 時間でも減衰 (30秒で消える)
-                if time.time() - sig.created_at > 30:
-                    continue
-                alive.append(sig)
-                new_age[sid] = age
-            self._signals = alive
-            # age を進める
-            for sid in list(new_age.keys()):
-                new_age[sid] += 1
-            self._age = new_age
-            return list(self._signals)
+            for sid in list(self._signals.keys()):
+                sig = self._signals[sid]
+                if self._age.get(sid, 0) >= sig.ttl or now - sig.created_at > 30:
+                    self._signals.pop(sid, None)
+                    self._age.pop(sid, None)
+            return [self._signals[sid] for sid in sorted(self._signals)]
+
+    def active_biases(self) -> dict[int, float]:
+        """減衰を適用した合成バイアス（生成ループが毎トークン呼ぶ）。"""
+        out: dict[int, float] = {}
+        for sig in self.active_signals():
+            for tid, v in sig.effective_bias(self._age.get(sig.id, 0)).items():
+                out[tid] = out.get(tid, 0.0) + v
+        return out
+
+    def advance(self) -> None:
+        """生成トークン 1 発ぶん age を進める（生成ループが呼ぶ）。"""
+        with self._lock:
+            for sid in list(self._age.keys()):
+                self._age[sid] += 1
 
     def apply_to_logits(self, logits: np.ndarray) -> np.ndarray:
-        signals = self.poll()
-        if not signals:
+        """ロジットへ確率の波を加算し、適用を記録する。"""
+        biases = self.active_biases()
+        if not biases:
             return logits
-        age_map = {i: self._age.get(sid, 0)
-                   for i, sid in enumerate(list(self._id_map.keys())[-len(signals):])}
-        # 簡易: 全シグナルを合成
-        out = logits
-        for sig in signals:
-            # 各シグナルの age を取得
-            eff = sig.effective_bias(0)  # 近似
-            for tid, v in eff.items():
-                if 0 <= tid < out.shape[-1]:
-                    out[tid] += v * 0.5
+        out = logits.astype(np.float32).copy()
+        n = out.shape[-1]
+        hit = 0
+        for tid, v in biases.items():
+            if 0 <= tid < n:
+                out[tid] += v
+                hit += 1
+        if hit:
+            self.note_applied(n_tokens=hit)
         return out
+
+    def active_text_biases(self) -> dict[str, float]:
+        """合成バイアスを「トークン文字列 → 重み」で返す。
+
+        別語彙のバックエンド（GGUF の BPE など）では文字単位の token_id が
+        一致しないため、文字列を橋渡しに自前のトークナイザで再エンコードする。
+        """
+        out: dict[str, float] = {}
+        biases = self.active_biases()
+        for tid, v in biases.items():
+            s = self.modulator.token_text(tid)
+            if s:
+                out[s] = out.get(s, 0.0) + v
+        return out
+
+    def note_applied(self, *, n_tokens: int = 0) -> None:
+        """バイアスが発動したことを適用イベントとして記録する。"""
+        with self._lock:
+            self._applied_total += 1
+            sigs = sorted(self._signals.values(), key=lambda s: s.id)
+            for sig in sigs:
+                sig.applied_tokens += max(1, n_tokens)
+            if sigs:
+                latest = sigs[-1]
+                self._events.append({
+                    "type": "steer",
+                    "kind": latest.kind,
+                    "text": latest.text[:80],
+                    "signals": len(sigs),
+                    "tokens_biased": n_tokens,
+                    "t": time.time(),
+                })
+                if len(self._events) > self._max_events:
+                    del self._events[: len(self._events) - self._max_events]
+
+    # ------------------------------------------------------------------ #
+    # 可視化（SSE イベント化）
+    # ------------------------------------------------------------------ #
+    def take_events(self) -> list[dict]:
+        """適用イベントを取り出す。同一シグナルの連打は 1 件に集約する。
+
+        トークンごとに適用を記録すると UI が埋まるので、(kind, text) 単位で
+        合算し「何トークンに干渉したか」を 1 行にまとめて返す。
+        """
+        with self._lock:
+            ev, self._events = self._events, []
+        merged: dict[tuple, dict] = {}
+        order: list[tuple] = []
+        for e in ev:
+            key = (e.get("kind"), e.get("text"))
+            if key in merged:
+                merged[key]["tokens_biased"] += int(e.get("tokens_biased") or 0)
+                merged[key]["applies"] += 1
+            else:
+                merged[key] = {**e, "applies": 1}
+                order.append(key)
+        return [merged[k] for k in order]
+
+    def snapshot_new(self, after_id: int) -> list[SteeringSignal]:
+        """after_id より後に届いたシグナル（リモート転送などに使う）。"""
+        with self._lock:
+            return [s for sid, s in sorted(self._signals.items()) if sid > after_id]
+
+    def last_id(self) -> int:
+        with self._lock:
+            return self._next_id - 1
 
     def clear(self):
         with self._lock:
             self._signals.clear()
-            self._id_map.clear()
             self._age.clear()
+            self._events.clear()
+            self._applied_total = 0
 
     def status(self) -> dict:
         with self._lock:
             return {
                 "pending": len(self._signals),
-                "signals": [{"text": s.text[:48], "ttl": s.ttl, "strength": s.strength}
-                            for s in list(self._signals)[-4:]],
+                "applied_total": self._applied_total,
+                "signals": [{"id": s.id, "text": s.text[:48], "kind": s.kind,
+                             "ttl": s.ttl, "strength": s.strength,
+                             "applied_tokens": s.applied_tokens}
+                            for s in sorted(self._signals.values(), key=lambda s: s.id)[-4:]],
             }
 
 
@@ -221,4 +318,12 @@ def get_steering_bus(tokenizer=None) -> SteeringBus:
             _GLOBAL_BUS = SteeringBus(mod)
         elif tokenizer is not None and _GLOBAL_BUS.modulator.tokenizer is None:
             _GLOBAL_BUS.modulator.tokenizer = tokenizer
+            _GLOBAL_BUS.modulator.vocab_size = int(tokenizer.size())
         return _GLOBAL_BUS
+
+
+def reset_steering_bus() -> None:
+    """テスト用のリセット（シングルトンを破棄する）。"""
+    global _GLOBAL_BUS
+    with _BUS_LOCK:
+        _GLOBAL_BUS = None

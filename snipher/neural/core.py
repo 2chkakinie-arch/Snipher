@@ -36,6 +36,23 @@ def _top_k_filter(logits: np.ndarray, k: int) -> np.ndarray:
     return np.where(logits < cutoff, -np.inf, logits)
 
 
+def _top_p_filter(logits: np.ndarray, p: float) -> np.ndarray:
+    """Gemma 2 系の nucleus sampling（累積確率 p を超えた裾を落とす）。"""
+    if p >= 1.0 or p <= 0.0:
+        return logits
+    order = np.argsort(logits)[::-1]
+    sorted_lg = logits[order]
+    probs = np.exp(sorted_lg - sorted_lg.max())
+    probs = probs / max(1e-12, probs.sum())
+    cum = np.cumsum(probs)
+    cutoff = int(np.searchsorted(cum, p) + 1)
+    cutoff = max(1, min(cutoff, logits.shape[-1]))
+    keep = order[:cutoff]
+    out = np.full_like(logits, -np.inf)
+    out[keep] = logits[keep]
+    return out
+
+
 class _Decoder:
     """KV キャッシュ付きの逐次デコーダ。
 
@@ -137,22 +154,19 @@ class DistilledCore:
     # 低レベル生成
     # ------------------------------------------------------------------ #
     def _sample(self, logits: np.ndarray, rng: np.random.Generator, temperature: float,
-                top_k: int, penalty_ids: list[int], repetition_penalty: float) -> int:
+                top_k: int, penalty_ids: list[int], repetition_penalty: float,
+                top_p: float = 1.0) -> int:
         lg = logits.astype(np.float32).copy()
         # --- リアルタイム・ステアリング: 確率の波をロジットに干渉 ---
-        # 生成中でもノンストップで受け取った介入プロンプト/Web検索結果を
-        # ロジット・バイアスとして加算する (出力を止めずにステア可能)
+        # 生成中でもノンストップで受け取った介入プロンプト/Web検索結果/熟考の結論を
+        # ロジット・バイアスとして加算する (出力を止めずにステア可能)。
+        # 適用された波は SteeringBus にイベントとして記録され、UI へ流れる。
         try:
             from ..lfm.steering import get_steering_bus
             bus = get_steering_bus(tokenizer=self.tok)
-            # bus が保持するバイアスを加算 (TTL/減衰付き)
-            signals = bus.poll() if bus is not None else []
-            if signals:
-                for sig in signals:
-                    for tid, v in (sig.bias or {}).items():
-                        if 0 <= tid < lg.shape[-1]:
-                            lg[tid] += float(v) * 0.55
-        except Exception:
+            if bus is not None:
+                lg = bus.apply_to_logits(lg)
+        except Exception:  # noqa: BLE001
             pass
         if repetition_penalty and penalty_ids:
             for i in set(penalty_ids):
@@ -161,6 +175,8 @@ class DistilledCore:
                 else:
                     lg[i] = lg[i] * repetition_penalty
         lg = _top_k_filter(lg, top_k)
+        if top_p is not None and 0.0 < top_p < 1.0:
+            lg = _top_p_filter(lg, top_p)
         if temperature <= 1e-3:
             return int(np.argmax(lg))
         p = np.exp((lg - lg.max()) / temperature)
@@ -173,7 +189,7 @@ class DistilledCore:
     def generate_ids(self, prompt_ids: list[int], *, max_new: int = 64, temperature: float = 0.8,
                      top_k: int = 40, repetition_penalty: float = 1.08, seed: int | None = None,
                      forbid: tuple[int, ...] = (PAD, UNK, USER, SYS), ctx: int = 56,
-                     use_cache: bool = True) -> list[int]:
+                     use_cache: bool = True, top_p: float = 1.0) -> list[int]:
         """続きのトークン ID 列を生成する（KV キャッシュ使用・結果は非キャッシュと同一）。"""
         assert self.net is not None and self.tok is not None
         rng = np.random.default_rng(seed)
@@ -192,7 +208,8 @@ class DistilledCore:
                 window = ids[-ctx:] if len(ids) > ctx else ids
                 logits, _ = net.forward(np.array([window or [BOS]], dtype=np.int64))
                 last = logits[0, -1]
-            nxt = self._sample(last, rng, temperature, top_k, ids, repetition_penalty)
+            nxt = self._sample(last, rng, temperature, top_k, ids, repetition_penalty, top_p)
+            self._advance_steering()
             if nxt == EOS or nxt in forbid:
                 break
             ids.append(nxt)
@@ -203,6 +220,16 @@ class DistilledCore:
             if dec is not None:
                 last = dec.advance(nxt)
         return out
+
+    def _advance_steering(self) -> None:
+        """生成トークン 1 発ぶん、ステアリング波の age を進める（減衰）。"""
+        try:
+            from ..lfm.steering import get_steering_bus
+            bus = get_steering_bus(tokenizer=self.tok)
+            if bus is not None:
+                bus.advance()
+        except Exception:  # noqa: BLE001
+            pass
 
     def generate(self, prompt: str = "", *, max_chars: int = 64, temperature: float = 0.8,
                  top_k: int = 40, seed: int | None = None, as_assistant: bool = True) -> str:
@@ -219,7 +246,8 @@ class DistilledCore:
         return text.strip()
 
     def reply(self, user_text: str, *, max_chars: int = 72, temperature: float = 0.8,
-              top_k: int = 40, seed: int | None = None, context: list[dict] | None = None) -> str:
+              top_k: int = 40, seed: int | None = None, context: list[dict] | None = None,
+              top_p: float = 1.0) -> str:
         """発話に対する返答を生成する（内部プロンプトは <user>/<asst> マーカー）。"""
         if not self.is_ready:
             return ""
@@ -232,7 +260,7 @@ class DistilledCore:
                 hist += f"<asst>{m.get('content', '')}\n"
         ids = [BOS] + self.tok.encode(hist + f"<user>{user_text}\n<asst>")  # type: ignore[union-attr]
         gen = self.generate_ids(ids, max_new=max_chars, temperature=temperature, top_k=top_k,
-                                seed=seed, forbid=(PAD, UNK, USER, SYS, ASST))
+                                seed=seed, forbid=(PAD, UNK, USER, SYS, ASST), top_p=top_p)
         return self.tok.decode(gen).strip()  # type: ignore[union-attr]
 
     # ------------------------------------------------------------------ #
@@ -310,7 +338,7 @@ class DistilledCore:
     def stream_chat(self, messages: list[dict], *, max_new_tokens: int | None = None,
                     temperature: float | None = None, top_k: int | None = None,
                     repetition_penalty: float | None = None, use_template: bool = True,
-                    system_prompt: str | None = None, **_ignored):
+                    system_prompt: str | None = None, top_p: float | None = None, **_ignored):
         """`GgufBackend.stream_chat` と同じイベントを出す（UI/コア側は無差別に使える）。"""
         if not self.is_ready:
             yield {"type": "error", "message": "内蔵ニューラルコアがロードされていません"}
@@ -333,6 +361,7 @@ class DistilledCore:
         temp = float(temperature if temperature is not None else 0.8)
         k = int(top_k or 40)
         rep = float(repetition_penalty or 1.06)
+        nucleus = float(top_p) if top_p else 1.0
         yield {"type": "start", "engine": self.engine_name(),
                "template_mode": "builtin-role-markers"}
         rng = np.random.default_rng(int(time.time() * 1000) % (2 ** 31))
@@ -343,7 +372,8 @@ class DistilledCore:
             dec = _Decoder(self.net, cur, ctx=56)  # type: ignore[arg-type]
             last = dec.logits
             while n < max_new:
-                nxt = self._sample(last, rng, temp, k, cur, rep)
+                nxt = self._sample(last, rng, temp, k, cur, rep, nucleus)
+                self._advance_steering()
                 if nxt == EOS or nxt in (PAD, UNK, USER, SYS, ASST):
                     break
                 cur.append(nxt)
@@ -364,7 +394,7 @@ class DistilledCore:
             "engine": self.engine_name(), "backend": "distilled",
             "new_tokens": n, "tokens_per_second": round(n / dt, 1),
             "seconds": round(dt, 3), "max_new_tokens": max_new,
-            "temperature": temp, "top_k": k,
+            "temperature": temp, "top_k": k, "top_p": nucleus,
         }}
 
     def scan_unknown(self, text: str) -> dict | None:

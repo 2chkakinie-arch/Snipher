@@ -136,6 +136,25 @@
   .spinner { width: 14px; height: 14px; border-radius: 50%; border: 1.5px solid var(--line2);
     border-top-color: var(--text); animation: spin 0.65s linear infinite; }
   @keyframes spin { to { transform: rotate(360deg); } }
+  /* ---- Agent timeline: 検索・熟考・ステアリングの全関わりをチャットラインへ ---- */
+  .acts { display: flex; flex-direction: column; gap: 4px; margin-bottom: 10px; }
+  .act {
+    display: flex; align-items: baseline; gap: 8px;
+    font-size: 0.72rem; color: var(--muted); line-height: 1.5;
+    padding: 5px 10px; border: 1px solid var(--line); border-radius: 9px;
+    background: var(--bg2); animation: rise 0.22s ease; letter-spacing: 0.01em;
+  }
+  .act .ico { flex: none; font-size: 0.74rem; opacity: 0.9; }
+  .act .lbl { color: var(--accent2); font-weight: 600; flex: none; }
+  .act .det { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .act.pending .lbl::after { content: "…"; animation: blink 1s steps(1) infinite; }
+  .act.steer { border-color: #3f3f46; }
+  .act.steer .lbl { color: var(--text); }
+  .act .steps { display: none; flex-basis: 100%; white-space: pre-wrap; color: var(--dim);
+    border-top: 1px dashed var(--line); margin-top: 4px; padding-top: 4px; font-size: 0.70rem; }
+  .act.open .steps { display: block; }
+  .act.clickable { cursor: pointer; }
+  .act.clickable:hover { border-color: var(--line2); }
   .cursor::after { content: "▍"; color: var(--text); animation: blink 1s steps(1) infinite; font-weight: 300; }
   @keyframes blink { 50% { opacity: 0; } }
   .hero { text-align: center; padding: 44px 12px 8px; }
@@ -283,10 +302,73 @@ function addUser(text) {
 function addAi() {
   const d = document.createElement("div");
   d.className = "msg ai";
-  d.innerHTML = `<div class="avatar">S</div><div class="bubble"><div class="body cursor"><span class="thinking"><span class="spinner"></span>推論中…</span></div><div class="sources" style="display:none"></div><div class="meta"></div></div>`;
+  d.innerHTML = `<div class="avatar">S</div><div class="bubble"><div class="acts"></div><div class="body cursor"><span class="thinking"><span class="spinner"></span>推論中…</span></div><div class="sources" style="display:none"></div><div class="meta"></div></div>`;
   thread.appendChild(d); scrollTop(); return d;
 }
 function scrollTop() { scroll.scrollTop = scroll.scrollHeight; }
+
+/* ---------- Agent timeline（すべての関わりをチャットラインへ） ---------- */
+const ACT_ICO = { web: "🌐", thought: "🧠", steer: "⚡", assist: "⚙", route: "⚙" };
+function addAct(actsBox, kind, label, detail, opts) {
+  opts = opts || {};
+  const el = document.createElement("div");
+  el.className = "act " + kind + (opts.pending ? " pending" : "") + (opts.steps ? " clickable" : "");
+  const ico = document.createElement("span"); ico.className = "ico"; ico.textContent = ACT_ICO[kind] || "·";
+  const lbl = document.createElement("span"); lbl.className = "lbl"; lbl.textContent = label;
+  const det = document.createElement("span"); det.className = "det"; det.textContent = detail || "";
+  el.appendChild(ico); el.appendChild(lbl); if (detail) el.appendChild(det);
+  if (opts.steps) {
+    const st = document.createElement("div"); st.className = "steps";
+    st.textContent = opts.steps.map((s, i) => `${i + 1}. ${s}`).join("\n");
+    el.appendChild(st);
+    el.addEventListener("click", () => el.classList.toggle("open"));
+  }
+  actsBox.appendChild(el); scrollTop();
+  return el;
+}
+function onWaveEvent(actsBox, ev, refs) {
+  if (ev.type === "web") {
+    if (ev.state === "start") {
+      refs.web = addAct(actsBox, "web", "Web検索", ev.query || "", { pending: true });
+    } else if (ev.state === "done") {
+      const n = ev.sentences || 0;
+      const srcTxt = (ev.sources || []).map((s) => s.title || domainOf(s.url || "")).filter(Boolean).slice(0, 3).join(" / ");
+      const detail = n ? `${n} 件の証拠文 → 確率波として生成に干渉` : "該当なし（生成は継続）";
+      if (refs.web) { refs.web.classList.remove("pending"); refs.web.querySelector(".det").textContent = detail; refs.web = null; }
+      else addAct(actsBox, "web", "Web検索", detail);
+      if (srcTxt) addAct(actsBox, "web", "出典", srcTxt);
+    }
+  } else if (ev.type === "thought") {
+    if (ev.state === "start") {
+      refs.thought = addAct(actsBox, "thought", "並列熟考", "裏で深い推論を実行中", { pending: true });
+    } else if (ev.state === "done") {
+      const detail = ev.conclusion ? `結論: ${ev.conclusion}` : "思考完了";
+      const steps = ev.steps || [];
+      if (refs.thought) { refs.thought.remove(); refs.thought = null; }
+      addAct(actsBox, "thought", "並列熟考", detail, { steps });
+    }
+  } else if (ev.type === "steer") {
+    // 同一テキストの波は 1 行に集約（トークン数だけ更新）
+    const label = `ステアリング波: ${ev.text || ""}`;
+    let line = null;
+    for (const el of actsBox.querySelectorAll(".act.steer")) {
+      if (el.dataset.steerText === (ev.text || "")) { line = el; break; }
+    }
+    if (line) {
+      line.querySelector(".det").textContent = `${ev.tokens_biased || 0} トークンに干渉中`;
+    } else {
+      line = addAct(actsBox, "steer", "ステアリング波", `${ev.text || ""} → ${ev.tokens_biased || 0} トークンに干渉`);
+      line.dataset.steerText = ev.text || "";
+    }
+  } else if (ev.type === "assist") {
+    const bits = [];
+    if (ev.route) bits.push("route " + ev.route);
+    if (ev.mode) bits.push(ev.mode);
+    if (ev.plan) bits.push(ev.plan);
+    if (ev.confidence != null) bits.push("conf " + Number(ev.confidence).toFixed(2));
+    addAct(actsBox, "assist", "経路判定", bits.join(" · "));
+  }
+}
 
 /* ---------- ローカルフォールバック ---------- */
 let localEngine = null;
@@ -305,21 +387,27 @@ async function localReply(messages) {
 /* ---------- 送信 (リアルタイム・ステアリング対応: 生成中でも追加入力可能) ---------- */
 let sending = false;
 let currentController = null;
+let currentActs = null;   // 進行中のAI応答の Agent タイムライン
 async function send() {
   const text = input.value.trim();
   // 生成中に別プロンプトを送ったら、ステアリングとして干渉させる (止めない)
   if (sending && text) {
     try {
-      await fetch("/api/steer", {
+      const r = await fetch("/api/steer", {
         method: "POST", headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ text })
       });
+      const ok = (await r.json().catch(() => ({}))).ok;
       input.value = ""; input.style.height = "auto";
       // ユーザー側にも小さく表示
       const d = document.createElement("div");
       d.className = "msg user"; d.style.opacity = "0.55";
       d.innerHTML = `<div class="avatar">↗</div><div class="bubble" style="font-size:0.82rem">↗ ${esc(text)} (steer)</div>`;
-      thread.appendChild(d); scrollTop();
+      thread.appendChild(d);
+      // 進行中のAI応答のタイムラインにも波の送出を記録
+      if (currentActs) addAct(currentActs, "steer", "ステアリング送出",
+        ok ? `${text} → 確率波として生成に注入（出力は継続）` : `${text} → 注入失敗`, {});
+      scrollTop();
       return;
     } catch (e) { /* fall through */ }
   }
@@ -331,7 +419,11 @@ async function send() {
   history.push({ role: "user", content: text });
   const node = addAi();
   const body = node.querySelector(".body"), srcBox = node.querySelector(".sources"), meta = node.querySelector(".meta");
+  const actsBox = node.querySelector(".acts");
+  currentActs = actsBox;
+  const waveRefs = {};
   const pill = $("stPill"); pill.classList.add("busy");
+  input.placeholder = "生成中はここからステアリング（出力を止めずに干渉）…";
   let acc = "", engine = "", stats = null, started = false;
   try {
     const res = await fetch("/api/chat", {
@@ -356,6 +448,9 @@ async function send() {
             acc += ev.text || ""; body.innerHTML = renderMd(acc); scrollTop();
           } else if (ev.type === "done") { acc = ev.text || acc; stats = ev.stats || null; }
           else if (ev.type === "error") { acc = `エラー: ${ev.message || "不明"}`; }
+          else if (ev.type === "web" || ev.type === "thought" || ev.type === "steer" || ev.type === "assist") {
+            onWaveEvent(actsBox, ev, waveRefs);
+          }
         }
       }
     }
@@ -364,6 +459,7 @@ async function send() {
     if (!acc) acc = "通信に失敗しました。時間をおいてお試しください。";
     else { body.innerHTML = renderMd(acc); }
   }
+  input.placeholder = "メッセージを入力…";
   body.classList.remove("cursor");
   body.innerHTML = acc.startsWith("エラー") || acc.startsWith("通信に") ? `<p class="err">${esc(acc)}</p>` : renderMd(acc);
   const sources = (stats && stats.sources) || [];
@@ -383,11 +479,16 @@ async function send() {
   if (stats && stats.seconds != null) bits.push(`${stats.seconds}秒`);
   if (stats && stats.confidence != null) bits.push(`確信度 ${stats.confidence}`);
   if (stats && stats.gemma) bits.push("Gemma波");
-  if (stats && stats.realtime_web) bits.push("Web波");
+  const waves = (stats && stats.waves) || null;
+  if (waves) {
+    if (waves.web_search) bits.push(waves.web_hits ? `Web波×${waves.web_hits}` : "Web波");
+    if (waves.deliberate) bits.push("熟考波");
+    if (waves.steer_waves) bits.push(`ステアリング波×${waves.steer_waves}`);
+  }
   if (bits.length) meta.textContent = bits.join(" · ");
   history.push({ role: "assistant", content: acc });
   pill.classList.remove("busy");
-  sending = false; sendBtn.disabled = false;
+  sending = false; sendBtn.disabled = false; currentActs = null;
   input.focus(); scrollTop();
 }
 sendBtn.onclick = send;

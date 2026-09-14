@@ -37,6 +37,7 @@ from __future__ import annotations
 import logging
 import math
 import os
+import queue
 import re
 import threading
 import time
@@ -88,6 +89,131 @@ ROUTE_KNOWLEDGE = "knowledge"  # 📚 知識ベース検索＋補足生成
 ROUTE_LIGHT = "light"          # ✨ 内蔵ニューラルコア（LFM2.5 蒸留）が生成
 ROUTE_NEURAL = "neural"        # ✨ LFM2.5 が生成（フルウェイト / リモート）
 ROUTE_FALLBACK = "fallback"    # 高速コアのみ（ニューラル未就绪）
+
+# 並列波（熟考 / リアルタイムWeb）を done の直前に待つ上限。
+# 挨拶・短い相槌は波を起動しないので、この待ちは発生しない（高速経路は無傷）。
+WAVE_WAIT_MS = float(os.environ.get("SNIPHER_WAVE_WAIT_MS", "650"))
+
+
+class _WaveTracker:
+    """1 応答に並走する「確率の波」（並列熟考 / リアルタイムWeb / ステアリング）の管理。
+
+    - 入力受信と同時に熟考とWeb検索を裏で開始する（応答生成を止めない）
+    - 完了イベントはキューに積まれ、生成ループの合間に SSE イベントとして流れる
+    - 結果は SteeringBus へ注入され、生成中のロジットに確率波として干渉する
+    - done の直前だけ、未着の波を WAVE_WAIT_MS まで待つ（挨拶では待たない）
+    """
+
+    def __init__(self, core: "SnipherCore", last_user: str, messages: list[dict],
+                 web: bool | None):
+        self.q: "queue.Queue[dict]" = queue.Queue()
+        self.web_fut = None
+        self.delib_fut = None
+        self.web_started = False
+        self.delib_started = False
+        self.sources: list[dict] = []
+        self.web_hits = 0
+        self.thought: dict | None = None
+        self.steer_waves = 0
+        self.searchable = False
+        try:
+            self.searchable = bool(should_search_realtime(last_user))
+        except Exception:  # noqa: BLE001
+            self.searchable = False
+        try:
+            self.bus = core.steering_bus()
+        except Exception:  # noqa: BLE001
+            self.bus = None
+        # 並列熟考（裏で深い推論 → 完了次第 SteeringBus へ確率波として注入）
+        try:
+            d = core.deliberative()
+            if d is not None:
+                _, self.delib_fut = d.think_async(last_user, history=messages,
+                                                  on_done=self._on_thought)
+                self.delib_started = True
+                if self.searchable:
+                    self.q.put({"type": "thought", "state": "start"})
+        except Exception:  # noqa: BLE001
+            pass
+        # リアルタイムWeb（挨拶・相槌以外のあらゆるプロンプトで出力中に検索）
+        try:
+            rw = core.realtime_web()
+            if rw is not None and web is not False and self.searchable:
+                self.q.put({"type": "web", "state": "start",
+                            "query": str(last_user)[:80]})
+                _, self.web_fut = rw.search_async(last_user, on_result=self._on_web)
+                self.web_started = True
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _on_thought(self, result) -> None:
+        try:
+            self.thought = result.as_dict()
+        except Exception:  # noqa: BLE001
+            self.thought = {"conclusion": ""}
+        ev = {"type": "thought", "state": "done"}
+        ev.update(self.thought or {})
+        self.q.put(ev)
+
+    def _on_web(self, sentences, sources) -> None:
+        srcs = []
+        for s in list(sources or [])[:4]:
+            if isinstance(s, dict):
+                srcs.append({k: s.get(k) for k in ("url", "title", "snippet") if s.get(k)})
+        self.sources = srcs
+        self.web_hits = len(sentences or [])
+        self.q.put({"type": "web", "state": "done", "sentences": self.web_hits,
+                    "sources": srcs})
+
+    # ---- 生成ループ側 ---- #
+    def drain(self) -> list[dict]:
+        out: list[dict] = []
+        if self.bus is not None:
+            try:
+                for ev in self.bus.take_events():
+                    self.steer_waves += 1
+                    out.append(ev)
+            except Exception:  # noqa: BLE001
+                pass
+        while True:
+            try:
+                out.append(self.q.get_nowait())
+            except queue.Empty:
+                break
+        return out
+
+    def pending(self) -> bool:
+        for f in (self.web_fut, self.delib_fut):
+            if f is not None and not f.done():
+                return True
+        return False
+
+    def settle(self, budget_ms: float) -> list[dict]:
+        """未着の波を budget_ms まで待つ（挨拶・相槌では 0 待ち）。
+
+        待つのは Web の波だけ（証拠文は応答に使える実材料）。
+        熟考の波はノンブロッキング — 届いた分だけイベントとして流し、
+        出力を止めることはしない（裏で走り続け、次の生成に干渉する）。
+        """
+        out: list[dict] = []
+        if not self.web_started or budget_ms <= 0:
+            return self.drain()
+        deadline = time.monotonic() + budget_ms / 1000.0
+        while self.web_fut is not None and not self.web_fut.done() \
+                and time.monotonic() < deadline:
+            time.sleep(0.01)
+            out.extend(self.drain())
+        out.extend(self.drain())
+        return out
+
+    def stats(self) -> dict:
+        return {
+            "deliberate": self.delib_started,
+            "web_search": self.web_started,
+            "web_hits": self.web_hits,
+            "steer_waves": self.steer_waves,
+            "thought": bool(self.thought),
+        }
 
 
 class SnipherCore:
@@ -1003,8 +1129,13 @@ class SnipherCore:
         if mode == "light":
             return self._light_route(draft, force=True)
         if mode in ("lfm", "neural"):
-            # 強制指定でも、重いコアが無ければ内蔵蒸留コアが同じ顔をして応答する
-            return ROUTE_NEURAL if self.neural_available() else self._light_route(draft, force=True)
+            # 強制指定でも、重いコアが無ければ Gemma 2 準拠の確率的エンジンが
+            # 同じ顔をして応答する（基盤は内蔵蒸留重み・サンプリングは Gemma 流）
+            if self.neural_available():
+                return ROUTE_NEURAL
+            if self.gemma_ready():
+                return ROUTE_NEURAL
+            return self._light_route(draft, force=True)
         if not self.neural_available():
             return self._light_route(draft, force=False)
         intent = str(draft.get("intent") or "")
@@ -1027,7 +1158,7 @@ class SnipherCore:
                      max_new_tokens: int | None = None, temperature: float | None = None,
                      top_k: int | None = None, repetition_penalty: float | None = None,
                      use_template: bool = True, system_prompt: str | None = None,
-                     web: bool | None = None):
+                     web: bool | None = None, wave_wait_ms: float | None = None):
         """SSE 用イベントジェネレータ。Snipher Core の内部パイプライン本体。
 
         v5 アーキテクチャ: 高速推論を止めずに「Gemma級確率生成 + 並列熟考 + リアルタイムWeb波」が確率的に干渉する。
@@ -1036,25 +1167,45 @@ class SnipherCore:
               - リアルタイムWebが挨拶以外の全プロンプトで検索を開始 (realtime_web)
             両者の結果は SteeringBus 経由でロジット・バイアスとして生成に波及する。
             高速コアは 1ms で下書きを作り、Gemma/蒸留コアが確率的にそれを磨く。
+
+        v6: すべての関わり（検索の開始/結果・熟考の思考・ステアリング波の適用）を
+            SSE イベント（web / thought / steer）としてチャットラインへ流す（Agent 化）。
+            生成は止めない — 波のイベントは delta の合間に差し込まれ、
+            未着の波だけ done の直前に WAVE_WAIT_MS を上限に待つ。
         """
         last_user = next(
             (m.get("content", "") for m in reversed(messages) if m.get("role") == "user"), ""
         )
+        waves = _WaveTracker(self, last_user, messages, web)
+        budget = WAVE_WAIT_MS if wave_wait_ms is None else float(wave_wait_ms)
 
-        # 0) 並列熟考とリアルタイムWebを即座に起動 (ノンブロッキング、高速推論を止めない)
-        try:
-            deliberate = self.deliberative()
-            if deliberate is not None:
-                deliberate.think_async(last_user, history=messages)
-        except Exception:
-            pass
-        try:
-            rweb = self.realtime_web()
-            if rweb is not None and web is not False:
-                # 挨拶・短い相槌以外はすべて検索 (無限知識の再現)。出力中に確率波として干渉。
-                rweb.search_async(last_user)
-        except Exception:
-            pass
+        def run(inner):
+            """内部パイプラインのイベントに、並列波のイベントを織り交ぜる。"""
+            seen_start = False
+            for ev in inner:
+                if ev.get("type") == "start":
+                    seen_start = True
+                    yield ev
+                    for w in waves.drain():
+                        yield w
+                    continue
+                if seen_start:
+                    for w in waves.drain():
+                        yield w
+                if ev.get("type") == "done":
+                    for w in waves.settle(budget):
+                        yield w
+                    stats = ev.get("stats")
+                    if not isinstance(stats, dict):
+                        stats = {}
+                        ev["stats"] = stats
+                    stats["waves"] = waves.stats()
+                    if waves.sources:
+                        seen_urls = {str(s.get("url")) for s in stats.get("sources") or []}
+                        merged = list(stats.get("sources") or [])
+                        merged += [s for s in waves.sources if str(s.get("url")) not in seen_urls]
+                        stats["sources"] = merged[:8]
+                yield ev
 
         # 1) 未知文字の自動検出・自動学習（LFM2.5 のパラメータを適用）
         try:
@@ -1076,7 +1227,7 @@ class SnipherCore:
                 log.debug("指示層が失敗（通常経路へ続行）", exc_info=True)
                 events = None
             if events:
-                yield from events
+                yield from run(events)
                 return
 
         # 3) 高速コアの下書き（数ミリ秒）
@@ -1084,20 +1235,20 @@ class SnipherCore:
         route = self.route_of(draft, mode, user_text=last_user, web=web)
 
         if route == ROUTE_NEURAL:
-            yield from self._neural_reply(messages, draft, mode,
-                                          max_new_tokens=max_new_tokens,
-                                          temperature=temperature, top_k=top_k,
-                                          repetition_penalty=repetition_penalty,
-                                          use_template=use_template,
-                                          system_prompt=system_prompt)
+            yield from run(self._neural_reply(messages, draft, mode,
+                                              max_new_tokens=max_new_tokens,
+                                              temperature=temperature, top_k=top_k,
+                                              repetition_penalty=repetition_penalty,
+                                              use_template=use_template,
+                                              system_prompt=system_prompt))
             return
 
         if route in (ROUTE_LIGHT, ROUTE_KNOWLEDGE):
-            yield from self._light_reply(messages, draft, route, mode=mode, web=web)
+            yield from run(self._light_reply(messages, draft, route, mode=mode, web=web))
             return
 
         # 4) instant / fallback: ニューラルを 1 トークンも使わず、その場で文を組み立てる
-        yield from self._fast_reply(messages, draft, route, t0=t0, web=web)
+        yield from run(self._fast_reply(messages, draft, route, t0=t0, web=web))
 
     def _instruction_reply(self, messages: list[dict], *, web: bool | None = None,
                            t0: float | None = None) -> list[dict] | None:
@@ -1320,6 +1471,15 @@ class SnipherCore:
         import re as _re
 
         core = self.light_core()
+        # Gemma 2 準拠の確率的生成エンジン（蒸留重みを Gemma のサンプリング
+        # temperature/top_k/top_p で回す）。準備できていれば生成はこちらが担う。
+        gen = core
+        try:
+            _g = self.gemma_engine()
+            if _g is not None and _g.is_ready:
+                gen = _g
+        except Exception:  # noqa: BLE001
+            pass
         lm = self.lm()
         composer = None
         try:
@@ -1381,7 +1541,7 @@ class SnipherCore:
         if core is not None and (not authoritative or force_light):
             if force_light:
                 # 明示的に light/lfm が選ばれたターンは、材料がなくても生成を試みる
-                gen_text = core.reply(last_user, context=messages, max_chars=34,
+                gen_text = gen.reply(last_user, context=messages, max_chars=34,
                                       temperature=0.6, top_k=24) or ""
                 used_core = bool(gen_text)
                 if gen_text:
@@ -1397,7 +1557,7 @@ class SnipherCore:
                 # 知識ベースの followups（人が書いた問い）があるなら、それを優先する
                 # （生成文は文法的でも中身が空のことがあるため）。
                 if needs_follow and len(text) < 120:
-                    gen_text = core.reply(last_user, context=messages, max_chars=28,
+                    gen_text = gen.reply(last_user, context=messages, max_chars=28,
                                           temperature=0.5, top_k=20) or ""
                     used_core = bool(gen_text)
                     if gen_text:
@@ -1421,7 +1581,7 @@ class SnipherCore:
                 cands: list[str] = []
                 for temp, topk, sd in ((0.60, 24, 11), (0.85, 40, 23), (0.45, 12, 37)):
                     try:
-                        one = (core.reply(last_user, context=messages,
+                        one = (gen.reply(last_user, context=messages,
                                           max_chars=self.cfg.light_max_chars,
                                           temperature=temp, top_k=topk, seed=sd) or "").strip()
                     except Exception:  # noqa: BLE001
@@ -1513,8 +1673,8 @@ class SnipherCore:
             engine = f"Snipher tool ({task_kind})"
             template_mode = "tool-grounded"
         elif used_core:
-            engine = core.engine_name()
-            template_mode = "distilled-numpy"
+            engine = gen.engine_name() if gen is not core else core.engine_name()
+            template_mode = "gemma-probabilistic" if gen is not core else "distilled-numpy"
         elif material:
             engine = "Snipher 知識ベース + composer"
             template_mode = "knowledge+composer"
@@ -1530,6 +1690,7 @@ class SnipherCore:
             "engine": engine,
             "template_mode": template_mode,
             "neural_used": used_core,
+            "gemma": bool(used_core and gen is not core),
             "assist": "light",
             "route": route,
             "plan": reply.plan,
@@ -1583,10 +1744,87 @@ class SnipherCore:
             return self.boot_error or "ニューラルランタイム未インストール"
         return "ニューラルコア未起動"
 
+    def _gemma_reply(self, messages: list[dict], draft: dict, gemma, **opts):
+        """✨ Gemma 2 準拠の確率的生成エンジンが本文を作る経路。
+
+        文字単位の logits → softmax → サンプリング（temperature/top_k/top_p/反復罰）を
+        1 文字ずつ回す。生成中は SteeringBus の確率波（ユーザーの追加プロンプト・
+        Web 検索の証拠文・熟考の結論）がリアルタイムでロジットに干渉する。
+        長い材料は抽出型ダイジェスト（digest_long）で文脈窓に載せる（長文読解）。
+        """
+        sp = opts.get("system_prompt")
+        if not sp:
+            from .lfm.config import DEFAULT_SYSTEM_PROMPT
+
+            sp = DEFAULT_SYSTEM_PROMPT
+            hint = (draft.get("text") or "").strip()
+            if hint and draft.get("intent") in ("question", "fallback"):
+                sp += f"\n（内部ヒント: 高速コアの下書き「{hint[:120]}」を参考にしつつ、自然な返答を作ってください）"
+            kb = self.kb_answer(last_user_of(messages))
+            if kb:
+                sp += (f"\n（Snipher 知識ベースが引けた事実: {str(kb.get('text'))[:520]}）"
+                       "この事実を踏まえて、短く自然に答えてください。")
+
+        yield {"type": "assist", "mode": "gemma", "draft": draft.get("text"),
+               "confidence": draft.get("confidence"), "reason": "probabilistic_llm",
+               "route": ROUTE_NEURAL, "engine": gemma.engine_name()}
+
+        collected: list[str] = []
+        stats: dict = {}
+        for ev in gemma.stream_chat(
+            messages,
+            max_new_tokens=opts.get("max_new_tokens"),
+            temperature=opts.get("temperature"),
+            top_k=opts.get("top_k"),
+            repetition_penalty=opts.get("repetition_penalty"),
+            use_template=opts.get("use_template", True),
+            system_prompt=sp,
+        ):
+            if ev.get("type") == "delta":
+                collected.append(ev.get("text", ""))
+                yield ev
+            elif ev.get("type") == "done":
+                stats = dict(ev.get("stats", {}))
+            elif ev.get("type") == "error":
+                log.warning("Gemma 生成エラー: %s", ev.get("message"))
+            else:
+                yield ev
+
+        text = "".join(collected).strip()
+        if text:
+            polished = self.polisher.polish(text, register="polite")
+            text = polished["text"] or text
+            stats["fixes"] = polished["fixes"]
+        else:
+            text = str(draft.get("base_text") or draft.get("text") or "")
+            for piece in _chunk_for_stream(text):
+                yield {"type": "delta", "text": piece}
+
+        stats.update({
+            "assist": "gemma",
+            "engine": gemma.engine_name(),
+            "route": ROUTE_NEURAL,
+            "gemma": True,
+            "draft": draft.get("text"),
+            "draft_confidence": draft.get("confidence"),
+            "intent": draft.get("intent"),
+        })
+        yield {"type": "done", "text": text, "stats": stats}
+
     def _neural_reply(self, messages: list[dict], draft: dict, mode: str, **opts):
         """✨ LFM2.5-1.2B-JP が内部構造として本文を生成する経路。"""
         backend = self.active_backend()
-        if backend is None:  # 判定直後に落ちた場合の安全網（→ 内蔵蒸留コア）
+        if backend is None:  # 判定直後に落ちた場合の安全網
+            # Gemma 2 準拠の確率的生成エンジンが使えるなら、そちらが本文を生成する
+            # （大量パラメータから一文字ずつ確率で出力する経路。DL 不要で同梱重みが基盤）
+            gemma = None
+            try:
+                gemma = self.gemma_engine()
+            except Exception:  # noqa: BLE001
+                gemma = None
+            if gemma is not None and gemma.is_ready:
+                yield from self._gemma_reply(messages, draft, gemma, **opts)
+                return
             if self.light_ready() or self.kb is not None:
                 yield from self._light_reply(messages, draft, ROUTE_LIGHT, mode=mode)
                 return

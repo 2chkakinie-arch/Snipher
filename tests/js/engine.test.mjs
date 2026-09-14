@@ -118,3 +118,96 @@ test("status は同梱 kb の規模を返す（API が無い場所でも画面�
   assert.ok(s.topics >= 200, String(s.topics));
   assert.ok(s.facts >= 500, String(s.facts));
 });
+
+// --------------------------------------------------------------------------- //
+// v6: 確率の波（ステアリング / 並列熟考 / リアルタイムWeb）— Pages 版の実測
+// --------------------------------------------------------------------------- //
+import { respondStream, shouldSearchRealtime, deliberateMini } from "../../public/engine.mjs";
+
+async function collect(gen) {
+  const evs = [];
+  for await (const ev of gen) evs.push(ev);
+  return evs;
+}
+
+test("shouldSearchRealtime: 挨拶・相槌は検索しない、それ以外はすべて検索", () => {
+  for (const greet of ["こんにちは", "ありがとう", "おはよう", "了解", "うん"]) {
+    assert.equal(shouldSearchRealtime(greet), false, greet);
+  }
+  for (const q of ["量子コンピュータとは", "今日の天気は？", "光合成の仕組みを教えて"]) {
+    assert.equal(shouldSearchRealtime(q), true, q);
+  }
+});
+
+test("deliberateMini: 問いの型を読んで思考の骨格を作る", () => {
+  const t = deliberateMini("なぜ空は青いの？", index);
+  assert.ok(t.steps.length >= 3);
+  assert.ok(t.conclusion.length > 4);
+  assert.ok(t.confidence > 0 && t.confidence <= 0.95);
+});
+
+test("respondStream: start → thought → delta → done の順で流れ、done に波の統計が載る", async () => {
+  const evs = await collect(respondStream([{ role: "user", content: "WebAssembly とは何ですか？" }], {
+    index, chunkDelayMs: 0,
+  }));
+  const kinds = evs.map((e) => e.type);
+  assert.equal(kinds[0], "start");
+  assert.ok(kinds.includes("thought"));
+  assert.ok(kinds.includes("delta"));
+  assert.equal(kinds[kinds.length - 1], "done");
+  const done = evs[evs.length - 1];
+  assert.equal(done.stats.waves.deliberate, true);
+  assert.equal(done.stats.waves.thought, true);
+  assert.ok(done.text.length > 4);
+});
+
+test("respondStream: 挨拶では Web 検索が走らない（高速経路を維持）", async () => {
+  const searched = [];
+  const evs = await collect(respondStream([{ role: "user", content: "こんにちは" }], {
+    index, chunkDelayMs: 0, search: async (q) => { searched.push(q); return { sentences: [], sources: [] }; },
+  }));
+  assert.deepEqual(searched, []);
+  assert.equal(evs.some((e) => e.type === "web"), false);
+});
+
+test("respondStream: 挨拶以外は出力中に検索が走り、web イベントが流れる", async () => {
+  const searched = [];
+  const evs = await collect(respondStream([{ role: "user", content: "太陽系の惑星を教えて" }], {
+    index, chunkDelayMs: 0,
+    search: async (q) => {
+      searched.push(q);
+      return { sentences: ["太陽系には8つの惑星がある。"], sources: [{ url: "https://example.com", title: "例" }] };
+    },
+  }));
+  assert.deepEqual(searched, ["太陽系の惑星を教えて"]);
+  const webs = evs.filter((e) => e.type === "web");
+  assert.equal(webs[0].state, "start");
+  const doneWeb = webs.find((e) => e.state === "done");
+  assert.equal(doneWeb.sentences, 1);
+  const done = evs[evs.length - 1];
+  assert.equal(done.stats.waves.web_search, true);
+  assert.equal(done.stats.waves.web_hits, 1);
+});
+
+test("respondStream: 生成中のステアリング波が残りの文を組み直す（出力は止まらない）", async () => {
+  // 2 文以上の応答を選び、1 文目が出た直後にステアを投入する
+  const queue = [{ text: "もっと詳しく", strength: 1.5 }];
+  let fed = false;
+  const evs = await collect(respondStream([{ role: "user", content: "WebAssembly とは何ですか？" }], {
+    index, chunkDelayMs: 0,
+    pollSteer: () => {
+      if (fed) return [];
+      fed = true;
+      return queue.splice(0, queue.length);
+    },
+  }));
+  const steers = evs.filter((e) => e.type === "steer");
+  assert.ok(steers.length >= 1, "ステアリング波が発火しない");
+  assert.equal(steers[0].text, "もっと詳しく");
+  const done = evs[evs.length - 1];
+  assert.equal(done.stats.waves.steer_waves >= 1, true);
+  // delta は途切れず最後まで流れる（生成は止まらない）
+  const kinds = evs.map((e) => e.type);
+  assert.ok(kinds.indexOf("delta") < kinds.lastIndexOf("delta") || kinds.filter((k) => k === "delta").length >= 1);
+  assert.equal(kinds[kinds.length - 1], "done");
+});

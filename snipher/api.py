@@ -81,7 +81,7 @@ app = FastAPI(
         "確率的に不安な応答だけニューラルコアが生成し、確実な定形は即答。"
         "未知文字の自動学習とテンプレートフォールバック付き。"
     ),
-    version="0.4.0",
+    version="6.0.0",
     lifespan=_lifespan,
 )
 
@@ -630,6 +630,7 @@ def api_steer(req: SteerRequest):
 
     前端は stream 中に別プロンプトをここへ POST する。サーバは
     ロジット・バイアスとして蓄積し、直後の生成トークンから反映する。
+    出力は止まらない — 波は次のサンプリングから滑らかに乗る。
     """
     try:
         c = core()
@@ -644,9 +645,12 @@ def api_steer(req: SteerRequest):
                 tok = getattr(_core_neural, "tok", None)
         except Exception:  # noqa: BLE001
             tok = None
-        # tokenizer が無ければ語をそのまま扱う (Gemma 等で別途 tokenize)
-        bus.steer(req.text, strength=req.strength, tokenizer=tok)
-        return {"ok": True, "queued": req.text[:80], "strength": req.strength}
+        sid = bus.steer(req.text, strength=req.strength, tokenizer=tok)
+        if sid < 0:
+            return {"ok": False, "error": "確率波に変換できませんでした（tokenizer 未ロード）"}
+        st = bus.status()
+        return {"ok": True, "id": sid, "queued": req.text[:80],
+                "strength": req.strength, "active_waves": st["pending"]}
     except Exception as exc:  # noqa: BLE001
         return JSONResponse({"ok": False, "error": str(exc)}, status_code=500)
 

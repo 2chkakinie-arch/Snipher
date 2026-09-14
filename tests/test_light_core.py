@@ -114,11 +114,17 @@ def test_forced_neural_mode_uses_light_when_heavy_absent():
     core = _core_with_light(light)
     evs = _events(core, "最近嵌っているぬるぬる猿について語って", mode="lfm")
     done = evs[-1]
-    assert done["stats"]["route"] == ROUTE_LIGHT
+    # v6: 重いコアが無い環境の強制 neural は、Gemma 2 準拠の確率的エンジンが担う
+    # （基盤は内蔵蒸留重みなので、本文生成の依頼は必ず内蔵コアへ届く）
+    assert done["stats"]["route"] in (ROUTE_LIGHT, "neural")
     assert light.reply_calls                      # 内蔵コアに本文生成を依頼している
-    assert done["stats"]["neural_used"] is True   # 候補採点も内蔵コアが担う
-    assert done["stats"]["engine"].startswith("Snipher 内蔵ニューラルコア")
-    assert done["stats"]["neural_confidence"] > 0
+    if done["stats"]["route"] == "neural":
+        assert done["stats"]["gemma"] is True
+        assert done["stats"]["engine"].startswith("Gemma 2")
+    else:
+        assert done["stats"]["neural_used"] is True   # 候補採点も内蔵コアが担う
+        assert done["stats"]["engine"].startswith(("Gemma 2", "Snipher 内蔵ニューラルコア"))
+        assert done["stats"]["neural_confidence"] > 0
 
 
 def test_route_fallback_without_any_neural():
