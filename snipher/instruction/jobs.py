@@ -68,8 +68,27 @@ _ANT = re.compile(r"対義語|反対(?:の)?(?:意味|語)|逆の意味|反意�
 # --------------------------------------------------------------------------- #
 # かな書き（実辞書の読み）
 # --------------------------------------------------------------------------- #
-_KANA_ASK = re.compile(r"(?:を|は)?\s*(カタカナ|かたかな|ひらがな|平仮名|ローマ字)\s*"
-                       r"(?:に|へ)\s*(?:変換|直し|して|に|表記)")
+_KANA_ASK = re.compile(r"(?:を|は|で)?\s*(カタカナ|かたかな|ひらがな|平仮名|ローマ字|かな)\s*"
+                       r"(?:に|へ|だけで|だけ|のみ)?\s*(?:変換|直し|して|出力|書いて|に|表記|で書|で出力)")
+_KANA_STRICT = re.compile(r"だけで|だけに|のみ|他の文字|ほかの文字|記号は含めない|記号を含めない")
+
+# --------------------------------------------------------------------------- #
+# つなぎ直し（カンマ区切りのリストに）
+# --------------------------------------------------------------------------- #
+_JOIN_ASK = re.compile(r"(?:カンマ|コンマ|comma|読点|中点|なかぐろ|スラッシュ|パイプ|縦棒)"
+                       r".{0,10}(?:区切り|で区切|でつな|で並べ|リスト|join)|"
+                       r"(?:区切り|つなげ|つない|並べ).{0,8}(?:リスト|出力|ください|ください)")
+
+# --------------------------------------------------------------------------- #
+# 好み（好き／嫌い + どちら）
+# --------------------------------------------------------------------------- #
+_PREFER_POL = re.compile(r"好き|きらい|嫌い|大好き|大嫌い")
+_PREFER_WHICH = re.compile(r"どちら|どれ|どっち|何が")
+
+# --------------------------------------------------------------------------- #
+# 数の比較・反転・選択肢（形の判定は solve/decide.py の実行可否で決める）
+# --------------------------------------------------------------------------- #
+_WHICH_WORD = re.compile(r"どちら|どっち|どれ|いずれ")
 
 # --------------------------------------------------------------------------- #
 # 語の写し（語彙の対応表）
@@ -149,18 +168,38 @@ def detect(raw: str) -> Job | None:
             return Job("relations", f"{'対義語' if kind == 'antonym' else '類義語'}の依頼",
                        word=word)
 
-    # --- かな書き（山羊 → やぎ／りんご → リンゴ） -------------------------- #
+    # --- つなぎ直し（「りんご、ゴリラ、ラッパ」→ カンマ区切りのリスト） --- #
+    if _JOIN_ASK.search(t):
+        from ..solve import jp as _jp
+
+        try:
+            _join_sol = _jp.join_items(t)
+        except Exception:  # noqa: BLE001
+            _join_sol = None
+        if _join_sol is not None:
+            _items = list((_join_sol.detail or {}).get("items") or [])
+            _sep = str((_join_sol.detail or {}).get("sep") or ",")
+            return Job("join", f"材料 {len(_items)} 語を「{_sep}」でつなぐ形", items=_items)
+
+    # --- かな書き（山羊 → やぎ／りんご → リンゴ／文全体も） ------------------ #
     m_kana = _KANA_ASK.search(t)
     if m_kana:
         word = ""
-        m = _QUOTED.search(t)
-        if m:
-            word = m.group(1).strip()
-        else:
+        for m in _QUOTED.finditer(t):
+            cand = m.group(1).strip()
+            if cand and not re.search(r"カタカナ|かたかな|ひらがな|平仮名|ローマ字|変換|出力|ください", cand):
+                # 文全体の引用（空が青い）を優先し、短い語は後回しにしない
+                if not word or len(cand) > len(word):
+                    word = cand
+        if not word:
             m2 = re.match(r"^(.{1,16}?)(?:を|は|の)", t)
             word = (m2.group(1).strip() if m2 else "")
         if word and not re.search(r"カタカナ|ひらがな|ローマ字|変換|ください", word):
-            return Job("kana", f"{m_kana.group(1)} への書き換え（実辞書の読みを使う）", word=word)
+            strict = bool(_KANA_STRICT.search(t))
+            why = f"{m_kana.group(1)} への書き換え（実辞書の読みを使う）"
+            if strict:
+                why += "［他の文字・記号なし］"
+            return Job("kana", why, word=word)
 
     # --- 語の写し（英語へ） ------------------------------------------------- #
     if _GLOSS_ASK.search(t) or (_GLOSS_WORDS.search(t) and "英語" in t):
@@ -176,6 +215,40 @@ def detect(raw: str) -> Job | None:
         if words:
             return Job("gloss", f"語の写し（{len(words)} 語）", items=words, language="english")
 
+    # --- 好み（「犬が好きで、猫は嫌い」+「好きなのはどちら」） ------------- #
+    if _PREFER_POL.search(t) and _PREFER_WHICH.search(t):
+        from ..solve import jp as _jp
+
+        try:
+            _ok = _jp.resolve_preference(t) is not None
+        except Exception:  # noqa: BLE001
+            _ok = False
+        if _ok:
+            return Job("prefer", "極性（好き／嫌い）+ どちら の形")
+
+    # --- 数の比較・反転・選択肢 -------------------------------------------- #
+    from ..solve import decide as _decide
+
+    try:
+        _cmp = _decide.compare_numbers(t)
+    except Exception:  # noqa: BLE001
+        _cmp = None
+    if _cmp is not None:
+        return Job("compare", f"数の比較（{'／'.join((_cmp.detail or {}).get('numbers') or [])}）")
+    try:
+        _tog = _decide.toggle_switch(t)
+    except Exception:  # noqa: BLE001
+        _tog = None
+    if _tog is not None:
+        return Job("toggle", "オン／オフ + 押す回数 の形")
+    try:
+        _opts = _decide.choice_options(t)
+    except Exception:  # noqa: BLE001
+        _opts = []
+    if len(_opts) >= 2 and _WHICH_WORD.search(t) \
+            and re.search(r"[？?]|ください|下さい|答えて|教えて|どこ|何|いつ|誰|だれ|なぜ|いくら", t):
+        return Job("choice", f"選択肢（{'／'.join(_opts)}）+ 問いの形", items=_opts)
+
     # --- 礼（禁止語つき） -------------------------------------------------- #
     if _THANKS_ART.search(t) and _NEG_ASK.search(t):
         banned = [m.group(1).strip() for m in _THANKS_BAN.finditer(t)]
@@ -188,10 +261,15 @@ def detect(raw: str) -> Job | None:
     if _AUDIT_ROLE.search(t) and _AUDIT_ASK.search(t) and _AUDIT_FIX.search(t):
         return Job("audit", "指示文と入力データの点検（判定 + 修正版の依頼）")
 
-    # --- 論理（全称命題・規則の適用） -------------------------------------- #
+    # --- 論理（全称命題・規則・条件文の適用） ------------------------------ #
     from ..solve import logic as _logic
 
-    if _logic.syllogism(t) is not None or _logic.apply_rule(t) is not None:
+    try:
+        _logic_hit = (_logic.syllogism(t) is not None or _logic.apply_rule(t) is not None
+                      or _logic.tara_conditionals(t) is not None)
+    except Exception:  # noqa: BLE001
+        _logic_hit = False
+    if _logic_hit:
         return Job("logic", "前提から結論を導く形（材料の文だけで推論できる）")
 
     return None

@@ -1195,10 +1195,23 @@ class SnipherCore:
                 if ev.get("type") == "done":
                     for w in waves.settle(budget):
                         yield w
+                    # v8: 出力の番人（定型句・繰り返しのループを物理的に禁じる）。
+                    # 全経路の最終段で 1 回だけ通す（JSON/CSV/コードは壊さない）。
+                    try:
+                        from .guard import scrub as _guard_scrub
+
+                        _cleaned, _rep = _guard_scrub(ev.get("text") or "")
+                        if _cleaned != (ev.get("text") or ""):
+                            ev["text"] = _cleaned
+                        _guard_rep: dict | None = _rep if (_rep.get("removed") or _rep.get("repeats")) else None
+                    except Exception:  # noqa: BLE001
+                        _guard_rep = None
                     stats = ev.get("stats")
                     if not isinstance(stats, dict):
                         stats = {}
                         ev["stats"] = stats
+                    if _guard_rep:
+                        stats["guard"] = _guard_rep
                     stats["waves"] = waves.stats()
                     if waves.sources:
                         seen_urls = {str(s.get("url")) for s in stats.get("sources") or []}

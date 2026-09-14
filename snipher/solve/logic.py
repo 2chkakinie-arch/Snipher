@@ -224,4 +224,112 @@ def _action_verb(action: str) -> str:
     return a
 
 
-__all__ = ["syllogism", "apply_rule", "strip_question"]
+# --------------------------------------------------------------------------- #
+# 3) 条件文（〜たら〜する）の適用 — いまの状態に当たる枝を選ぶ（v8）
+# --------------------------------------------------------------------------- #
+_TARA = re.compile(r"(?P<cond>[^、。]{1,30}?)たら(?P<action>[^、。]{1,40})")
+_NARA = re.compile(r"(?P<cond>[^、。]{1,30}?)(?:なら|ならば|であれば)(?P<action>[^、。]{1,40})")
+_REBA = re.compile(r"(?P<cond>[^、。]{1,30}?)(?:れば|えれば)(?P<action>[^、。]{1,40})")
+_STATE_NOW = re.compile(r"(?:いま|今|現在)?\s*(?P<obj>[^、。]{1,20}?)は(?P<value>[^、。]{1,24}?)"
+                        r"(?:ています|てます|です|だ|である|ます|になる|になった)")
+_OBJECT_OF = re.compile(r"^(?P<obj>[^、。をがにへでと]{1,12}?)(?:を|が)(?P<verb>.+)$")
+
+
+def _cond_core(cond: str) -> str:
+    """条件の核（「雨が降っ」→「雨降」、晴れ」→「晴れ」）を取り出す。"""
+    c = normalize(cond).strip(" 　、")
+    c = re.sub(r"^(?:もし|仮に)", "", c).strip()
+    c = re.sub(r"(?:が|は|も|に|へ|で|と|から|より)$", "", c).strip()
+    c = re.sub(r"(?:っ|し|しな|来|き|見|み|降|ふ|降り|なり|あり|しつつ)$", "", c).strip()
+    c = re.sub(r"[がはもにへでとを]$", "", c).strip()
+    return c
+
+
+def _state_core(value: str, obj: str = "") -> list[str]:
+    """状態の核の候補（「晴れています」→ 晴れ／晴）。"""
+    v = normalize(value).strip(" 　、")
+    v = re.sub(r"(?:てい?ます|ています|ている|です|である|だ|ます|ました|した)$", "", v).strip()
+    cands = [v]
+    # 「晴れ」→「晴」のような語幹も候補に（条件側の表記ゆれを吸う）
+    if v.endswith(("れ", "り", "み", "び", "い")) and len(v) >= 2:
+        cands.append(v[:-1])
+    if obj:
+        o = normalize(obj).strip(" 　、")
+        cands.append(f"{o}{v}")
+    return [c for c in cands if c]
+
+
+def _action_word(action: str) -> str:
+    """行動の答えの語（「傘をさす」→「傘」）。「単語で」の指定に応える。"""
+    a = normalize(action).strip(" 　、。")
+    m = _OBJECT_OF.match(a)
+    if m:
+        return m.group("obj").strip()
+    # 「帽子をかぶる」の形でないときは、文節の先頭の内容語
+    head = re.split(r"[をがにへでと、]", a)[0].strip()
+    return head or a
+
+
+def tara_conditionals(text: str, *, want: str = "") -> Solution | None:
+    """「X たら Y。Z たら W」+「いま Z だ」→ W（材料の文だけで枝を選ぶ）。
+
+    「雨が降ったら傘をさす。晴れたら帽子をかぶる。いま外は晴れています。
+    何を持っていきますか？単語で」→「帽子」。
+    条件にも状態にも当てはまらないときは None（枝を当てずっぽうで選ばない）。
+    """
+    body = normalize(str(text or ""))
+    rules: list[tuple[str, str, str]] = []
+    for pat in (_TARA, _NARA, _REBA):
+        for m in pat.finditer(body):
+            cond = m.group("cond").strip(" 　、「」『』")
+            action = m.group("action").strip(" 　、。")
+            if not cond or not action:
+                continue
+            # 問い文（〜たらどうなる？）は規則ではない
+            if re.search(r"(?:どう|何|どれ|どちら|いくつ|いつ|なぜ).{0,6}[？?]$", action):
+                continue
+            if (cond, action) not in [(c, a) for c, a, _ in rules]:
+                rules.append((cond, action, m.group(0)))
+    if not rules:
+        return None
+    states: list[tuple[str, str, str]] = []
+    for m in _STATE_NOW.finditer(body):
+        obj = m.group("obj").strip(" 　、。")
+        val = m.group("value").strip(" 　、。")
+        # 規則文の中の条件は状態ではない
+        if any(obj and obj in raw for _, _, raw in rules):
+            continue
+        # 「信号は赤です」のような短い状態も拾う（「いま」が無くてもよい）
+        states.append((obj, val, m.group(0)))
+    if not states:
+        return None
+    single_word = bool(re.search(r"単語で|一語で|1語で|ひとことで|一言で", body)) or want == "word"
+    for obj, val, raw_state in states:
+        cores = _state_core(val, obj)
+        for cond, action, raw_rule in rules:
+            core = _cond_core(cond)
+            # 状態の核が条件文に含まれている（「晴れ」∈「晴れたら…」）ときに当てる。
+            # 条件の核が状態に含まれている（「青」∈「青信号」）逆向きも許す。
+            hit = False
+            for c in cores:
+                if not c or len(c) < 1:
+                    continue
+                if c in cond or (core and (core in c or (len(c) >= 2 and c in core))):
+                    hit = True
+                    break
+            if not hit:
+                continue
+            answer = _action_word(action) if single_word else normalize(action).strip(" 　、。")
+            steps = [f"条件文（材料）: 「{raw_rule}」",
+                     f"いまの状態（材料）: 「{raw_state}」",
+                     f"「{val}」は条件「{cond}」に当たる → 行動は「{action}」"]
+            if single_word:
+                steps.append(f"「単語で」の指定なので、行動の語「{answer}」だけを返す")
+            return Solution(answer=answer, steps=steps, kind="branch", verified=True,
+                            detail={"rule": raw_rule, "state": raw_state,
+                                    "action": action, "answer": answer,
+                                    "single_word": single_word})
+    return None
+
+
+__all__ = ["syllogism", "apply_rule", "tara_conditionals", "strip_question"]

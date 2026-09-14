@@ -66,6 +66,18 @@ _QUESTION = re.compile(
 )
 #: 文の終わり（材料が「文」として立っているかの判定に使う）
 _SENTENCE_END = re.compile(r"(?:。|です|ました|である|だ|た|る|い|な|よ|ね|？|\?)\s*$")
+#: 「〜してください。」の後ろに続く文が、まだ *指示* である印（v8）。
+#: 「他の文字は含めないでください」「改行や説明は不要です」は材料ではない。
+_INSTRUCTION_TAIL = re.compile(
+    r"(?:ください|下さい|しなさい|せよ|しろ|なさい|ちょうだい|くれ|してほしい|"
+    r"不要|いらない|なし|無し|禁止|使わず|抜きで|だけで|のみ|"
+    r"添えて|添えない|しないで|やめて|避けて|除いて|除き)"
+)
+#: 問いかけの印（疑問詞 + 文末）。「言葉の仕事」の型が読めた 1 通を後押しする。
+_WH_QUESTION = re.compile(
+    r"(?:どちら|どれ|どっち|いずれ|何|いつ|どこ|だれ|誰|なぜ|なんで|どう|"
+    r"いくつ|いくら|どの).{0,8}(?:[?？]|ですか|ますか|でしょうか|なの|のか|こと)"
+)
 #: 「〜してください。」「〜を出力せよ。」のような命令の終わり
 _IMPERATIVE_SENT = re.compile(
     r"[^\n。]{0,60}?(?:してください|して下さい|てください|て下さい|ください|下さい|"
@@ -394,6 +406,10 @@ _FIELD_LIST_LABEL = re.compile(
     r"(?:項目|欄|キー|フィールド|columns?|fields?)\s*[：:]\s*([^\n]+)", re.IGNORECASE)
 _LATIN_HEADER = re.compile(
     r"^\s*([A-Za-z_][A-Za-z0-9_]*(?:\s*,\s*[A-Za-z_][A-Za-z0-9_]*)+)\s*$")
+_EXPLICIT_KEY = re.compile(
+    r"キー(?:名)?(?:は|を|が)?\s*[「『\"']?"
+    r"([A-Za-z_][A-Za-z0-9_]*(?:\s*[、，,と・]\s*[A-Za-z_][A-Za-z0-9_]*)*)"
+    r"[」』\"']?\s*(?:に|で|と|として)")
 
 
 def _is_sentence_list(body: str) -> bool:
@@ -446,6 +462,15 @@ def parse_schema(text: str) -> tuple[list[tuple[str, str]], list[tuple[int, int]
         if names:
             spans.append((m.start(1), m.end(1)))
             return [(n, n) for n in names], spans
+    # (3.5) 「キーを user_name にした JSON」のようにキーを名指しした指定（v8）。
+    # 出力の欄名はここで確定する（値のラベルと違ってもよい — 突き合わせは概念で行う）。
+    m = _EXPLICIT_KEY.search(t)
+    if m:
+        names = [x.strip().strip("「」『』\"'") for x in re.split(r"[、，,と・]", m.group(1))]
+        names = [n for n in names if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", n or "")]
+        if names:
+            spans.append((m.start(1), m.end(1)))
+            return [(n, "") for n in names[:8]], spans
     for line in t.split("\n"):
         mline = _LATIN_HEADER.match(line)
         if mline:
@@ -523,6 +548,10 @@ def parse_format(text: str, *, schema: list[tuple[str, str]] | None = None) -> F
             f.bullets = f.bullets or n
 
     # ---- 長さ ---- #
+    # 「1 文字以上 2 文字以内」のように複数あるときは、*上限（以内/以下/まで）* を
+    # 優先して max_chars にする（v8: 先に読んだ「1 文字」を目標 1 字にしない）。
+    _max_ns: list[int] = []
+    _approx_n = 0
     for m in _LEN_KIND.finditer(t):
         n = _num(m.group(1))
         if not n or n > 100000:
@@ -531,12 +560,19 @@ def parse_format(text: str, *, schema: list[tuple[str, str]] | None = None) -> F
         # `_LEN_KIND` が「以内」まで飲み込むので、*一致した文字列自体* でも判定する
         if re.search(r"(?:以内|以下|まで|を超えない|以内に収め)", m.group(0)) \
                 or re.match(r"\s*(?:以内|以下)", tail):
-            f.length_kind, f.max_chars = "max", n
+            _max_ns.append(n)
         elif re.match(r"\s*(?:程度|くらい|ぐらい|前後|ほど|を目安|を目標)", tail):
-            f.length_kind, f.target_chars = "approx", n
+            _approx_n = _approx_n or n
+        elif re.match(r"\s*(?:以上|から| over)", tail):
+            continue            # 「1 文字以上」は下限（目標ではない）
         else:
-            f.length_kind, f.target_chars = "approx", n
-        break
+            _approx_n = _approx_n or n
+    if _max_ns:
+        f.length_kind, f.max_chars = "max", min(_max_ns)
+    if _approx_n:
+        if not f.length_kind:
+            f.length_kind = "approx"
+        f.target_chars = _approx_n
     if f.max_chars and not f.target_chars:
         f.target_chars = int(f.max_chars * 0.85)
     if f.target_chars and not f.max_chars:
@@ -789,7 +825,10 @@ def split_payload(text: str) -> tuple[str, str, list[tuple[int, int]], list[str]
         m = re.search(r"(?:してください|して下さい|してください。|お願いします|せよ|しろ)[。！!?]?\s*", t)
         if m:
             rest = t[m.end():].strip()
-            if rest and ("\n" in rest or ":" in rest or "・" in rest or re.search(r"[A-Za-z0-9_{}\[]", rest) or len(rest) >= 6):
+            # 「〜してください。他の文字は含めないでください」の後半は *指示* であって
+            # 材料ではない（v8: ここを材料にすると指示文をそのまま返す事故になる）。
+            still_instruction = bool(_INSTRUCTION_TAIL.search(rest)) if rest else False
+            if rest and not still_instruction and ("\n" in rest or ":" in rest or "・" in rest or re.search(r"[A-Za-z0-9_{}\[]", rest) or len(rest) >= 6):
                 if not re.search(r"\{[^{}]*\"[^{}]*\}", rest) or len(rest) > 30:
                     payload = rest
                     marks.append("fallback-tail")
@@ -1129,6 +1168,11 @@ def parse(text: str, *, min_score: float = 0.55) -> Directive | None:
         score += 0.34
         signals.append(job.as_signal())
         signals.append(f"job-reason:{job.reason[:24]}")
+    if job is not None and _WH_QUESTION.search(raw):
+        # 「言葉の仕事」の型 + 問いかけ（どちら・何・どう…）は依頼の形
+        # （v8: 「犬が好きで猫は嫌い。好きなのはどちら？」のような 1 通を拾う）
+        score += 0.25
+        signals.append("job+question")
     if payload and len(payload) >= 8:
         score += 0.30
         signals.append(f"payload:{len(payload)}字")

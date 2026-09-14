@@ -31,6 +31,12 @@ CAN_NOT_SAY = ("できません", "出来ません", "分かりません", "わ�
                "答えられ", "対応しておりません", "持ち合わせて", "学習されてい",
                "サポートして", "お答えでき", "わかりかね", "利用できません")
 
+#: 抽出値に混ざってはいけない *指示の動詞*（v8: 値が指示文を飲み込んだ印）
+_INSTRUCTION_VERB = re.compile(
+    r"(?:出力|変換|抽出|要約|作成|作って|列挙|まとめ|点検|確認|判定|検証|書いて|"
+    r"直して|並べて|してください|して下さい|しなさい|せよ|しろ|ください|下さい|"
+    r"お願いします|教えろ|答えろ)")
+
 
 class Result:
     """指示の実行結果（composer / core がそのまま応答にできる形）。"""
@@ -182,12 +188,16 @@ def _do_extract(d: Directive) -> dict:
                 "kind": kind, "confidence": 0.94 if not missing else 0.84}
 
     values, missing, trace = _extract.extract_fields(payload, schema)
-    # 欄名が材料のラベルと一致するなら、ラベルの値をそのまま使う（取り違えを防ぐ）
+    # 欄名が材料のラベルと一致するなら、ラベルの値をそのまま使う（取り違えを防ぐ）。
+    # 候補採点の値が *指示文*（出力してください…）を飲み込んでいたら、ラベルで上書きする
+    # （v8: 指示の動詞は材料の値ではありえない）。
     labels = _extract.label_values(payload)
     if labels:
         for key, hint in schema:
             for lab, val in labels.items():
-                if not str(values.get(key, "")).strip() and _extract._same_field(lab, key, hint):
+                cur = str(values.get(key, ""))
+                swallowed = bool(_INSTRUCTION_VERB.search(cur)) if cur.strip() else True
+                if swallowed and _extract._same_field(lab, key, hint):
                     values[key] = val
                     if key in missing:
                         missing.remove(key)
@@ -970,12 +980,17 @@ def _do_fill(d: Directive, *, lm=None) -> dict:
 
 
 def _do_kana(d: Directive) -> dict:
-    """かな書き（山羊 → やぎ／りんご → リンゴ）。読みは実辞書から引く。"""
+    """かな書き（山羊 → やぎ／りんご → リンゴ／文全体も）。読みは実辞書から引く。"""
     from ..solve import jp as _jp
 
+    raw = str(d.raw or "")
     job = getattr(d, "job", None)
     word = (getattr(job, "word", "") or "").strip() or (d.payload or "")
-    sol = _jp.kana_write(str(d.raw or ""), kind="")
+    strict = bool(re.search(r"だけで|だけに|のみ|他の文字|ほかの文字|記号は含めない|記号を含めない", raw))
+    # 文全体（漢字を含む引用）→ kana_sentence、1 語 → kana_write の順に試す
+    sol = _jp.kana_sentence(raw, strict=strict)
+    if sol is None:
+        sol = _jp.kana_write(raw, kind="")
     if sol is None or (word and sol.answer == word):
         # 読みが引けない語は書き換えない（同じ字を「書き換えました」と言わない）
         return {"text": "", "confidence": 0.0, "verified": False,
@@ -1045,13 +1060,15 @@ def _do_gloss(d: Directive) -> dict:
 
 
 def _do_logic(d: Directive) -> dict:
-    """前提（全称命題・規則）から結論を出す。材料の文だけで推論する。"""
+    """前提（全称命題・規則・条件文）から結論を出す。材料の文だけで推論する。"""
     from ..solve import logic as _logic
 
     raw = str(d.raw or "")
     job = getattr(d, "job", None)
     wants_yn = bool(re.search(r"はい|いいえ", raw)) or "ますか" in raw
     sol = _logic.syllogism(raw) if wants_yn else None
+    if sol is None:
+        sol = _logic.tara_conditionals(raw)
     if sol is None:
         sol = _logic.apply_rule(raw)
     if sol is None:
@@ -1063,6 +1080,72 @@ def _do_logic(d: Directive) -> dict:
     return {"text": sol.answer, "confidence": 0.9, "kind": sol.kind,
             "verified": bool(sol.verified), "notes": steps, "detail": sol.detail,
             "hint": getattr(job, "reason", "")}
+
+
+def _do_join(d: Directive) -> dict:
+    """「りんご、ゴリラ、ラッパ」→ カンマ区切りの 1 行（語は 1 字も変えない）。"""
+    from ..solve import jp as _jp
+
+    sol = _jp.join_items(str(d.raw or ""))
+    if sol is None:
+        return {"text": "", "confidence": 0.0, "verified": False,
+                "notes": ["つなぎ直し: 材料（語の並び）か区切りの指定が読めない"]}
+    return {"text": sol.answer, "confidence": 0.93, "kind": "join",
+            "verified": bool(sol.verified), "notes": list(sol.steps or []),
+            "detail": sol.detail}
+
+
+def _do_prefer(d: Directive) -> dict:
+    """「犬が好きで、猫は嫌い」+「好きなのはどちら」→「犬」（極性で選ぶ）。"""
+    from ..solve import jp as _jp
+
+    sol = _jp.resolve_preference(str(d.raw or ""))
+    if sol is None:
+        return {"text": "", "confidence": 0.0, "verified": False,
+                "notes": ["好み: 極性（好き／嫌い）の対象が材料から読めない"]}
+    return {"text": sol.answer, "confidence": 0.9, "kind": "prefer",
+            "verified": bool(sol.verified), "notes": list(sol.steps or []),
+            "detail": sol.detail}
+
+
+def _do_compare(d: Directive) -> dict:
+    """「10 と 5 はどちらが大きい」→「10」（数字だけ）。"""
+    from ..solve import decide as _decide
+
+    sol = _decide.compare_numbers(str(d.raw or ""))
+    if sol is None:
+        return {"text": "", "confidence": 0.0, "verified": False,
+                "notes": ["比較: 数が 2 つ以上無いか、比較の向きが読めない"]}
+    return {"text": sol.answer, "confidence": 0.93, "kind": "compare",
+            "verified": bool(sol.verified), "notes": list(sol.steps or []),
+            "detail": sol.detail}
+
+
+def _do_toggle(d: Directive) -> dict:
+    """「オフ。1 回押すと」→「オン」（偶奇で決める。裸で返す）。"""
+    from ..solve import decide as _decide
+
+    sol = _decide.toggle_switch(str(d.raw or ""))
+    if sol is None:
+        return {"text": "", "confidence": 0.0, "verified": False,
+                "notes": ["反転: いまの状態か押す回数が読めない"]}
+    return {"text": sol.answer, "confidence": 0.93, "kind": "toggle",
+            "verified": bool(sol.verified), "notes": list(sol.steps or []),
+            "detail": sol.detail}
+
+
+def _do_choice(d: Directive, *, kb=None) -> dict:
+    """「「東京」か「大阪」のどちらか」+ 問い → 裏取りした選択肢だけを返す。"""
+    from ..solve import decide as _decide
+
+    kb = _default_kb(kb)
+    sol = _decide.resolve_choice(str(d.raw or ""), kb=kb)
+    if sol is None:
+        return {"text": "", "confidence": 0.0, "verified": False,
+                "notes": ["選択肢: 知識ベースの根拠に当たる選択肢が 1 つに決まらない"]}
+    return {"text": sol.answer, "confidence": 0.9, "kind": "choice",
+            "verified": bool(sol.verified), "notes": list(sol.steps or []),
+            "detail": sol.detail}
 
 
 def _one_line(text: str, *, limit: int = 160) -> str:
@@ -1200,6 +1283,16 @@ def execute(d: Directive, *, kb=None, web=None, history=None, lm=None, core=None
         return _do_gloss(d)
     if task == "logic":
         return _do_logic(d)
+    if task == "join":
+        return _do_join(d)
+    if task == "prefer":
+        return _do_prefer(d)
+    if task == "compare":
+        return _do_compare(d)
+    if task == "toggle":
+        return _do_toggle(d)
+    if task == "choice":
+        return _do_choice(d, kb=kb)
     if task == "thanks":
         return _do_thanks(d, lm=lm)
     if task == "audit":
